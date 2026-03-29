@@ -1,0 +1,7 @@
+project_name = "a_share_mainboard"
+environment = "dev"
+timezone = "Asia/Shanghai"
+data_root = "data"
+report_root = "data/reports"
+log_root = "data/logs"
+

@@ -1,0 +1,4 @@
+cost_bps = 15
+execution_price_mode = "next_open"
+max_positions = 20
+

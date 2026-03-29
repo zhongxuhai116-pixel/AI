@@ -1,0 +1,6 @@
+market_provider = "akshare"
+duckdb_path = "data/mart/ashare_mainboard.duckdb"
+parquet_root = "data"
+default_start_date = "2018-01-01"
+index_codes = ["sh000001", "sz399001", "sz399006"]
+

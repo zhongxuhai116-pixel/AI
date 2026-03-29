@@ -1,0 +1,5 @@
+allowed_boards = ["MAIN"]
+min_listing_days = 120
+min_avg_amount = 50000000
+exclude_st = true
+

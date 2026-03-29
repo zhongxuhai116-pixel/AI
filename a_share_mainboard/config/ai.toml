@@ -1,0 +1,11 @@
+enabled = true
+model = "gpt-5-mini"
+base_url = "https://api.openai.com/v1"
+timeout_seconds = 30
+max_retries = 3
+max_symbols_per_day = 10
+market_prompt_version = "market_summary_v1"
+stock_prompt_version = "stock_explainer_v1"
+risk_prompt_version = "risk_reviewer_v1"
+report_prompt_version = "report_writer_v1"
+

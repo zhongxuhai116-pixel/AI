@@ -1,0 +1,12 @@
+horizons = [5, 10]
+top_n = 20
+rebalance_frequency = "daily"
+enable_ml_ranker = false
+
+[baseline_weights]
+ret_5d = 0.35
+ret_10d = 0.25
+rs_index_10d = 0.20
+amount_ratio_5d = 0.10
+volatility_10d = -0.10
+

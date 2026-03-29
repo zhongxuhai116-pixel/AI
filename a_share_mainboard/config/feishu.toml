@@ -1,0 +1,4 @@
+enabled = false
+webhook_url_env = "FEISHU_BOT_WEBHOOK"
+signing_secret_env = "FEISHU_BOT_SECRET"
+timeout_seconds = 15
