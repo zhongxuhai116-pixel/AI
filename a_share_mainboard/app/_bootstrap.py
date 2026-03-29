@@ -13,5 +13,8 @@ def bootstrap_paths() -> Path:
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
 
-    return project_root
+    from infra.config.env_loader import load_project_env
 
+    load_project_env(project_root)
+
+    return project_root
