@@ -15,6 +15,16 @@ from strategy.stock_selection.baseline_ranker import BaselineRanker
 from strategy.stock_selection.selection_service import SelectionService
 from strategy.validation.execution_model import ExecutionModel
 
+GENERIC_RULE_TAGS = {
+    "mainboard",
+    "baseline",
+    "t_plus_1",
+    "sentiment_gate",
+    "policy_gate",
+    "policy_hot",
+    "policy_warm",
+}
+
 
 @dataclass(slots=True)
 class ValidationEngine:
@@ -65,11 +75,12 @@ class ValidationEngine:
             }
 
         self._materialize_signal_chain(signal_dates=signal_dates, horizons=horizons)
-        summaries = self._evaluate_returns(
+        summaries, policy_reviews = self._evaluate_returns(
             signal_dates=signal_dates,
             horizons=horizons,
             max_price_date=max_price_date,
         )
+        universe_review = self._build_universe_review(signal_dates=signal_dates)
         metric_rows = self._build_metric_rows(run_id=run_id, summaries=summaries)
         metric_count = self.repo.save_validation_metrics(pd.DataFrame(metric_rows))
 
@@ -82,6 +93,8 @@ class ValidationEngine:
             "evaluated_trade_dates": len(signal_dates),
             "metric_rows": metric_count,
             "summaries": summaries,
+            "policy_reviews": policy_reviews,
+            "universe_review": universe_review,
         }
 
     def _materialize_signal_chain(self, *, signal_dates: list[str], horizons: list[int]) -> None:
@@ -136,10 +149,10 @@ class ValidationEngine:
         signal_dates: list[str],
         horizons: list[int],
         max_price_date: str,
-    ) -> dict[int, dict]:
+    ) -> tuple[dict[int, dict], dict[int, dict]]:
         signals_df = self.repo.read_dataframe(
             """
-            SELECT trade_date, symbol, horizon, final_rank, target_weight
+            SELECT trade_date, symbol, horizon, final_rank, target_weight, rule_tags
             FROM signals_daily
             WHERE trade_date BETWEEN ? AND ?
             ORDER BY trade_date, horizon, final_rank, symbol
@@ -147,14 +160,22 @@ class ValidationEngine:
             (signal_dates[0], signal_dates[-1]),
         )
         if signals_df.empty:
-            return {horizon: self._empty_summary(horizon=horizon) for horizon in horizons}
+            empty_summaries = {
+                horizon: self._empty_summary(horizon=horizon) for horizon in horizons
+            }
+            empty_reviews = {horizon: self._empty_policy_review() for horizon in horizons}
+            return empty_summaries, empty_reviews
 
         price_history = self.market_repo.get_price_history(
             start_date=signal_dates[0],
             end_date=max_price_date,
         )
         if price_history.empty:
-            return {horizon: self._empty_summary(horizon=horizon) for horizon in horizons}
+            empty_summaries = {
+                horizon: self._empty_summary(horizon=horizon) for horizon in horizons
+            }
+            empty_reviews = {horizon: self._empty_policy_review() for horizon in horizons}
+            return empty_summaries, empty_reviews
 
         signals_df["trade_date"] = pd.to_datetime(signals_df["trade_date"], errors="coerce").dt.strftime(
             "%Y-%m-%d"
@@ -176,10 +197,12 @@ class ValidationEngine:
         )
 
         summaries: dict[int, dict] = {}
+        policy_reviews: dict[int, dict] = {}
         for horizon in horizons:
             horizon_signals = signals_df[signals_df["horizon"] == horizon].copy()
             if horizon_signals.empty:
                 summaries[horizon] = self._empty_summary(horizon=horizon)
+                policy_reviews[horizon] = self._empty_policy_review()
                 continue
 
             outcomes: list[dict] = []
@@ -221,17 +244,20 @@ class ValidationEngine:
                         "entry_date": entry_date,
                         "exit_date": exit_date,
                         "trade_return": trade_return,
+                        "rule_tags": row.get("rule_tags", ""),
                     }
                 )
 
+            outcomes_df = pd.DataFrame(outcomes)
             summaries[horizon] = self._summarize_outcomes(
                 horizon=horizon,
                 signal_dates=signal_dates,
-                outcomes_df=pd.DataFrame(outcomes),
+                outcomes_df=outcomes_df,
                 skipped_trades=skipped_trades,
             )
+            policy_reviews[horizon] = self._summarize_policy_review(outcomes_df)
 
-        return summaries
+        return summaries, policy_reviews
 
     def _build_metric_rows(self, *, run_id: str, summaries: dict[int, dict]) -> list[dict]:
         rows: list[dict] = []
@@ -248,6 +274,56 @@ class ValidationEngine:
                     }
                 )
         return rows
+
+    def _build_universe_review(self, *, signal_dates: list[str]) -> dict:
+        if not signal_dates:
+            return {
+                "instrument_count": 0,
+                "avg_eligible_pool": 0.0,
+                "avg_feature_ready": 0.0,
+                "avg_daily_signals": 0.0,
+            }
+
+        instrument_count = int(len(self.market_repo.get_instruments()))
+
+        pool_df = self.repo.read_dataframe(
+            """
+            SELECT trade_date, COUNT(*) AS eligible_count
+            FROM stock_pool_daily
+            WHERE trade_date BETWEEN ? AND ?
+              AND eligible = TRUE
+            GROUP BY trade_date
+            ORDER BY trade_date
+            """,
+            (signal_dates[0], signal_dates[-1]),
+        )
+        feature_df = self.repo.read_dataframe(
+            """
+            SELECT trade_date, COUNT(*) AS feature_count
+            FROM features_daily
+            WHERE trade_date BETWEEN ? AND ?
+            GROUP BY trade_date
+            ORDER BY trade_date
+            """,
+            (signal_dates[0], signal_dates[-1]),
+        )
+        signal_df = self.repo.read_dataframe(
+            """
+            SELECT trade_date, COUNT(*) AS signal_count
+            FROM signals_daily
+            WHERE trade_date BETWEEN ? AND ?
+            GROUP BY trade_date
+            ORDER BY trade_date
+            """,
+            (signal_dates[0], signal_dates[-1]),
+        )
+
+        return {
+            "instrument_count": instrument_count,
+            "avg_eligible_pool": float(pool_df["eligible_count"].mean()) if not pool_df.empty else 0.0,
+            "avg_feature_ready": float(feature_df["feature_count"].mean()) if not feature_df.empty else 0.0,
+            "avg_daily_signals": float(signal_df["signal_count"].mean()) if not signal_df.empty else 0.0,
+        }
 
     @staticmethod
     def _summarize_outcomes(
@@ -303,4 +379,90 @@ class ValidationEngine:
             "max_drawdown": 0.0,
             "skipped_trades": 0.0,
             "coverage_ratio": 0.0,
+        }
+
+    @staticmethod
+    def _summarize_policy_review(outcomes_df: pd.DataFrame) -> dict:
+        if outcomes_df.empty:
+            return ValidationEngine._empty_policy_review()
+
+        frame = outcomes_df.copy()
+        frame["rule_tags"] = frame["rule_tags"].fillna("").astype(str)
+        frame["has_policy"] = frame["rule_tags"].str.contains("policy_gate")
+        frame["policy_themes"] = frame["rule_tags"].apply(ValidationEngine._extract_policy_themes)
+
+        return {
+            "policy_group": ValidationEngine._summarize_policy_subset(
+                frame[frame["has_policy"]]
+            ),
+            "non_policy_group": ValidationEngine._summarize_policy_subset(
+                frame[~frame["has_policy"]]
+            ),
+            "theme_groups": ValidationEngine._summarize_theme_groups(frame),
+        }
+
+    @staticmethod
+    def _summarize_policy_subset(frame: pd.DataFrame) -> dict:
+        if frame.empty:
+            return {
+                "trade_count": 0.0,
+                "avg_trade_return": 0.0,
+                "win_rate": 0.0,
+            }
+        return {
+            "trade_count": float(len(frame)),
+            "avg_trade_return": float(frame["trade_return"].mean()),
+            "win_rate": float((frame["trade_return"] > 0).mean()),
+        }
+
+    @staticmethod
+    def _summarize_theme_groups(frame: pd.DataFrame) -> list[dict]:
+        exploded = frame[["trade_return", "policy_themes"]].explode("policy_themes")
+        exploded = exploded[exploded["policy_themes"].notna()].copy()
+        if exploded.empty:
+            return []
+
+        grouped_rows: list[dict] = []
+        for theme, theme_frame in exploded.groupby("policy_themes"):
+            grouped_rows.append(
+                {
+                    "theme": str(theme),
+                    "trade_count": float(len(theme_frame)),
+                    "avg_trade_return": float(theme_frame["trade_return"].mean()),
+                    "win_rate": float((theme_frame["trade_return"] > 0).mean()),
+                }
+            )
+        grouped_rows.sort(
+            key=lambda item: (
+                -item["avg_trade_return"],
+                -item["trade_count"],
+                item["theme"],
+            )
+        )
+        return grouped_rows
+
+    @staticmethod
+    def _extract_policy_themes(rule_tags: str) -> list[str]:
+        if not rule_tags:
+            return []
+        return [
+            tag
+            for tag in rule_tags.split("|")
+            if tag and tag not in GENERIC_RULE_TAGS
+        ]
+
+    @staticmethod
+    def _empty_policy_review() -> dict:
+        return {
+            "policy_group": {
+                "trade_count": 0.0,
+                "avg_trade_return": 0.0,
+                "win_rate": 0.0,
+            },
+            "non_policy_group": {
+                "trade_count": 0.0,
+                "avg_trade_return": 0.0,
+                "win_rate": 0.0,
+            },
+            "theme_groups": [],
         }

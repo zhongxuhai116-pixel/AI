@@ -10,6 +10,8 @@ def build_markdown_template(context: dict) -> str:
     market_ai = ai_outputs.get("market_summary", {})
     stock_ai = ai_outputs.get("stock_explanations", [])
     validation_summaries = validation_outputs.get("summaries", {})
+    validation_policy_reviews = validation_outputs.get("policy_reviews", {})
+    validation_universe_review = validation_outputs.get("universe_review", {})
     policy_themes = policy_outputs.get("active_themes", [])
 
     lines = [
@@ -39,6 +41,20 @@ def build_markdown_template(context: dict) -> str:
 
     if validation_summaries:
         lines.append("## Validation Snapshot")
+        if validation_universe_review:
+            lines.append(
+                f"- Universe: {int(validation_universe_review.get('instrument_count', 0) or 0)} instruments"
+            )
+            lines.append(
+                f"- Avg eligible pool: {validation_universe_review.get('avg_eligible_pool', 0.0):.1f}"
+            )
+            lines.append(
+                f"- Avg feature-ready pool: {validation_universe_review.get('avg_feature_ready', 0.0):.1f}"
+            )
+            lines.append(
+                f"- Avg daily signals: {validation_universe_review.get('avg_daily_signals', 0.0):.1f}"
+            )
+            lines.append("")
         for horizon in sorted(validation_summaries):
             summary = validation_summaries[horizon]
             lines.append(f"### Horizon {horizon}D")
@@ -48,6 +64,27 @@ def build_markdown_template(context: dict) -> str:
             lines.append(f"- Win rate: {summary.get('win_rate', 0.0):.2%}")
             lines.append(f"- Cumulative return: {summary.get('cumulative_return', 0.0):.2%}")
             lines.append(f"- Max drawdown: {summary.get('max_drawdown', 0.0):.2%}")
+            lines.append("")
+
+    if validation_policy_reviews:
+        lines.append("## Policy Validation")
+        for horizon in sorted(validation_policy_reviews):
+            review = validation_policy_reviews[horizon]
+            policy_group = review.get("policy_group", {})
+            non_policy_group = review.get("non_policy_group", {})
+            theme_groups = review.get("theme_groups", [])
+            lines.append(f"### Horizon {horizon}D")
+            lines.append(
+                f"- Policy trades: {int(policy_group.get('trade_count', 0) or 0)} | avg={policy_group.get('avg_trade_return', 0.0):.2%} | win={policy_group.get('win_rate', 0.0):.2%}"
+            )
+            lines.append(
+                f"- Non-policy trades: {int(non_policy_group.get('trade_count', 0) or 0)} | avg={non_policy_group.get('avg_trade_return', 0.0):.2%} | win={non_policy_group.get('win_rate', 0.0):.2%}"
+            )
+            if theme_groups:
+                top_theme = theme_groups[0]
+                lines.append(
+                    f"- Best policy theme: {top_theme.get('theme', '')} | avg={top_theme.get('avg_trade_return', 0.0):.2%} | trades={int(top_theme.get('trade_count', 0) or 0)}"
+                )
             lines.append("")
 
     if policy_themes:
@@ -91,7 +128,7 @@ def build_markdown_template(context: dict) -> str:
                 lines.append(f"  Source: {source_url}")
             watchlist_candidates = theme.get("watchlist_candidates", [])
             if watchlist_candidates:
-                lines.append("  Watchlist:")
+                lines.append("  Watchlist sample:")
                 for item in watchlist_candidates[:3]:
                     display = f"{item.get('symbol', '')} {item.get('name', '')}".strip()
                     ret_5d = float(item.get("ret_5d", 0.0) or 0.0)

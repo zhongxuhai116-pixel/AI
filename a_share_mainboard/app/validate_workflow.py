@@ -7,8 +7,10 @@ from data.storage.repositories import MarketRepository, ResearchRepository
 from data.storage.duckdb_client import DuckDBClient
 from infra.config.settings import Settings
 from infra.logging.run_logger import RunLogger
+from infra.utils.io import write_text
 from strategy.validation.execution_model import ExecutionModel
 from strategy.validation.validation_engine import ValidationEngine
+from strategy.validation.validation_reporter import ValidationReporter
 
 
 @dataclass(slots=True)
@@ -62,8 +64,18 @@ class ValidateWorkflow:
                 "end_date": validation_result["end_date"],
                 "horizon": horizon,
                 "summary": validation_result["summaries"].get(horizon, {}),
+                "policy_review": validation_result["policy_reviews"].get(horizon, {}),
+                "universe_review": validation_result.get("universe_review", {}),
                 "message": "Validation run completed.",
             }
+            report_path = (
+                self.db_client.db_path.parents[1]
+                / "reports"
+                / f"validation_{horizon}d_{validation_result['end_date']}.md"
+            )
+            report_markdown = ValidationReporter().build_report(result=result, horizon=horizon)
+            write_text(report_path, report_markdown)
+            result["report_path"] = str(report_path)
             self.run_logger.log_event(
                 run_id=run_id,
                 module="validate_workflow",
