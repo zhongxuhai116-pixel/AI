@@ -1,12 +1,18 @@
 horizons = [5, 10]
-top_n = 20
+top_n = 10
 rebalance_frequency = "daily"
 enable_ml_ranker = false
+min_amount_ratio_5d = 1.0
+max_turnover_quantile = 0.5
+require_benchmark_positive = true
+allowed_regimes = ["bullish", "neutral"]
+allowed_volume_heat = ["warm", "hot"]
 
 [baseline_weights]
 ret_5d = 0.35
-ret_10d = 0.25
-rs_index_10d = 0.20
-amount_ratio_5d = 0.10
-volatility_10d = -0.10
-
+ret_10d = 0.15
+rs_index_10d = 0.25
+ma_gap_5 = 0.10
+amount_ratio_5d = 0.05
+volatility_10d = -0.05
+turnover_5d = -0.05

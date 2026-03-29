@@ -293,7 +293,7 @@ class DailyWorkflow:
                 "message": (
                     "Collected mainboard data and produced the phase-1 research chain."
                     if signal_count > 0
-                    else "Collected mainboard data. Candidate signals are pending enough historical price bars."
+                    else "Collected mainboard data. No candidates passed the current sentiment and execution gates."
                 ),
             }
             self.run_logger.finish_run(run_id=run_id, status="SUCCESS", summary=result)

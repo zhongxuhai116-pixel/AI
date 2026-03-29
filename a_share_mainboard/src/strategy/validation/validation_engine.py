@@ -8,6 +8,7 @@ from data.features.feature_pipeline import FeaturePipeline
 from data.filters.stock_pool_builder import StockPoolBuilder
 from data.storage.repositories import MarketRepository, ResearchRepository
 from infra.config.settings import StrategySettings, UniverseSettings, ValidationSettings
+from strategy.market_scan.market_scan_service import MarketScanService
 from strategy.rules.rule_engine import RuleEngine
 from strategy.stock_selection.baseline_ranker import BaselineRanker
 from strategy.stock_selection.selection_service import SelectionService
@@ -92,6 +93,11 @@ class ValidationEngine:
             repo=self.repo,
             benchmark_index=self.benchmark_index,
         )
+        market_scan_service = MarketScanService(
+            market_repo=self.market_repo,
+            repo=self.repo,
+            benchmark_index=self.benchmark_index,
+        )
         selection_service = SelectionService(
             repo=self.repo,
             baseline_ranker=BaselineRanker(
@@ -103,6 +109,7 @@ class ValidationEngine:
         for trade_date in signal_dates:
             stock_pool_builder.build(trade_date=trade_date)
             feature_pipeline.run(trade_date=trade_date)
+            market_scan_service.run(trade_date=trade_date)
             selection_service.run(trade_date=trade_date, horizons=horizons)
             self.repo.delete_signals_for_trade_date(trade_date)
             for horizon in horizons:

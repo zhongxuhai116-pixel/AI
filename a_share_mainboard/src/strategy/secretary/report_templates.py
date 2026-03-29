@@ -20,6 +20,7 @@ def build_markdown_template(context: dict) -> str:
         f"- Style: {market_regime.get('style_label', 'unknown')}",
         f"- Breadth up ratio: {market_regime.get('breadth_up_ratio', 0.0):.4f}",
         f"- Volume heat: {market_regime.get('volume_heat', 'unknown')}",
+        "",
     ]
 
     if market_ai:

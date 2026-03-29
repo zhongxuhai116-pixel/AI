@@ -33,6 +33,13 @@ class StrategySettings(BaseModel):
     rebalance_frequency: str
     enable_ml_ranker: bool
     baseline_weights: dict[str, float]
+    min_amount_ratio_5d: float | None = None
+    max_turnover_quantile: float | None = None
+    min_ret_5d: float | None = None
+    min_rs_index_10d: float | None = None
+    require_benchmark_positive: bool = False
+    allowed_regimes: list[str] = ["bullish", "neutral"]
+    allowed_volume_heat: list[str] = ["warm", "hot"]
 
 
 class ValidationSettings(BaseModel):

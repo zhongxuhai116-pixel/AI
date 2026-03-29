@@ -40,7 +40,7 @@ class BaselineRanker:
             values = pd.to_numeric(frame[factor], errors="coerce")
             factor_rank = values.rank(
                 pct=True,
-                ascending=weight < 0,
+                ascending=weight > 0,
                 method="average",
             ).fillna(0.5)
             frame["score_raw"] += abs(weight) * factor_rank
