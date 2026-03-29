@@ -35,6 +35,7 @@ class DesktopApp(tk.Tk):
         self.worker_thread: threading.Thread | None = None
         self.run_buttons: list[ttk.Button] = []
         self.status_var = tk.StringVar(value="Idle")
+        self.reco_var = tk.StringVar(value="推荐股票：暂无数据")
 
         self.daily_trade_date_var = tk.StringVar(value=date.today().isoformat())
         self.validate_start_var = tk.StringVar(
@@ -57,6 +58,7 @@ class DesktopApp(tk.Tk):
         self.rebuild_end_var = tk.StringVar(value=date.today().isoformat())
 
         self.log_text: tk.Text | None = None
+        self.reco_tree: ttk.Treeview | None = None
         self._build_layout()
         self._render_settings_summary()
         self.after(200, self._drain_event_queue)
@@ -73,7 +75,7 @@ class DesktopApp(tk.Tk):
 
         output_panel = ttk.Frame(root)
         output_panel.grid(row=0, column=1, sticky="nsew")
-        output_panel.rowconfigure(2, weight=1)
+        output_panel.rowconfigure(3, weight=1)
         output_panel.columnconfigure(0, weight=1)
 
         self._build_daily_card(control_panel)
@@ -90,8 +92,21 @@ class DesktopApp(tk.Tk):
         self.summary_label = ttk.Label(output_panel, text="", justify=tk.LEFT)
         self.summary_label.grid(row=1, column=0, sticky="w", pady=(4, 8))
 
+        reco_frame = ttk.LabelFrame(output_panel, text="推荐股票清单（Daily）", padding=6)
+        reco_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        reco_frame.rowconfigure(1, weight=1)
+        reco_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            reco_frame,
+            textvariable=self.reco_var,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        self._build_recommendation_table(reco_frame)
+
         log_frame = ttk.Frame(output_panel)
-        log_frame.grid(row=2, column=0, sticky="nsew")
+        log_frame.grid(row=3, column=0, sticky="nsew")
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
 
@@ -102,6 +117,34 @@ class DesktopApp(tk.Tk):
         text_widget.configure(yscrollcommand=scroll.set)
         self.log_text = text_widget
         self._append_log("Desktop launcher initialized.")
+
+    def _build_recommendation_table(self, parent: ttk.Frame) -> None:
+        columns = ("seq", "role", "horizon", "symbol", "name", "rank", "weight", "tags")
+        tree = ttk.Treeview(
+            parent,
+            columns=columns,
+            show="headings",
+            height=8,
+        )
+        tree.grid(row=1, column=0, sticky="nsew")
+        headings = {
+            "seq": ("序号", 54),
+            "role": ("主辅", 70),
+            "horizon": ("周期D", 70),
+            "symbol": ("代码", 90),
+            "name": ("名称", 120),
+            "rank": ("排名", 70),
+            "weight": ("权重", 80),
+            "tags": ("标签", 280),
+        }
+        for key, (title, width) in headings.items():
+            tree.heading(key, text=title)
+            tree.column(key, width=width, stretch=True, anchor=tk.W)
+
+        scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        tree.configure(yscrollcommand=scroll.set)
+        self.reco_tree = tree
 
     def _build_daily_card(self, parent: ttk.Frame) -> None:
         card = ttk.LabelFrame(parent, text="Daily Workflow", padding=10)
@@ -283,6 +326,7 @@ class DesktopApp(tk.Tk):
         if kind == "result":
             task_name = item.get("task", "task")
             result = item.get("result", {})
+            self._refresh_recommendations(task_name=task_name, result=result)
             self._append_log(
                 f"{task_name} finished.\n{json.dumps(result, ensure_ascii=False, indent=2)}"
             )
@@ -323,6 +367,44 @@ class DesktopApp(tk.Tk):
         state = tk.NORMAL if enabled else tk.DISABLED
         for button in self.run_buttons:
             button.configure(state=state)
+
+    def _refresh_recommendations(self, *, task_name: str, result: dict[str, Any]) -> None:
+        if self.reco_tree is None:
+            return
+        for child in self.reco_tree.get_children():
+            self.reco_tree.delete(child)
+
+        if task_name != "daily":
+            self.reco_var.set("推荐股票：仅在 Daily 任务后更新")
+            return
+
+        top_signals = result.get("top_signals", [])
+        if not isinstance(top_signals, list) or not top_signals:
+            self.reco_var.set("推荐股票：本次无候选")
+            return
+
+        primary = result.get("strategy_profile", {}).get("primary_horizon")
+        effective_date = result.get("effective_trade_date", "")
+        self.reco_var.set(
+            f"推荐股票：{len(top_signals)} 只 | 交易日 {effective_date} | 主周期 {primary}D"
+        )
+
+        for index, signal in enumerate(top_signals, start=1):
+            weight = signal.get("target_weight")
+            self.reco_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    index,
+                    signal.get("role", ""),
+                    signal.get("horizon", ""),
+                    signal.get("symbol", ""),
+                    signal.get("name", ""),
+                    signal.get("final_rank", ""),
+                    f"{float(weight):.2%}" if isinstance(weight, (float, int)) else "",
+                    signal.get("rule_tags", ""),
+                ),
+            )
 
 
 def _compact_payload(payload: Any, limit: int = 280) -> str:

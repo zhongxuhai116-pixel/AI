@@ -29,6 +29,7 @@ python scripts/run_desktop.py
 
 - Capabilities:
   - Run daily workflow
+  - Show clearly visible daily recommended stocks in a dedicated table (code/name/horizon/role/rank/weight/tags)
   - Run single validation
   - Run rolling validation
   - Run historical rebuild

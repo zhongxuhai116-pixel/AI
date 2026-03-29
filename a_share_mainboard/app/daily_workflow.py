@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -423,6 +424,11 @@ class DailyWorkflow:
                 "strategy_profile": strategy_profile,
                 "policy_status": policy_context.get("status", "UNKNOWN"),
                 "policy_themes": policy_context.get("active_themes", []),
+                "top_signals": self._build_top_signals(
+                    signals_df=signals_df,
+                    strategy_profile=strategy_profile,
+                    limit=20,
+                ),
                 "message": (
                     "Collected mainboard data and produced the policy-aware research chain."
                     if signal_count > 0
@@ -538,6 +544,53 @@ class DailyWorkflow:
             "matched_symbols": matched_bonus_candidates,
         }
 
+    @staticmethod
+    def _build_top_signals(
+        *,
+        signals_df,
+        strategy_profile: dict[str, Any],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if signals_df is None or signals_df.empty or limit <= 0:
+            return []
+
+        primary_horizon = strategy_profile.get("primary_horizon")
+        rows = (
+            signals_df.sort_values(["horizon", "final_rank", "symbol"])
+            .to_dict(orient="records")
+        )
+        ranked: list[dict[str, Any]] = []
+        for row in rows:
+            horizon = _safe_int(row.get("horizon"))
+            rank = _safe_int(row.get("final_rank"))
+            target_weight = _safe_float(row.get("target_weight"))
+            signal = {
+                "symbol": str(row.get("symbol", "") or ""),
+                "name": str(row.get("name", "") or ""),
+                "horizon": horizon,
+                "role": (
+                    "PRIMARY"
+                    if primary_horizon is not None and horizon == int(primary_horizon)
+                    else "AUX"
+                ),
+                "final_rank": rank,
+                "target_weight": target_weight,
+                "rule_tags": str(row.get("rule_tags", "") or ""),
+            }
+            ranked.append(signal)
+
+        ranked.sort(
+            key=lambda item: (
+                0
+                if item.get("role") == "PRIMARY"
+                else 1,
+                int(item.get("horizon") or 999),
+                int(item.get("final_rank") or 9999),
+                str(item.get("symbol") or ""),
+            )
+        )
+        return ranked[:limit]
+
     def _run_ai_explanations(
         self,
         *,
@@ -635,3 +688,25 @@ class DailyWorkflow:
             horizons=self.settings.strategy.execution_horizons(),
             run_id=run_id,
         )
+
+
+def _safe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
