@@ -80,7 +80,10 @@ class ValidationEngine:
             horizons=horizons,
             max_price_date=max_price_date,
         )
-        universe_review = self._build_universe_review(signal_dates=signal_dates)
+        universe_review = self._build_universe_review(
+            signal_dates=signal_dates,
+            horizons=horizons,
+        )
         metric_rows = self._build_metric_rows(run_id=run_id, summaries=summaries)
         metric_count = self.repo.save_validation_metrics(pd.DataFrame(metric_rows))
 
@@ -275,12 +278,14 @@ class ValidationEngine:
                 )
         return rows
 
-    def _build_universe_review(self, *, signal_dates: list[str]) -> dict:
+    def _build_universe_review(self, *, signal_dates: list[str], horizons: list[int]) -> dict:
         if not signal_dates:
             return {
                 "instrument_count": 0,
                 "avg_eligible_pool": 0.0,
                 "avg_feature_ready": 0.0,
+                "avg_daily_signals_total": 0.0,
+                "avg_daily_signals_per_horizon": 0.0,
                 "avg_daily_signals": 0.0,
             }
 
@@ -318,11 +323,17 @@ class ValidationEngine:
             (signal_dates[0], signal_dates[-1]),
         )
 
+        avg_daily_signals_total = float(signal_df["signal_count"].mean()) if not signal_df.empty else 0.0
+        horizon_count = max(len(horizons), 1)
+        avg_daily_signals_per_horizon = avg_daily_signals_total / horizon_count
+
         return {
             "instrument_count": instrument_count,
             "avg_eligible_pool": float(pool_df["eligible_count"].mean()) if not pool_df.empty else 0.0,
             "avg_feature_ready": float(feature_df["feature_count"].mean()) if not feature_df.empty else 0.0,
-            "avg_daily_signals": float(signal_df["signal_count"].mean()) if not signal_df.empty else 0.0,
+            "avg_daily_signals_total": avg_daily_signals_total,
+            "avg_daily_signals_per_horizon": avg_daily_signals_per_horizon,
+            "avg_daily_signals": avg_daily_signals_per_horizon,
         }
 
     @staticmethod

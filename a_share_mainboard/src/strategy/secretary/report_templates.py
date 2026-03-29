@@ -13,6 +13,9 @@ def build_markdown_template(context: dict) -> str:
     validation_policy_reviews = validation_outputs.get("policy_reviews", {})
     validation_universe_review = validation_outputs.get("universe_review", {})
     policy_themes = policy_outputs.get("active_themes", [])
+    strategy_profile = context.get("strategy_profile", {})
+    primary_horizon = strategy_profile.get("primary_horizon")
+    auxiliary_horizons = strategy_profile.get("auxiliary_horizons", [])
 
     lines = [
         "# Daily Report",
@@ -24,6 +27,10 @@ def build_markdown_template(context: dict) -> str:
         f"- Style: {market_regime.get('style_label', 'unknown')}",
         f"- Breadth up ratio: {market_regime.get('breadth_up_ratio', 0.0):.4f}",
         f"- Volume heat: {market_regime.get('volume_heat', 'unknown')}",
+        "",
+        "## Strategy Profile",
+        f"- Primary horizon: {primary_horizon if primary_horizon is not None else 'n/a'}D",
+        f"- Auxiliary horizons: {', '.join(str(value) + 'D' for value in auxiliary_horizons) if auxiliary_horizons else 'none'}",
         "",
     ]
 
@@ -52,12 +59,15 @@ def build_markdown_template(context: dict) -> str:
                 f"- Avg feature-ready pool: {validation_universe_review.get('avg_feature_ready', 0.0):.1f}"
             )
             lines.append(
-                f"- Avg daily signals: {validation_universe_review.get('avg_daily_signals', 0.0):.1f}"
+                f"- Avg daily signals (total): {validation_universe_review.get('avg_daily_signals_total', validation_universe_review.get('avg_daily_signals', 0.0)):.1f}"
+            )
+            lines.append(
+                f"- Avg daily signals (per horizon): {validation_universe_review.get('avg_daily_signals_per_horizon', validation_universe_review.get('avg_daily_signals', 0.0)):.1f}"
             )
             lines.append("")
-        for horizon in sorted(validation_summaries):
+        for horizon in _ordered_horizons(validation_summaries, primary_horizon):
             summary = validation_summaries[horizon]
-            lines.append(f"### Horizon {horizon}D")
+            lines.append(f"### { _horizon_label(horizon, primary_horizon) }")
             lines.append(f"- Signal days: {int(summary.get('signal_days', 0))}")
             lines.append(f"- Trade count: {int(summary.get('trade_count', 0))}")
             lines.append(f"- Avg trade return: {summary.get('avg_trade_return', 0.0):.2%}")
@@ -68,12 +78,12 @@ def build_markdown_template(context: dict) -> str:
 
     if validation_policy_reviews:
         lines.append("## Policy Validation")
-        for horizon in sorted(validation_policy_reviews):
+        for horizon in _ordered_horizons(validation_policy_reviews, primary_horizon):
             review = validation_policy_reviews[horizon]
             policy_group = review.get("policy_group", {})
             non_policy_group = review.get("non_policy_group", {})
             theme_groups = review.get("theme_groups", [])
-            lines.append(f"### Horizon {horizon}D")
+            lines.append(f"### { _horizon_label(horizon, primary_horizon) }")
             lines.append(
                 f"- Policy trades: {int(policy_group.get('trade_count', 0) or 0)} | avg={policy_group.get('avg_trade_return', 0.0):.2%} | win={policy_group.get('win_rate', 0.0):.2%}"
             )
@@ -147,8 +157,8 @@ def build_markdown_template(context: dict) -> str:
         lines.append("- No candidate signals for this run.")
         return "\n".join(lines) + "\n"
 
-    for horizon in sorted(signals_by_horizon):
-        lines.append(f"### Horizon {horizon}D")
+    for horizon in _ordered_horizons(signals_by_horizon, primary_horizon):
+        lines.append(f"### { _horizon_label(horizon, primary_horizon) }")
         for row in signals_by_horizon[horizon][:10]:
             name = row.get("name", "")
             display = f"{row.get('symbol', '')} {name}".strip()
@@ -196,3 +206,17 @@ def build_markdown_template(context: dict) -> str:
 
 def build_json_template(context: dict) -> dict:
     return context
+
+
+def _ordered_horizons(payload: dict, primary_horizon: int | None) -> list[int]:
+    horizons = [int(value) for value in payload.keys()]
+    unique = sorted(set(horizons))
+    if primary_horizon is None or primary_horizon not in unique:
+        return unique
+    return [primary_horizon] + [value for value in unique if value != primary_horizon]
+
+
+def _horizon_label(horizon: int, primary_horizon: int | None) -> str:
+    if primary_horizon is not None and horizon == primary_horizon:
+        return f"Primary Horizon {horizon}D"
+    return f"Auxiliary Horizon {horizon}D"

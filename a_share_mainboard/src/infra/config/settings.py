@@ -29,6 +29,8 @@ class UniverseSettings(BaseModel):
 
 class StrategySettings(BaseModel):
     horizons: list[int]
+    primary_horizon: int | None = None
+    auxiliary_horizons: list[int] = []
     top_n: int
     rebalance_frequency: str
     enable_ml_ranker: bool
@@ -40,6 +42,43 @@ class StrategySettings(BaseModel):
     require_benchmark_positive: bool = False
     allowed_regimes: list[str] = ["bullish", "neutral"]
     allowed_volume_heat: list[str] = ["warm", "hot"]
+
+    def execution_horizons(self) -> list[int]:
+        if not self.horizons:
+            return []
+
+        unique_horizons: list[int] = []
+        for horizon in self.horizons:
+            if horizon not in unique_horizons:
+                unique_horizons.append(horizon)
+
+        if self.primary_horizon in unique_horizons:
+            primary = int(self.primary_horizon)
+        else:
+            primary = max(unique_horizons)
+
+        ordered: list[int] = [primary]
+        for horizon in self.auxiliary_horizons:
+            if horizon in unique_horizons and horizon not in ordered:
+                ordered.append(horizon)
+        for horizon in unique_horizons:
+            if horizon not in ordered:
+                ordered.append(horizon)
+        return ordered
+
+    def strategy_profile(self) -> dict:
+        ordered = self.execution_horizons()
+        if not ordered:
+            return {
+                "primary_horizon": None,
+                "auxiliary_horizons": [],
+                "execution_horizons": [],
+            }
+        return {
+            "primary_horizon": ordered[0],
+            "auxiliary_horizons": ordered[1:],
+            "execution_horizons": ordered,
+        }
 
 
 class ValidationSettings(BaseModel):

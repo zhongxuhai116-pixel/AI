@@ -261,7 +261,7 @@ class DailyWorkflow:
                 ),
             ).run(
                 trade_date=effective_trade_date,
-                horizons=self.settings.strategy.horizons,
+                horizons=self.settings.strategy.execution_horizons(),
             )
             self.run_logger.log_event(
                 run_id=run_id,
@@ -283,8 +283,9 @@ class DailyWorkflow:
                 policy_service=policy_service,
                 instruments_df=instruments_df,
             )
+            strategy_profile = self.settings.strategy.strategy_profile()
             policy_contexts: list[dict[str, Any]] = []
-            for horizon in self.settings.strategy.horizons:
+            for horizon in strategy_profile["execution_horizons"]:
                 signal_count += rule_engine.run(
                     trade_date=effective_trade_date,
                     horizon=horizon,
@@ -350,6 +351,7 @@ class DailyWorkflow:
                 ai_outputs=ai_outputs,
                 validation_outputs=validation_outputs,
                 policy_outputs=policy_context,
+                strategy_profile=strategy_profile,
             )
             report_path = (
                 self.db_client.db_path.parents[1]
@@ -379,6 +381,7 @@ class DailyWorkflow:
                 report_path=str(report_path),
                 validation_outputs=validation_outputs,
                 policy_outputs=policy_context,
+                strategy_profile=strategy_profile,
             )
             self.run_logger.log_event(
                 run_id=run_id,
@@ -409,6 +412,7 @@ class DailyWorkflow:
                 "feishu_status": feishu_result.get("status", "UNKNOWN"),
                 "validation_status": validation_outputs.get("status", "UNKNOWN"),
                 "validation_summary": validation_outputs.get("summaries", {}),
+                "strategy_profile": strategy_profile,
                 "policy_status": policy_context.get("status", "UNKNOWN"),
                 "policy_themes": policy_context.get("active_themes", []),
                 "message": (
@@ -620,6 +624,6 @@ class DailyWorkflow:
         ).run(
             start_date=validation_start_date,
             end_date=trade_date,
-            horizons=self.settings.strategy.horizons,
+            horizons=self.settings.strategy.execution_horizons(),
             run_id=run_id,
         )

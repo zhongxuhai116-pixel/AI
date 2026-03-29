@@ -116,9 +116,14 @@ def test_validation_engine_builds_universe_review():
         policy_settings=None,
     )
 
-    review = engine._build_universe_review(signal_dates=["2026-03-20", "2026-03-21"])
+    review = engine._build_universe_review(
+        signal_dates=["2026-03-20", "2026-03-21"],
+        horizons=[5, 10],
+    )
 
     assert review["instrument_count"] == 2
     assert review["avg_eligible_pool"] == 1.5
     assert review["avg_feature_ready"] == 2.0
-    assert review["avg_daily_signals"] == 0.5
+    assert review["avg_daily_signals_total"] == 0.5
+    assert review["avg_daily_signals_per_horizon"] == 0.25
+    assert review["avg_daily_signals"] == 0.25

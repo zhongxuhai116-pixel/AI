@@ -1,4 +1,6 @@
 horizons = [5, 10]
+primary_horizon = 10
+auxiliary_horizons = [5]
 top_n = 10
 rebalance_frequency = "daily"
 enable_ml_ranker = false

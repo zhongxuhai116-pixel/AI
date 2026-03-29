@@ -24,6 +24,7 @@ class FeishuSyncService:
         report_path: str,
         validation_outputs: dict | None = None,
         policy_outputs: dict | None = None,
+        strategy_profile: dict | None = None,
     ) -> dict:
         if not self.settings.enabled:
             return {"status": "SKIPPED", "message": "Feishu is disabled by configuration."}
@@ -50,6 +51,7 @@ class FeishuSyncService:
                 report_path=report_path,
                 validation_outputs=validation_outputs or {},
                 policy_outputs=policy_outputs or {},
+                strategy_profile=strategy_profile or {},
             )
             response = client.send_text(message)
             return {"status": "SUCCESS", "response": response}
@@ -68,15 +70,18 @@ class FeishuSyncService:
         report_path: str,
         validation_outputs: dict,
         policy_outputs: dict,
+        strategy_profile: dict,
     ) -> str:
+        primary_horizon = strategy_profile.get("primary_horizon")
         lines = [
-            f"A股主板日报 {trade_date}",
-            f"市场状态: {market_regime.get('regime_label', 'unknown')} / {market_regime.get('style_label', 'unknown')}",
+            f"A-share Mainboard Daily {trade_date}",
+            f"Market regime: {market_regime.get('regime_label', 'unknown')} / {market_regime.get('style_label', 'unknown')}",
+            f"Primary horizon: {primary_horizon if primary_horizon is not None else 'n/a'}D",
         ]
 
         market_ai = ai_outputs.get("market_summary", {})
         if market_ai:
-            lines.append(f"AI摘要: {market_ai.get('market_summary', '')}")
+            lines.append(f"AI summary: {market_ai.get('market_summary', '')}")
 
         policy_themes = policy_outputs.get("active_themes", [])
         if policy_themes:
@@ -86,19 +91,22 @@ class FeishuSyncService:
                 heat = theme.get("sentiment_label", "inactive")
                 event = theme.get("event_label", "ongoing")
                 labels.append(f"{label}({heat}/{event})")
-            lines.append("政策主线: " + "、".join(labels))
+            lines.append("Policy themes: " + " | ".join(labels))
 
         validation_summaries = validation_outputs.get("summaries", {})
-        for horizon in sorted(validation_summaries):
+        for horizon in _ordered_horizons(validation_summaries, primary_horizon):
             summary = validation_summaries[horizon]
+            role = "PRIMARY" if horizon == primary_horizon else "AUX"
             lines.append(
-                f"{horizon}D验证: 胜率 {summary.get('win_rate', 0.0):.1%} | 累计 {summary.get('cumulative_return', 0.0):.1%}"
+                f"{role} {horizon}D validation: win {summary.get('win_rate', 0.0):.1%} | cumulative {summary.get('cumulative_return', 0.0):.1%}"
             )
 
         if signals_df is not None and not signals_df.empty:
             top5 = signals_df.sort_values(["horizon", "final_rank"]).head(5)
             for row in top5.to_dict(orient="records"):
                 name = row.get("name", "")
+                horizon = int(row.get("horizon", 0) or 0)
+                role = "P" if primary_horizon is not None and horizon == primary_horizon else "A"
                 heat = ""
                 tags = str(row.get("rule_tags", ""))
                 if "policy_hot" in tags:
@@ -106,10 +114,18 @@ class FeishuSyncService:
                 elif "policy_warm" in tags:
                     heat = " | heat=warm"
                 lines.append(
-                    f"{row.get('horizon')}D #{row.get('final_rank')}: {row.get('symbol')} {name}{heat}".strip()
+                    f"{role} {horizon}D #{row.get('final_rank')}: {row.get('symbol')} {name}{heat}".strip()
                 )
         else:
-            lines.append("今日无候选信号。")
+            lines.append("No candidate signals today.")
 
-        lines.append(f"报告: {report_path}")
+        lines.append(f"Report: {report_path}")
         return "\n".join(lines)
+
+
+def _ordered_horizons(payload: dict, primary_horizon: int | None) -> list[int]:
+    horizons = [int(value) for value in payload.keys()]
+    unique = sorted(set(horizons))
+    if primary_horizon is None or primary_horizon not in unique:
+        return unique
+    return [primary_horizon] + [value for value in unique if value != primary_horizon]

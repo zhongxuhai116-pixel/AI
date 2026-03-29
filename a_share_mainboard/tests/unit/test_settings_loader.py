@@ -9,6 +9,9 @@ def test_load_settings_smoke():
     assert settings.app.project_name == "a_share_mainboard"
     assert settings.data.market_provider == "akshare"
     assert settings.strategy.horizons == [5, 10]
+    assert settings.strategy.primary_horizon == 10
+    assert settings.strategy.auxiliary_horizons == [5]
+    assert settings.strategy.execution_horizons() == [10, 5]
     assert settings.policy.enabled is True
     assert settings.policy.min_theme_match_count == 2
     assert settings.policy.fresh_event_days == 10
