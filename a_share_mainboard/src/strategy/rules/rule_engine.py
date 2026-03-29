@@ -1,27 +1,39 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
 from data.storage.repositories import ResearchRepository
 from infra.config.settings import StrategySettings
+from strategy.policy.policy_overlay_service import PolicyOverlayService
 
 
 @dataclass(slots=True)
 class RuleEngine:
     settings: StrategySettings
     repo: ResearchRepository
+    policy_service: PolicyOverlayService | None = None
+    instruments_df: pd.DataFrame | None = None
+    last_run_context: dict[int, dict] = field(default_factory=dict)
 
     def run(self, trade_date: str, horizon: int) -> int:
         if not self._market_is_tradeable(trade_date):
+            self.last_run_context[horizon] = self._build_policy_context(
+                trade_date=trade_date,
+                status="MARKET_BLOCKED",
+            )
             return 0
 
         scores = self.repo.get_model_scores(trade_date=trade_date, horizon=horizon)
         pool = self.repo.get_stock_pool(trade_date=trade_date, eligible_only=True)
         features = self._parse_features(trade_date)
         if scores.empty or pool.empty or features.empty:
+            self.last_run_context[horizon] = self._build_policy_context(
+                trade_date=trade_date,
+                status="NO_INPUT",
+            )
             return 0
 
         candidates = (
@@ -29,16 +41,42 @@ class RuleEngine:
             .merge(features, on="symbol", how="inner")
             .sort_values(["score_rank", "symbol"], ignore_index=True)
         )
+        if self.instruments_df is not None and not self.instruments_df.empty:
+            candidates = candidates.merge(
+                self.instruments_df[["symbol", "name", "industry_l1"]],
+                on="symbol",
+                how="left",
+            )
         candidates = self._apply_feature_filters(candidates)
         if candidates.empty:
+            self.last_run_context[horizon] = self._build_policy_context(
+                trade_date=trade_date,
+                status="NO_CANDIDATES",
+            )
             return 0
 
+        policy_context = {"active_themes": []}
+        if self.policy_service is not None:
+            candidates, policy_context = self.policy_service.apply(
+                trade_date=trade_date,
+                candidates_df=candidates,
+            )
+        else:
+            candidates["policy_bonus"] = 0.0
+            candidates["policy_tags"] = ""
+        candidates["score_raw_plus_policy"] = pd.to_numeric(
+            candidates["score_raw"], errors="coerce"
+        ).fillna(0.0) + pd.to_numeric(
+            candidates["policy_bonus"], errors="coerce"
+        ).fillna(0.0)
+
         candidates = candidates.sort_values(
-            ["score_raw", "score_rank", "symbol"],
+            ["score_raw_plus_policy", "score_rank", "symbol"],
             ascending=[False, True, True],
             ignore_index=True,
         )
         candidates = candidates.head(self.settings.top_n).copy()
+        self.last_run_context[horizon] = policy_context
         if candidates.empty:
             return 0
 
@@ -48,7 +86,13 @@ class RuleEngine:
         candidates["final_rank"] = range(1, len(candidates) + 1)
         candidates["action"] = "BUY_CANDIDATE"
         candidates["target_weight"] = weight
-        candidates["rule_tags"] = "mainboard|baseline|t_plus_1|sentiment_gate"
+        candidates["rule_tags"] = candidates.apply(
+            lambda row: self._build_rule_tags(
+                policy_tags=str(row.get("policy_tags", "")),
+                policy_sentiment_label=str(row.get("policy_sentiment_label", "")),
+            ),
+            axis=1,
+        )
         candidates["blocked_reason"] = ""
         payload = candidates[
             [
@@ -119,3 +163,28 @@ class RuleEngine:
         for column in numeric_columns:
             parsed[column] = pd.to_numeric(parsed[column], errors="coerce")
         return parsed
+
+    def _build_policy_context(self, *, trade_date: str, status: str) -> dict:
+        if self.policy_service is None:
+            return {
+                "status": status,
+                "trade_date": trade_date,
+                "theme_sentiment_label": "inactive",
+                "active_bonus_count": 0,
+                "active_themes": [],
+                "matched_symbols": 0,
+            }
+        context = self.policy_service.build_context(trade_date=trade_date)
+        context["status"] = status
+        return context
+
+    @staticmethod
+    def _build_rule_tags(*, policy_tags: str, policy_sentiment_label: str) -> str:
+        base_tags = ["mainboard", "baseline", "t_plus_1", "sentiment_gate"]
+        if policy_tags:
+            base_tags.append("policy_gate")
+        if policy_sentiment_label in {"warm", "hot"}:
+            base_tags.append(f"policy_{policy_sentiment_label}")
+        if policy_tags:
+            base_tags.extend([tag for tag in policy_tags.split("|") if tag])
+        return "|".join(dict.fromkeys(base_tags))

@@ -23,6 +23,7 @@ class FeishuSyncService:
         ai_outputs: dict | None,
         report_path: str,
         validation_outputs: dict | None = None,
+        policy_outputs: dict | None = None,
     ) -> dict:
         if not self.settings.enabled:
             return {"status": "SKIPPED", "message": "Feishu is disabled by configuration."}
@@ -48,6 +49,7 @@ class FeishuSyncService:
                 ai_outputs=ai_outputs or {},
                 report_path=report_path,
                 validation_outputs=validation_outputs or {},
+                policy_outputs=policy_outputs or {},
             )
             response = client.send_text(message)
             return {"status": "SUCCESS", "response": response}
@@ -65,6 +67,7 @@ class FeishuSyncService:
         ai_outputs: dict,
         report_path: str,
         validation_outputs: dict,
+        policy_outputs: dict,
     ) -> str:
         lines = [
             f"A股主板日报 {trade_date}",
@@ -74,6 +77,15 @@ class FeishuSyncService:
         market_ai = ai_outputs.get("market_summary", {})
         if market_ai:
             lines.append(f"AI摘要: {market_ai.get('market_summary', '')}")
+
+        policy_themes = policy_outputs.get("active_themes", [])
+        if policy_themes:
+            labels = []
+            for theme in policy_themes[:3]:
+                label = theme.get("label", theme.get("name", ""))
+                heat = theme.get("sentiment_label", "inactive")
+                labels.append(f"{label}({heat})")
+            lines.append("政策主线: " + "、".join(labels))
 
         validation_summaries = validation_outputs.get("summaries", {})
         for horizon in sorted(validation_summaries):
@@ -86,8 +98,14 @@ class FeishuSyncService:
             top5 = signals_df.sort_values(["horizon", "final_rank"]).head(5)
             for row in top5.to_dict(orient="records"):
                 name = row.get("name", "")
+                heat = ""
+                tags = str(row.get("rule_tags", ""))
+                if "policy_hot" in tags:
+                    heat = " | heat=hot"
+                elif "policy_warm" in tags:
+                    heat = " | heat=warm"
                 lines.append(
-                    f"{row.get('horizon')}D #{row.get('final_rank')}: {row.get('symbol')} {name}".strip()
+                    f"{row.get('horizon')}D #{row.get('final_rank')}: {row.get('symbol')} {name}{heat}".strip()
                 )
         else:
             lines.append("今日无候选信号。")

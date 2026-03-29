@@ -8,6 +8,7 @@ from infra.config.settings import (
     AppSettings,
     DataSettings,
     FeishuSettings,
+    PolicySettings,
     Settings,
     StrategySettings,
     UniverseSettings,
@@ -33,4 +34,5 @@ def load_settings(config_dir: str | Path) -> Settings:
         validation=ValidationSettings(**_read_toml(config_dir / "validation.toml")),
         ai=AISettings(**_read_toml(config_dir / "ai.toml")),
         feishu=FeishuSettings(**_read_toml(config_dir / "feishu.toml")),
+        policy=PolicySettings(**_read_toml(config_dir / "policy.toml")),
     )

@@ -69,6 +69,29 @@ class FeishuSettings(BaseModel):
     timeout_seconds: int = 15
 
 
+class PolicyThemeSettings(BaseModel):
+    name: str
+    label: str
+    start_date: str
+    end_date: str
+    weight: float
+    summary: str
+    source_url: str
+    industries: list[str] = []
+    name_keywords: list[str] = []
+    symbols: list[str] = []
+
+
+class PolicySettings(BaseModel):
+    enabled: bool
+    max_total_bonus: float = 0.08
+    min_theme_match_count: int = 2
+    min_theme_positive_ratio: float = 0.55
+    min_theme_amount_ratio_5d: float = 1.0
+    sentiment_multiplier_cap: float = 1.35
+    themes: list[PolicyThemeSettings] = []
+
+
 class Settings(BaseModel):
     app: AppSettings
     data: DataSettings
@@ -77,3 +100,4 @@ class Settings(BaseModel):
     validation: ValidationSettings
     ai: AISettings
     feishu: FeishuSettings
+    policy: PolicySettings

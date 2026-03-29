@@ -6,9 +6,11 @@ def build_markdown_template(context: dict) -> str:
     signals_by_horizon = context.get("signals_by_horizon", {})
     ai_outputs = context.get("ai_outputs", {})
     validation_outputs = context.get("validation_outputs", {})
+    policy_outputs = context.get("policy_outputs", {})
     market_ai = ai_outputs.get("market_summary", {})
     stock_ai = ai_outputs.get("stock_explanations", [])
     validation_summaries = validation_outputs.get("summaries", {})
+    policy_themes = policy_outputs.get("active_themes", [])
 
     lines = [
         "# Daily Report",
@@ -48,6 +50,32 @@ def build_markdown_template(context: dict) -> str:
             lines.append(f"- Max drawdown: {summary.get('max_drawdown', 0.0):.2%}")
             lines.append("")
 
+    if policy_themes:
+        lines.append("## Policy Themes")
+        matched_symbols = int(policy_outputs.get("matched_symbols", 0) or 0)
+        lines.append(
+            f"- Theme sentiment: {policy_outputs.get('theme_sentiment_label', 'inactive')}"
+        )
+        lines.append(f"- Matched signals: {matched_symbols}")
+        for theme in policy_themes:
+            lines.append(
+                f"- {theme.get('label', theme.get('name', 'unknown'))}: {theme.get('summary', '')}"
+            )
+            lines.append(
+                "  "
+                f"heat={theme.get('sentiment_label', 'inactive')} | "
+                f"matches={int(theme.get('matched_count', 0) or 0)} | "
+                f"positive_ratio={theme.get('positive_ratio', 0.0):.2%} | "
+                f"avg_ret_5d={theme.get('avg_ret_5d', 0.0):.2%} | "
+                f"avg_rs_index_10d={theme.get('avg_rs_index_10d', 0.0):.2%} | "
+                f"avg_amount_ratio_5d={theme.get('avg_amount_ratio_5d', 0.0):.2f} | "
+                f"bonus={theme.get('effective_bonus', 0.0):.4f}"
+            )
+            source_url = theme.get("source_url", "")
+            if source_url:
+                lines.append(f"  Source: {source_url}")
+        lines.append("")
+
     lines.extend(["## Signals"])
 
     if not signals_by_horizon:
@@ -59,8 +87,32 @@ def build_markdown_template(context: dict) -> str:
         for row in signals_by_horizon[horizon][:10]:
             name = row.get("name", "")
             display = f"{row.get('symbol', '')} {name}".strip()
+            policy_tags = row.get("rule_tags", "")
+            policy_suffix = ""
+            heat_suffix = ""
+            if "policy_gate" in str(policy_tags):
+                theme_tags = [
+                    tag
+                    for tag in str(policy_tags).split("|")
+                    if tag
+                    not in {
+                        "mainboard",
+                        "baseline",
+                        "t_plus_1",
+                        "sentiment_gate",
+                        "policy_gate",
+                        "policy_hot",
+                        "policy_warm",
+                    }
+                ]
+                if theme_tags:
+                    policy_suffix = f" | policy={','.join(theme_tags)}"
+                if "policy_hot" in str(policy_tags):
+                    heat_suffix = " | heat=hot"
+                elif "policy_warm" in str(policy_tags):
+                    heat_suffix = " | heat=warm"
             lines.append(
-                f"- #{row.get('final_rank', '-')}: {display} | weight={row.get('target_weight', 0):.4f}"
+                f"- #{row.get('final_rank', '-')}: {display} | weight={row.get('target_weight', 0):.4f}{policy_suffix}{heat_suffix}"
             )
         lines.append("")
 

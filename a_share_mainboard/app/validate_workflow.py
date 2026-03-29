@@ -46,6 +46,7 @@ class ValidateWorkflow:
                 settings=self.settings.validation,
                 universe_settings=self.settings.universe,
                 strategy_settings=self.settings.strategy,
+                policy_settings=self.settings.policy,
                 benchmark_index=benchmark_index,
             ).run(
                 start_date=start_date,

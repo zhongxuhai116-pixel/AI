@@ -7,8 +7,9 @@ import pandas as pd
 from data.features.feature_pipeline import FeaturePipeline
 from data.filters.stock_pool_builder import StockPoolBuilder
 from data.storage.repositories import MarketRepository, ResearchRepository
-from infra.config.settings import StrategySettings, UniverseSettings, ValidationSettings
+from infra.config.settings import PolicySettings, StrategySettings, UniverseSettings, ValidationSettings
 from strategy.market_scan.market_scan_service import MarketScanService
+from strategy.policy.policy_overlay_service import PolicyOverlayService
 from strategy.rules.rule_engine import RuleEngine
 from strategy.stock_selection.baseline_ranker import BaselineRanker
 from strategy.stock_selection.selection_service import SelectionService
@@ -23,6 +24,7 @@ class ValidationEngine:
     settings: ValidationSettings
     universe_settings: UniverseSettings
     strategy_settings: StrategySettings
+    policy_settings: PolicySettings
     benchmark_index: str = "sh000001"
 
     def run(
@@ -98,13 +100,19 @@ class ValidationEngine:
             repo=self.repo,
             benchmark_index=self.benchmark_index,
         )
+        instruments_df = self.market_repo.get_instruments()[["symbol", "name", "industry_l1"]]
         selection_service = SelectionService(
             repo=self.repo,
             baseline_ranker=BaselineRanker(
                 factor_weights=self.strategy_settings.baseline_weights
             ),
         )
-        rule_engine = RuleEngine(settings=self.strategy_settings, repo=self.repo)
+        rule_engine = RuleEngine(
+            settings=self.strategy_settings,
+            repo=self.repo,
+            policy_service=PolicyOverlayService(settings=self.policy_settings),
+            instruments_df=instruments_df,
+        )
 
         for trade_date in signal_dates:
             stock_pool_builder.build(trade_date=trade_date)

@@ -1,0 +1,30 @@
+enabled = true
+max_total_bonus = 0.005
+min_theme_match_count = 2
+min_theme_positive_ratio = 0.55
+min_theme_amount_ratio_5d = 1.0
+sentiment_multiplier_cap = 1.35
+
+[[themes]]
+name = "two_new_2026"
+label = "两新扩围"
+start_date = "2026-01-01"
+end_date = "2026-12-31"
+weight = 0.001
+summary = "继续实施大规模设备更新和消费品以旧换新，优先偏向装备制造、零售流通和公用事业链条。"
+source_url = "https://www.ndrc.gov.cn/xwdt/ztzl/tddgmsbgxhxfpyjhx/gzdt/202503/t20250331_1396918.html"
+industries = ["C 制造业", "F 批发零售", "G 运输仓储", "D 水电煤气"]
+name_keywords = ["装备", "电力", "能源", "物流", "零售", "家电"]
+symbols = []
+
+[[themes]]
+name = "ai_plus_2026"
+label = "人工智能+"
+start_date = "2026-03-05"
+end_date = "2026-12-31"
+weight = 0.002
+summary = "围绕人工智能+、智能终端和智能制造装备，对科技与先进制造方向做政策加权。"
+source_url = "https://jgs.moa.gov.cn/zcjd/202503/t20250313_6471675.htm"
+industries = ["I 信息技术", "C 制造业", "M 科研服务"]
+name_keywords = ["智能", "机器人", "软件", "电子", "半导体", "通信", "汽车"]
+symbols = []

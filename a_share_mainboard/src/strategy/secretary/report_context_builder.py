@@ -11,6 +11,7 @@ class ReportContextBuilder:
         signals_df,
         ai_outputs: dict | None,
         validation_outputs: dict | None = None,
+        policy_outputs: dict | None = None,
     ) -> dict:
         if isinstance(signals_df, pd.DataFrame):
             signal_records = signals_df.to_dict(orient="records")
@@ -29,4 +30,5 @@ class ReportContextBuilder:
             "signals_by_horizon": signals_by_horizon,
             "ai_outputs": ai_outputs or {},
             "validation_outputs": validation_outputs or {},
+            "policy_outputs": policy_outputs or {},
         }

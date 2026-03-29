@@ -24,6 +24,7 @@ from infra.exceptions import ProviderUnavailableError
 from infra.logging.run_logger import RunLogger
 from infra.utils.dates import add_days
 from strategy.market_scan.market_scan_service import MarketScanService
+from strategy.policy.policy_overlay_service import PolicyOverlayService
 from strategy.rules.rule_engine import RuleEngine
 from strategy.secretary.feishu_sync_service import FeishuSyncService
 from strategy.secretary.markdown_writer import MarkdownWriter
@@ -104,12 +105,31 @@ class DailyWorkflow:
                 },
             )
 
-            market_repo.delete_price_daily_for_trade_date(effective_trade_date)
-            price_count = PriceDailyCollector(provider=provider, repo=market_repo).collect(
-                start_date=effective_trade_date,
-                end_date=effective_trade_date,
-                symbols=instrument_symbols,
-            )
+            try:
+                price_count = PriceDailyCollector(provider=provider, repo=market_repo).collect(
+                    start_date=effective_trade_date,
+                    end_date=effective_trade_date,
+                    symbols=instrument_symbols,
+                )
+            except Exception as exc:
+                cached_prices = market_repo.get_price_history(
+                    start_date=effective_trade_date,
+                    end_date=effective_trade_date,
+                )
+                if cached_prices.empty:
+                    raise
+                price_count = int(len(cached_prices))
+                self.run_logger.log_event(
+                    run_id=run_id,
+                    module="daily_workflow",
+                    level="WARNING",
+                    message="Mainboard daily snapshot refresh failed; reused cached bars",
+                    payload={
+                        "trade_date": effective_trade_date,
+                        "rows": price_count,
+                        "error": str(exc),
+                    },
+                )
             self.run_logger.log_event(
                 run_id=run_id,
                 module="daily_workflow",
@@ -182,12 +202,28 @@ class DailyWorkflow:
 
             research_repo.delete_signals_for_trade_date(effective_trade_date)
             signal_count = 0
-            rule_engine = RuleEngine(settings=self.settings.strategy, repo=research_repo)
+            instruments_df = market_repo.get_instruments()[["symbol", "name", "industry_l1"]]
+            policy_service = PolicyOverlayService(settings=self.settings.policy)
+            rule_engine = RuleEngine(
+                settings=self.settings.strategy,
+                repo=research_repo,
+                policy_service=policy_service,
+                instruments_df=instruments_df,
+            )
+            policy_contexts: list[dict[str, Any]] = []
             for horizon in self.settings.strategy.horizons:
                 signal_count += rule_engine.run(
                     trade_date=effective_trade_date,
                     horizon=horizon,
                 )
+                context = rule_engine.last_run_context.get(horizon, {}).copy()
+                if context:
+                    context["horizon"] = horizon
+                    policy_contexts.append(context)
+            policy_context = self._merge_policy_contexts(
+                trade_date=effective_trade_date,
+                policy_contexts=policy_contexts,
+            )
             self.run_logger.log_event(
                 run_id=run_id,
                 module="daily_workflow",
@@ -197,9 +233,15 @@ class DailyWorkflow:
             )
 
             signals_df = research_repo.get_signals(effective_trade_date)
-            instruments_df = market_repo.get_instruments()[["symbol", "name"]]
             if not signals_df.empty:
-                signals_df = signals_df.merge(instruments_df, on="symbol", how="left")
+                signals_df = signals_df.merge(
+                    instruments_df[["symbol", "name", "industry_l1"]],
+                    on="symbol",
+                    how="left",
+                )
+                policy_context["matched_symbols"] = int(
+                    signals_df["rule_tags"].fillna("").str.contains("policy_gate").sum()
+                )
             market_regime_df = research_repo.get_market_regime(effective_trade_date)
             market_regime = (
                 {}
@@ -212,6 +254,7 @@ class DailyWorkflow:
                 market_regime=market_regime,
                 signals_df=signals_df,
                 research_repo=research_repo,
+                policy_context=policy_context,
             )
             validation_outputs = self._run_validation_snapshot(
                 run_id=run_id,
@@ -232,6 +275,7 @@ class DailyWorkflow:
                 signals_df=signals_df,
                 ai_outputs=ai_outputs,
                 validation_outputs=validation_outputs,
+                policy_outputs=policy_context,
             )
             report_path = (
                 self.db_client.db_path.parents[1]
@@ -260,6 +304,7 @@ class DailyWorkflow:
                 ai_outputs=ai_outputs,
                 report_path=str(report_path),
                 validation_outputs=validation_outputs,
+                policy_outputs=policy_context,
             )
             self.run_logger.log_event(
                 run_id=run_id,
@@ -290,8 +335,10 @@ class DailyWorkflow:
                 "feishu_status": feishu_result.get("status", "UNKNOWN"),
                 "validation_status": validation_outputs.get("status", "UNKNOWN"),
                 "validation_summary": validation_outputs.get("summaries", {}),
+                "policy_status": policy_context.get("status", "UNKNOWN"),
+                "policy_themes": policy_context.get("active_themes", []),
                 "message": (
-                    "Collected mainboard data and produced the phase-1 research chain."
+                    "Collected mainboard data and produced the policy-aware research chain."
                     if signal_count > 0
                     else "Collected mainboard data. No candidates passed the current sentiment and execution gates."
                 ),
@@ -313,6 +360,80 @@ class DailyWorkflow:
             )
             raise
 
+    @staticmethod
+    def _merge_policy_contexts(
+        *,
+        trade_date: str,
+        policy_contexts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not policy_contexts:
+            return {
+                "status": "INACTIVE",
+                "trade_date": trade_date,
+                "theme_sentiment_label": "inactive",
+                "active_bonus_count": 0,
+                "active_themes": [],
+                "matched_symbols": 0,
+            }
+
+        theme_map: dict[str, dict[str, Any]] = {}
+        fallback_status = "INACTIVE"
+        matched_symbols = 0
+        for context in policy_contexts:
+            status = str(context.get("status", "INACTIVE"))
+            if fallback_status == "INACTIVE" and status != "INACTIVE":
+                fallback_status = status
+            matched_symbols = max(matched_symbols, int(context.get("matched_symbols", 0) or 0))
+            horizon = context.get("horizon")
+            for theme in context.get("active_themes", []):
+                name = str(theme.get("name", ""))
+                if not name:
+                    continue
+                candidate = dict(theme)
+                candidate["horizons"] = [horizon] if horizon is not None else []
+                existing = theme_map.get(name)
+                if existing is None:
+                    theme_map[name] = candidate
+                    continue
+                if float(candidate.get("sentiment_score", 0.0) or 0.0) > float(
+                    existing.get("sentiment_score", 0.0) or 0.0
+                ):
+                    merged = candidate
+                else:
+                    merged = existing
+                merged["horizons"] = sorted(
+                    {
+                        *existing.get("horizons", []),
+                        *candidate.get("horizons", []),
+                    }
+                )
+                merged["matched_count"] = max(
+                    int(existing.get("matched_count", 0) or 0),
+                    int(candidate.get("matched_count", 0) or 0),
+                )
+                merged["effective_bonus"] = max(
+                    float(existing.get("effective_bonus", 0.0) or 0.0),
+                    float(candidate.get("effective_bonus", 0.0) or 0.0),
+                )
+                merged["bonus_active"] = bool(
+                    existing.get("bonus_active") or candidate.get("bonus_active")
+                )
+                theme_map[name] = merged
+
+        active_themes = list(theme_map.values())
+        return {
+            "status": "ACTIVE" if active_themes else fallback_status,
+            "trade_date": trade_date,
+            "theme_sentiment_label": PolicyOverlayService._aggregate_sentiment_label(
+                active_themes
+            ),
+            "active_bonus_count": sum(
+                1 for theme in active_themes if bool(theme.get("bonus_active"))
+            ),
+            "active_themes": active_themes,
+            "matched_symbols": matched_symbols,
+        }
+
     def _run_ai_explanations(
         self,
         *,
@@ -321,6 +442,7 @@ class DailyWorkflow:
         market_regime: dict,
         signals_df,
         research_repo: ResearchRepository,
+        policy_context: dict,
     ) -> dict:
         prompt_root = self.db_client.db_path.parents[2] / "src" / "ai" / "prompts"
         prompt_loader = PromptLoader(prompt_root)
@@ -371,6 +493,7 @@ class DailyWorkflow:
             market_payload={
                 "trade_date": trade_date,
                 "market_regime": {key: str(value) for key, value in market_regime.items()},
+                "policy_context": policy_context,
                 "signal_count": 0 if signals_df is None else len(signals_df),
             },
             stock_payloads=stock_payloads,
@@ -400,6 +523,7 @@ class DailyWorkflow:
             settings=self.settings.validation,
             universe_settings=self.settings.universe,
             strategy_settings=self.settings.strategy,
+            policy_settings=self.settings.policy,
             benchmark_index=benchmark_index,
         ).run(
             start_date=validation_start_date,
