@@ -429,6 +429,12 @@ class DailyWorkflow:
                     strategy_profile=strategy_profile,
                     limit=20,
                 ),
+                "top_candidates": self._build_top_candidates(
+                    research_repo=research_repo,
+                    trade_date=effective_trade_date,
+                    strategy_profile=strategy_profile,
+                    limit=20,
+                ),
                 "message": (
                     "Collected mainboard data and produced the policy-aware research chain."
                     if signal_count > 0
@@ -590,6 +596,37 @@ class DailyWorkflow:
             )
         )
         return ranked[:limit]
+
+    @staticmethod
+    def _build_top_candidates(
+        *,
+        research_repo: ResearchRepository,
+        trade_date: str,
+        strategy_profile: dict[str, Any],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        primary = strategy_profile.get("primary_horizon")
+        horizon = int(primary) if primary is not None else None
+        scores = research_repo.get_model_scores(trade_date, horizon=horizon)
+        if scores.empty:
+            return []
+        rows = scores.sort_values(["score_rank", "symbol"]).head(limit).to_dict(orient="records")
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            payload.append(
+                {
+                    "symbol": str(row.get("symbol", "") or ""),
+                    "name": "",
+                    "horizon": _safe_int(row.get("horizon")),
+                    "role": "CANDIDATE",
+                    "final_rank": _safe_int(row.get("score_rank")),
+                    "target_weight": None,
+                    "rule_tags": str(row.get("model_name", "") or ""),
+                }
+            )
+        return payload
 
     def _run_ai_explanations(
         self,

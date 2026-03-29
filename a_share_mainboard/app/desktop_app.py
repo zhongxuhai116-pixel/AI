@@ -376,9 +376,18 @@ class DesktopApp(tk.Tk):
     def _refresh_recommendations(self, *, task_name: str, result: dict[str, Any]) -> None:
         if task_name != "daily":
             return
+        top_signals = result.get("top_signals", [])
+        if isinstance(top_signals, list) and top_signals:
+            self._render_recommendations(
+                top_signals=top_signals,
+                trade_date=result.get("effective_trade_date", ""),
+                subtitle_prefix="推荐股票",
+            )
+            return
         self._render_recommendations(
-            top_signals=result.get("top_signals", []),
+            top_signals=result.get("top_candidates", []),
             trade_date=result.get("effective_trade_date", ""),
+            subtitle_prefix="候选推荐（无信号）",
         )
 
     def _load_latest_recommendations_from_db(self) -> None:
@@ -406,6 +415,21 @@ class DesktopApp(tk.Tk):
                 ORDER BY s.horizon, s.final_rank, s.symbol
                 """
             )
+            latest_scores_df = repo.read_dataframe(
+                """
+                SELECT
+                    s.trade_date,
+                    s.symbol,
+                    s.horizon,
+                    s.score_rank,
+                    s.model_name,
+                    COALESCE(i.name, '') AS name
+                FROM model_scores_daily s
+                LEFT JOIN instrument_basic i ON i.symbol = s.symbol
+                WHERE s.trade_date = (SELECT MAX(trade_date) FROM model_scores_daily)
+                ORDER BY s.horizon, s.score_rank, s.symbol
+                """
+            )
         except Exception as exc:
             self.reco_var.set("推荐股票：读取失败")
             self._append_log(f"加载最新推荐失败：{exc}")
@@ -413,19 +437,49 @@ class DesktopApp(tk.Tk):
         finally:
             db_client.close()
 
-        if latest_df.empty:
-            self.reco_var.set("推荐股票：暂无数据（请先运行 Daily）")
+        if not latest_df.empty:
+            latest_trade_date = str(latest_df.iloc[0].get("trade_date", ""))
+            top_signals = _format_signals(
+                rows=latest_df.to_dict(orient="records"),
+                primary_horizon=self.settings.strategy.strategy_profile().get("primary_horizon"),
+                limit=20,
+                rank_key="final_rank",
+                role_signal=True,
+                tags_key="rule_tags",
+            )
+            self._render_recommendations(
+                top_signals=top_signals,
+                trade_date=latest_trade_date,
+                subtitle_prefix="推荐股票",
+            )
             return
 
-        latest_trade_date = str(latest_df.iloc[0].get("trade_date", ""))
-        top_signals = _format_signals(
-            rows=latest_df.to_dict(orient="records"),
-            primary_horizon=self.settings.strategy.strategy_profile().get("primary_horizon"),
-            limit=20,
-        )
-        self._render_recommendations(top_signals=top_signals, trade_date=latest_trade_date)
+        if not latest_scores_df.empty:
+            latest_trade_date = str(latest_scores_df.iloc[0].get("trade_date", ""))
+            top_candidates = _format_signals(
+                rows=latest_scores_df.to_dict(orient="records"),
+                primary_horizon=self.settings.strategy.strategy_profile().get("primary_horizon"),
+                limit=20,
+                rank_key="score_rank",
+                role_signal=False,
+                tags_key="model_name",
+            )
+            self._render_recommendations(
+                top_signals=top_candidates,
+                trade_date=latest_trade_date,
+                subtitle_prefix="候选推荐（无信号）",
+            )
+            return
 
-    def _render_recommendations(self, *, top_signals: Any, trade_date: str) -> None:
+        self.reco_var.set("推荐股票：暂无数据（请先运行 Daily）")
+
+    def _render_recommendations(
+        self,
+        *,
+        top_signals: Any,
+        trade_date: str,
+        subtitle_prefix: str,
+    ) -> None:
         if self.reco_tree is None:
             return
         for child in self.reco_tree.get_children():
@@ -433,14 +487,14 @@ class DesktopApp(tk.Tk):
 
         if not isinstance(top_signals, list) or not top_signals:
             if trade_date:
-                self.reco_var.set(f"推荐股票：{trade_date} 无候选")
+                self.reco_var.set(f"{subtitle_prefix}：{trade_date} 无候选")
             else:
-                self.reco_var.set("推荐股票：本次无候选")
+                self.reco_var.set(f"{subtitle_prefix}：本次无候选")
             return
 
         primary = self.settings.strategy.strategy_profile().get("primary_horizon")
         self.reco_var.set(
-            f"推荐股票：{len(top_signals)} 只 | 交易日 {trade_date} | 主周期 {primary}D"
+            f"{subtitle_prefix}：{len(top_signals)} 只 | 交易日 {trade_date} | 主周期 {primary}D"
         )
         for index, signal in enumerate(top_signals, start=1):
             weight = signal.get("target_weight")
@@ -481,6 +535,9 @@ def _format_signals(
     rows: list[dict[str, Any]],
     primary_horizon: int | None,
     limit: int,
+    rank_key: str,
+    role_signal: bool,
+    tags_key: str,
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
@@ -495,12 +552,14 @@ def _format_signals(
                 "horizon": horizon,
                 "role": (
                     "主"
-                    if primary_horizon is not None and horizon == int(primary_horizon)
-                    else "辅"
+                    if role_signal
+                    and primary_horizon is not None
+                    and horizon == int(primary_horizon)
+                    else ("辅" if role_signal else "候选")
                 ),
-                "final_rank": _safe_int(row.get("final_rank")),
+                "final_rank": _safe_int(row.get(rank_key)),
                 "target_weight": _safe_float(row.get("target_weight")),
-                "rule_tags": str(row.get("rule_tags", "") or ""),
+                "rule_tags": str(row.get(tags_key, "") or ""),
             }
         )
 
