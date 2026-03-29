@@ -63,8 +63,8 @@ class ValidateWorkflow:
                 "start_date": validation_result["start_date"],
                 "end_date": validation_result["end_date"],
                 "horizon": horizon,
-                "summary": validation_result["summaries"].get(horizon, {}),
-                "policy_review": validation_result["policy_reviews"].get(horizon, {}),
+                "summary": validation_result.get("summaries", {}).get(horizon, {}),
+                "policy_review": validation_result.get("policy_reviews", {}).get(horizon, {}),
                 "universe_review": validation_result.get("universe_review", {}),
                 "message": "Validation run completed.",
             }

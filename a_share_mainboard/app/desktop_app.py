@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 import threading
 import traceback
@@ -20,13 +21,15 @@ from app.launcher import (
     run_validate_cli,
     run_validate_rolling_cli,
 )
+from data.storage.duckdb_client import DuckDBClient
+from data.storage.repositories import ResearchRepository
 from infra.config.loader import load_settings
 
 
 class DesktopApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("A-Share TradingAgents Lite")
+        self.title("A股 TradingAgents Lite")
         self.geometry("1180x760")
         self.minsize(1080, 700)
 
@@ -34,7 +37,7 @@ class DesktopApp(tk.Tk):
         self.event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.run_buttons: list[ttk.Button] = []
-        self.status_var = tk.StringVar(value="Idle")
+        self.status_var = tk.StringVar(value="空闲")
         self.reco_var = tk.StringVar(value="推荐股票：暂无数据")
 
         self.daily_trade_date_var = tk.StringVar(value=date.today().isoformat())
@@ -42,13 +45,17 @@ class DesktopApp(tk.Tk):
             value=(date.today() - timedelta(days=90)).isoformat()
         )
         self.validate_end_var = tk.StringVar(value=date.today().isoformat())
-        self.validate_horizon_var = tk.StringVar(value=str(self.settings.strategy.primary_horizon or 10))
+        self.validate_horizon_var = tk.StringVar(
+            value=str(self.settings.strategy.primary_horizon or 10)
+        )
 
         self.rolling_start_var = tk.StringVar(
             value=(date.today() - timedelta(days=140)).isoformat()
         )
         self.rolling_end_var = tk.StringVar(value=date.today().isoformat())
-        self.rolling_horizon_var = tk.StringVar(value=str(self.settings.strategy.primary_horizon or 10))
+        self.rolling_horizon_var = tk.StringVar(
+            value=str(self.settings.strategy.primary_horizon or 10)
+        )
         self.rolling_window_var = tk.StringVar(value="20")
         self.rolling_step_var = tk.StringVar(value="5")
 
@@ -59,8 +66,11 @@ class DesktopApp(tk.Tk):
 
         self.log_text: tk.Text | None = None
         self.reco_tree: ttk.Treeview | None = None
+        self.summary_label: ttk.Label | None = None
+
         self._build_layout()
         self._render_settings_summary()
+        self._load_latest_recommendations_from_db()
         self.after(200, self._drain_event_queue)
 
     def _build_layout(self) -> None:
@@ -102,7 +112,6 @@ class DesktopApp(tk.Tk):
             textvariable=self.reco_var,
             font=("Segoe UI", 10, "bold"),
         ).grid(row=0, column=0, sticky="w", pady=(0, 4))
-
         self._build_recommendation_table(reco_frame)
 
         log_frame = ttk.Frame(output_panel)
@@ -116,16 +125,11 @@ class DesktopApp(tk.Tk):
         scroll.grid(row=0, column=1, sticky="ns")
         text_widget.configure(yscrollcommand=scroll.set)
         self.log_text = text_widget
-        self._append_log("Desktop launcher initialized.")
+        self._append_log("桌面程序已启动。")
 
     def _build_recommendation_table(self, parent: ttk.Frame) -> None:
         columns = ("seq", "role", "horizon", "symbol", "name", "rank", "weight", "tags")
-        tree = ttk.Treeview(
-            parent,
-            columns=columns,
-            show="headings",
-            height=8,
-        )
+        tree = ttk.Treeview(parent, columns=columns, show="headings", height=8)
         tree.grid(row=1, column=0, sticky="nsew")
         headings = {
             "seq": ("序号", 54),
@@ -147,15 +151,15 @@ class DesktopApp(tk.Tk):
         self.reco_tree = tree
 
     def _build_daily_card(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="Daily Workflow", padding=10)
+        card = ttk.LabelFrame(parent, text="每日流程", padding=10)
         card.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(card, text="Trade Date").grid(row=0, column=0, sticky="w")
+        ttk.Label(card, text="交易日").grid(row=0, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.daily_trade_date_var, width=16).grid(
             row=0, column=1, sticky="we", padx=(8, 0)
         )
         button = ttk.Button(
             card,
-            text="Run Daily",
+            text="运行 Daily",
             command=lambda: self._run_async(
                 task_name="daily",
                 runner=run_daily_cli,
@@ -166,23 +170,23 @@ class DesktopApp(tk.Tk):
         self.run_buttons.append(button)
 
     def _build_validate_card(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="Single Validation", padding=10)
+        card = ttk.LabelFrame(parent, text="区间验证", padding=10)
         card.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(card, text="Start Date").grid(row=0, column=0, sticky="w")
+        ttk.Label(card, text="开始日期").grid(row=0, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.validate_start_var, width=16).grid(
             row=0, column=1, sticky="we", padx=(8, 0)
         )
-        ttk.Label(card, text="End Date").grid(row=1, column=0, sticky="w")
+        ttk.Label(card, text="结束日期").grid(row=1, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.validate_end_var, width=16).grid(
             row=1, column=1, sticky="we", padx=(8, 0)
         )
-        ttk.Label(card, text="Horizon").grid(row=2, column=0, sticky="w")
+        ttk.Label(card, text="周期").grid(row=2, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.validate_horizon_var, width=16).grid(
             row=2, column=1, sticky="we", padx=(8, 0)
         )
         button = ttk.Button(
             card,
-            text="Run Validate",
+            text="运行验证",
             command=lambda: self._run_async(
                 task_name="validate",
                 runner=run_validate_cli,
@@ -197,31 +201,31 @@ class DesktopApp(tk.Tk):
         self.run_buttons.append(button)
 
     def _build_rolling_card(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="Rolling Validation", padding=10)
+        card = ttk.LabelFrame(parent, text="滚动验证", padding=10)
         card.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(card, text="Start Date").grid(row=0, column=0, sticky="w")
+        ttk.Label(card, text="开始日期").grid(row=0, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.rolling_start_var, width=16).grid(
             row=0, column=1, sticky="we", padx=(8, 0)
         )
-        ttk.Label(card, text="End Date").grid(row=1, column=0, sticky="w")
+        ttk.Label(card, text="结束日期").grid(row=1, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.rolling_end_var, width=16).grid(
             row=1, column=1, sticky="we", padx=(8, 0)
         )
-        ttk.Label(card, text="Horizon").grid(row=2, column=0, sticky="w")
+        ttk.Label(card, text="周期").grid(row=2, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.rolling_horizon_var, width=16).grid(
             row=2, column=1, sticky="we", padx=(8, 0)
         )
-        ttk.Label(card, text="Window").grid(row=3, column=0, sticky="w")
+        ttk.Label(card, text="窗口").grid(row=3, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.rolling_window_var, width=16).grid(
             row=3, column=1, sticky="we", padx=(8, 0)
         )
-        ttk.Label(card, text="Step").grid(row=4, column=0, sticky="w")
+        ttk.Label(card, text="步长").grid(row=4, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.rolling_step_var, width=16).grid(
             row=4, column=1, sticky="we", padx=(8, 0)
         )
         button = ttk.Button(
             card,
-            text="Run Rolling",
+            text="运行滚动",
             command=lambda: self._run_async(
                 task_name="validate_rolling",
                 runner=run_validate_rolling_cli,
@@ -238,19 +242,19 @@ class DesktopApp(tk.Tk):
         self.run_buttons.append(button)
 
     def _build_rebuild_card(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="History Rebuild", padding=10)
+        card = ttk.LabelFrame(parent, text="历史回补", padding=10)
         card.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(card, text="Start Date").grid(row=0, column=0, sticky="w")
+        ttk.Label(card, text="开始日期").grid(row=0, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.rebuild_start_var, width=16).grid(
             row=0, column=1, sticky="we", padx=(8, 0)
         )
-        ttk.Label(card, text="End Date").grid(row=1, column=0, sticky="w")
+        ttk.Label(card, text="结束日期").grid(row=1, column=0, sticky="w")
         ttk.Entry(card, textvariable=self.rebuild_end_var, width=16).grid(
             row=1, column=1, sticky="we", padx=(8, 0)
         )
         button = ttk.Button(
             card,
-            text="Run Rebuild",
+            text="运行回补",
             command=lambda: self._run_async(
                 task_name="rebuild",
                 runner=run_rebuild_cli,
@@ -266,13 +270,14 @@ class DesktopApp(tk.Tk):
     def _render_settings_summary(self) -> None:
         profile = self.settings.strategy.strategy_profile()
         summary = (
-            f"Primary horizon: {profile.get('primary_horizon')}D | "
-            f"Auxiliary: {profile.get('auxiliary_horizons')} | "
-            f"AI enabled: {self.settings.ai.enabled} | "
-            f"Feishu enabled: {self.settings.feishu.enabled} | "
-            f"Log root: {self.settings.app.log_root}"
+            f"主周期: {profile.get('primary_horizon')}D | "
+            f"辅周期: {profile.get('auxiliary_horizons')} | "
+            f"AI启用: {_bool_cn(self.settings.ai.enabled)} | "
+            f"飞书启用: {_bool_cn(self.settings.feishu.enabled)} | "
+            f"日志目录: {self.settings.app.log_root}"
         )
-        self.summary_label.configure(text=summary)
+        if self.summary_label is not None:
+            self.summary_label.configure(text=summary)
 
     def _run_async(
         self,
@@ -282,12 +287,12 @@ class DesktopApp(tk.Tk):
         kwargs: dict[str, Any],
     ) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
-            self._append_log("Another run is in progress. Wait for it to finish.")
+            self._append_log("当前已有任务在运行，请等待完成。")
             return
 
         self._set_buttons_enabled(False)
-        self.status_var.set(f"Running: {task_name}")
-        self._append_log(f"Starting {task_name} with args: {kwargs}")
+        self.status_var.set(f"运行中：{task_name}")
+        self._append_log(f"开始执行 {task_name}，参数：{kwargs}")
 
         def worker() -> None:
             try:
@@ -328,17 +333,17 @@ class DesktopApp(tk.Tk):
             result = item.get("result", {})
             self._refresh_recommendations(task_name=task_name, result=result)
             self._append_log(
-                f"{task_name} finished.\n{json.dumps(result, ensure_ascii=False, indent=2)}"
+                f"{task_name} 执行完成。\n{json.dumps(result, ensure_ascii=False, indent=2)}"
             )
-            self.status_var.set(f"Completed: {task_name}")
+            self.status_var.set(f"已完成：{task_name}")
             self._set_buttons_enabled(True)
             return
         if kind == "error":
             task_name = item.get("task", "task")
             self._append_log(
-                f"{task_name} failed: {item.get('message')}\n{item.get('traceback', '')}"
+                f"{task_name} 执行失败：{item.get('message')}\n{item.get('traceback', '')}"
             )
-            self.status_var.set(f"Failed: {task_name}")
+            self.status_var.set(f"失败：{task_name}")
             self._set_buttons_enabled(True)
 
     def _append_runtime_event(self, event: dict[str, Any]) -> None:
@@ -369,26 +374,74 @@ class DesktopApp(tk.Tk):
             button.configure(state=state)
 
     def _refresh_recommendations(self, *, task_name: str, result: dict[str, Any]) -> None:
+        if task_name != "daily":
+            return
+        self._render_recommendations(
+            top_signals=result.get("top_signals", []),
+            trade_date=result.get("effective_trade_date", ""),
+        )
+
+    def _load_latest_recommendations_from_db(self) -> None:
+        db_path = PROJECT_ROOT / self.settings.data.duckdb_path
+        if not db_path.exists():
+            self.reco_var.set("推荐股票：暂无数据（请先运行 Daily）")
+            return
+
+        db_client = DuckDBClient(db_path)
+        try:
+            repo = ResearchRepository(db_client)
+            latest_df = repo.read_dataframe(
+                """
+                SELECT
+                    s.trade_date,
+                    s.symbol,
+                    s.horizon,
+                    s.final_rank,
+                    s.target_weight,
+                    s.rule_tags,
+                    COALESCE(i.name, '') AS name
+                FROM signals_daily s
+                LEFT JOIN instrument_basic i ON i.symbol = s.symbol
+                WHERE s.trade_date = (SELECT MAX(trade_date) FROM signals_daily)
+                ORDER BY s.horizon, s.final_rank, s.symbol
+                """
+            )
+        except Exception as exc:
+            self.reco_var.set("推荐股票：读取失败")
+            self._append_log(f"加载最新推荐失败：{exc}")
+            return
+        finally:
+            db_client.close()
+
+        if latest_df.empty:
+            self.reco_var.set("推荐股票：暂无数据（请先运行 Daily）")
+            return
+
+        latest_trade_date = str(latest_df.iloc[0].get("trade_date", ""))
+        top_signals = _format_signals(
+            rows=latest_df.to_dict(orient="records"),
+            primary_horizon=self.settings.strategy.strategy_profile().get("primary_horizon"),
+            limit=20,
+        )
+        self._render_recommendations(top_signals=top_signals, trade_date=latest_trade_date)
+
+    def _render_recommendations(self, *, top_signals: Any, trade_date: str) -> None:
         if self.reco_tree is None:
             return
         for child in self.reco_tree.get_children():
             self.reco_tree.delete(child)
 
-        if task_name != "daily":
-            self.reco_var.set("推荐股票：仅在 Daily 任务后更新")
-            return
-
-        top_signals = result.get("top_signals", [])
         if not isinstance(top_signals, list) or not top_signals:
-            self.reco_var.set("推荐股票：本次无候选")
+            if trade_date:
+                self.reco_var.set(f"推荐股票：{trade_date} 无候选")
+            else:
+                self.reco_var.set("推荐股票：本次无候选")
             return
 
-        primary = result.get("strategy_profile", {}).get("primary_horizon")
-        effective_date = result.get("effective_trade_date", "")
+        primary = self.settings.strategy.strategy_profile().get("primary_horizon")
         self.reco_var.set(
-            f"推荐股票：{len(top_signals)} 只 | 交易日 {effective_date} | 主周期 {primary}D"
+            f"推荐股票：{len(top_signals)} 只 | 交易日 {trade_date} | 主周期 {primary}D"
         )
-
         for index, signal in enumerate(top_signals, start=1):
             weight = signal.get("target_weight")
             self.reco_tree.insert(
@@ -417,6 +470,71 @@ def _compact_payload(payload: Any, limit: int = 280) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def _bool_cn(value: bool) -> str:
+    return "是" if value else "否"
+
+
+def _format_signals(
+    *,
+    rows: list[dict[str, Any]],
+    primary_horizon: int | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+
+    formatted: list[dict[str, Any]] = []
+    for row in rows:
+        horizon = _safe_int(row.get("horizon"))
+        formatted.append(
+            {
+                "symbol": str(row.get("symbol", "") or ""),
+                "name": str(row.get("name", "") or ""),
+                "horizon": horizon,
+                "role": (
+                    "主"
+                    if primary_horizon is not None and horizon == int(primary_horizon)
+                    else "辅"
+                ),
+                "final_rank": _safe_int(row.get("final_rank")),
+                "target_weight": _safe_float(row.get("target_weight")),
+                "rule_tags": str(row.get("rule_tags", "") or ""),
+            }
+        )
+
+    formatted.sort(
+        key=lambda item: (
+            0 if item.get("role") == "主" else 1,
+            int(item.get("horizon") or 999),
+            int(item.get("final_rank") or 9999),
+            str(item.get("symbol") or ""),
+        )
+    )
+    return formatted[:limit]
+
+
+def _safe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def main() -> None:
