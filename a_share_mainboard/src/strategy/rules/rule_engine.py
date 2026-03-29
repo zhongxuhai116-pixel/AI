@@ -19,13 +19,6 @@ class RuleEngine:
     last_run_context: dict[int, dict] = field(default_factory=dict)
 
     def run(self, trade_date: str, horizon: int) -> int:
-        if not self._market_is_tradeable(trade_date):
-            self.last_run_context[horizon] = self._build_policy_context(
-                trade_date=trade_date,
-                status="MARKET_BLOCKED",
-            )
-            return 0
-
         scores = self.repo.get_model_scores(trade_date=trade_date, horizon=horizon)
         pool = self.repo.get_stock_pool(trade_date=trade_date, eligible_only=True)
         features = self._parse_features(trade_date)
@@ -43,7 +36,9 @@ class RuleEngine:
         )
         if self.instruments_df is not None and not self.instruments_df.empty:
             candidates = candidates.merge(
-                self.instruments_df[["symbol", "name", "industry_l1"]],
+                self.instruments_df[
+                    [column for column in ["symbol", "name", "industry_l1", "industry_l2"] if column in self.instruments_df.columns]
+                ],
                 on="symbol",
                 how="left",
             )
@@ -64,11 +59,17 @@ class RuleEngine:
         else:
             candidates["policy_bonus"] = 0.0
             candidates["policy_tags"] = ""
+            candidates["policy_sentiment_label"] = ""
         candidates["score_raw_plus_policy"] = pd.to_numeric(
             candidates["score_raw"], errors="coerce"
         ).fillna(0.0) + pd.to_numeric(
             candidates["policy_bonus"], errors="coerce"
         ).fillna(0.0)
+
+        if not self._market_is_tradeable(trade_date):
+            policy_context["status"] = "MARKET_BLOCKED"
+            self.last_run_context[horizon] = policy_context
+            return 0
 
         candidates = candidates.sort_values(
             ["score_raw_plus_policy", "score_rank", "symbol"],
@@ -172,6 +173,9 @@ class RuleEngine:
                 "theme_sentiment_label": "inactive",
                 "active_bonus_count": 0,
                 "active_themes": [],
+                "matched_candidates": 0,
+                "matched_bonus_candidates": 0,
+                "matched_signals": 0,
                 "matched_symbols": 0,
             }
         context = self.policy_service.build_context(trade_date=trade_date)

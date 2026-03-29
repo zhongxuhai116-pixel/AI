@@ -52,11 +52,15 @@ def build_markdown_template(context: dict) -> str:
 
     if policy_themes:
         lines.append("## Policy Themes")
-        matched_symbols = int(policy_outputs.get("matched_symbols", 0) or 0)
+        matched_candidates = int(policy_outputs.get("matched_candidates", 0) or 0)
+        matched_bonus_candidates = int(policy_outputs.get("matched_bonus_candidates", 0) or 0)
+        matched_signals = int(policy_outputs.get("matched_signals", 0) or 0)
         lines.append(
             f"- Theme sentiment: {policy_outputs.get('theme_sentiment_label', 'inactive')}"
         )
-        lines.append(f"- Matched signals: {matched_symbols}")
+        lines.append(f"- Matched candidates: {matched_candidates}")
+        lines.append(f"- Bonus-ready candidates: {matched_bonus_candidates}")
+        lines.append(f"- Matched signals: {matched_signals}")
         for theme in policy_themes:
             lines.append(
                 f"- {theme.get('label', theme.get('name', 'unknown'))}: {theme.get('summary', '')}"
@@ -85,6 +89,19 @@ def build_markdown_template(context: dict) -> str:
             source_url = theme.get("source_url", "")
             if source_url:
                 lines.append(f"  Source: {source_url}")
+            watchlist_candidates = theme.get("watchlist_candidates", [])
+            if watchlist_candidates:
+                lines.append("  Watchlist:")
+                for item in watchlist_candidates[:3]:
+                    display = f"{item.get('symbol', '')} {item.get('name', '')}".strip()
+                    ret_5d = float(item.get("ret_5d", 0.0) or 0.0)
+                    amount_ratio_5d = float(item.get("amount_ratio_5d", 0.0) or 0.0)
+                    lines.append(
+                        "  "
+                        f"- {display} | industry={item.get('industry_l1', '')} | "
+                        f"ret_5d={ret_5d:.2%} | "
+                        f"amount_ratio_5d={amount_ratio_5d:.2f}"
+                    )
         lines.append("")
 
     lines.extend(["## Signals"])

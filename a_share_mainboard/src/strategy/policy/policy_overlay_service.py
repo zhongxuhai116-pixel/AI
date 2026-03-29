@@ -24,25 +24,32 @@ class PolicyOverlayService:
 
         theme_contexts: list[dict] = []
         for theme in active_themes:
-            mask = self._match_theme(frame=frame, theme=theme)
-            theme_frame = frame.loc[mask].copy()
+            match_mask = self._match_theme(frame=frame, theme=theme)
+            watchlist_mask = self._match_watchlist(frame=frame, theme=theme)
+            theme_frame = frame.loc[match_mask].copy()
+            watchlist_frame = frame.loc[watchlist_mask].copy()
             theme_context = self._build_theme_context(
                 theme=theme,
                 trade_date=trade_date,
                 theme_frame=theme_frame,
+                watchlist_frame=watchlist_frame,
             )
             theme_contexts.append(theme_context)
-            if not mask.any() or theme_context["effective_bonus"] <= 0:
+
+            if match_mask.any():
+                frame.loc[match_mask, "policy_matched"] = True
+
+            if not match_mask.any() or theme_context["effective_bonus"] <= 0:
                 continue
 
-            frame.loc[mask, "policy_bonus"] = (
-                frame.loc[mask, "policy_bonus"] + float(theme_context["effective_bonus"])
+            frame.loc[match_mask, "policy_bonus"] = (
+                frame.loc[match_mask, "policy_bonus"] + float(theme_context["effective_bonus"])
             )
-            frame.loc[mask, "policy_tags"] = frame.loc[mask, "policy_tags"].apply(
+            frame.loc[match_mask, "policy_tags"] = frame.loc[match_mask, "policy_tags"].apply(
                 lambda value: self._append_tag(value, theme.name)
             )
-            frame.loc[mask, "policy_sentiment_label"] = frame.loc[
-                mask, "policy_sentiment_label"
+            frame.loc[match_mask, "policy_sentiment_label"] = frame.loc[
+                match_mask, "policy_sentiment_label"
             ].apply(
                 lambda value: self._merge_sentiment_label(
                     value,
@@ -53,11 +60,13 @@ class PolicyOverlayService:
         frame["policy_bonus"] = frame["policy_bonus"].clip(
             upper=self.settings.max_total_bonus
         )
-        matched_symbols = int((frame["policy_bonus"] > 0).sum())
+        matched_candidates = int(frame["policy_matched"].sum())
+        matched_bonus_candidates = int((frame["policy_bonus"] > 0).sum())
         context = self._build_applied_context(
             trade_date=trade_date,
             theme_contexts=theme_contexts,
-            matched_symbols=matched_symbols,
+            matched_candidates=matched_candidates,
+            matched_bonus_candidates=matched_bonus_candidates,
         )
         return frame, context
 
@@ -69,7 +78,8 @@ class PolicyOverlayService:
                 self._build_inactive_theme_context(theme=theme, trade_date=trade_date)
                 for theme in active_themes
             ],
-            matched_symbols=0,
+            matched_candidates=0,
+            matched_bonus_candidates=0,
         )
 
     def _build_applied_context(
@@ -77,7 +87,8 @@ class PolicyOverlayService:
         *,
         trade_date: str,
         theme_contexts: list[dict],
-        matched_symbols: int,
+        matched_candidates: int,
+        matched_bonus_candidates: int,
     ) -> dict:
         overall_label = self._aggregate_sentiment_label(theme_contexts)
         active_bonus_count = sum(1 for item in theme_contexts if item["bonus_active"])
@@ -93,7 +104,9 @@ class PolicyOverlayService:
             "theme_sentiment_label": overall_label,
             "active_bonus_count": active_bonus_count,
             "active_themes": theme_contexts,
-            "matched_symbols": matched_symbols,
+            "matched_candidates": matched_candidates,
+            "matched_bonus_candidates": matched_bonus_candidates,
+            "matched_symbols": matched_bonus_candidates,
         }
 
     def _build_theme_context(
@@ -102,6 +115,7 @@ class PolicyOverlayService:
         theme: PolicyThemeSettings,
         trade_date: str,
         theme_frame: pd.DataFrame,
+        watchlist_frame: pd.DataFrame,
     ) -> dict:
         match_count = int(len(theme_frame))
         positive_ratio = self._safe_mean(theme_frame.get("ret_5d", pd.Series(dtype=float)) > 0)
@@ -165,6 +179,7 @@ class PolicyOverlayService:
             "latest_event_date": event_context["latest_event_date"],
             "latest_event_title": event_context["latest_event_title"],
             "latest_event_source_url": event_context["latest_event_source_url"],
+            "watchlist_candidates": self._build_watchlist_candidates(watchlist_frame),
         }
 
     def _build_inactive_theme_context(
@@ -194,6 +209,7 @@ class PolicyOverlayService:
             "latest_event_date": event_context["latest_event_date"],
             "latest_event_title": event_context["latest_event_title"],
             "latest_event_source_url": event_context["latest_event_source_url"],
+            "watchlist_candidates": [],
         }
 
     def _build_event_context(
@@ -273,22 +289,97 @@ class PolicyOverlayService:
             frame["policy_tags"] = ""
         if "policy_sentiment_label" not in frame.columns:
             frame["policy_sentiment_label"] = ""
+        if "policy_matched" not in frame.columns:
+            frame["policy_matched"] = False
         return frame
 
-    @staticmethod
-    def _match_theme(frame: pd.DataFrame, theme: PolicyThemeSettings) -> pd.Series:
+    @classmethod
+    def _match_theme(cls, frame: pd.DataFrame, theme: PolicyThemeSettings) -> pd.Series:
         mask = pd.Series(False, index=frame.index)
 
         if "industry_l1" in frame.columns and theme.industries:
             mask = mask | frame["industry_l1"].isin(set(theme.industries))
+        if theme.industry_aliases:
+            mask = mask | cls._match_text_columns(
+                frame=frame,
+                columns=["industry_l1", "industry_l2"],
+                keywords=theme.industry_aliases,
+            )
         if "name" in frame.columns and theme.name_keywords:
-            keywords = tuple(theme.name_keywords)
-            mask = mask | frame["name"].fillna("").apply(
-                lambda value: any(keyword in value for keyword in keywords)
+            mask = mask | cls._match_text_columns(
+                frame=frame,
+                columns=["name"],
+                keywords=theme.name_keywords,
             )
         if theme.symbols:
             mask = mask | frame["symbol"].isin(set(theme.symbols))
         return mask
+
+    @classmethod
+    def _match_watchlist(cls, frame: pd.DataFrame, theme: PolicyThemeSettings) -> pd.Series:
+        mask = cls._match_theme(frame=frame, theme=theme)
+        if theme.watchlist_keywords:
+            mask = mask | cls._match_text_columns(
+                frame=frame,
+                columns=["name", "industry_l1", "industry_l2"],
+                keywords=theme.watchlist_keywords,
+            )
+        return mask
+
+    @staticmethod
+    def _match_text_columns(
+        *,
+        frame: pd.DataFrame,
+        columns: list[str],
+        keywords: list[str],
+    ) -> pd.Series:
+        available_columns = [column for column in columns if column in frame.columns]
+        if not available_columns or not keywords:
+            return pd.Series(False, index=frame.index)
+        text_series = frame[available_columns].fillna("").astype(str).agg("|".join, axis=1)
+        keyword_tuple = tuple(keyword for keyword in keywords if keyword)
+        if not keyword_tuple:
+            return pd.Series(False, index=frame.index)
+        return text_series.apply(lambda value: any(keyword in value for keyword in keyword_tuple))
+
+    @staticmethod
+    def _build_watchlist_candidates(frame: pd.DataFrame) -> list[dict]:
+        if frame.empty:
+            return []
+        ranked = frame.copy()
+        for column in ["score_raw", "ret_5d", "amount_ratio_5d"]:
+            if column in ranked.columns:
+                ranked[column] = pd.to_numeric(ranked[column], errors="coerce")
+        sort_columns: list[str] = []
+        ascending: list[bool] = []
+        if "score_raw" in ranked.columns:
+            sort_columns.append("score_raw")
+            ascending.append(False)
+        if "ret_5d" in ranked.columns:
+            sort_columns.append("ret_5d")
+            ascending.append(False)
+        sort_columns.append("symbol")
+        ascending.append(True)
+        ranked = ranked.sort_values(sort_columns, ascending=ascending, ignore_index=True)
+        payload_columns = [
+            column
+            for column in [
+                "symbol",
+                "name",
+                "industry_l1",
+                "industry_l2",
+                "score_raw",
+                "ret_5d",
+                "amount_ratio_5d",
+            ]
+            if column in ranked.columns
+        ]
+        watchlist = ranked[payload_columns].head(5).to_dict(orient="records")
+        for item in watchlist:
+            for key in ["score_raw", "ret_5d", "amount_ratio_5d"]:
+                if key in item and item[key] is not None:
+                    item[key] = float(item[key])
+        return watchlist
 
     @staticmethod
     def _score_theme_sentiment(

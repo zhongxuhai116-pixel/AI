@@ -100,7 +100,14 @@ class ValidationEngine:
             repo=self.repo,
             benchmark_index=self.benchmark_index,
         )
-        instruments_df = self.market_repo.get_instruments()[["symbol", "name", "industry_l1"]]
+        all_instruments_df = self.market_repo.get_instruments()
+        instruments_df = all_instruments_df[
+            [
+                column
+                for column in ["symbol", "name", "industry_l1", "industry_l2"]
+                if column in all_instruments_df.columns
+            ]
+        ]
         selection_service = SelectionService(
             repo=self.repo,
             baseline_ranker=BaselineRanker(

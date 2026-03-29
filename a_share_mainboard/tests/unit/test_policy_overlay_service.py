@@ -28,7 +28,9 @@ def test_policy_overlay_applies_bonus_only_when_theme_heat_and_event_are_confirm
                     summary="test",
                     source_url="https://example.com/theme",
                     industries=["I 信息技术"],
+                    industry_aliases=["电子"],
                     name_keywords=["机器人"],
+                    watchlist_keywords=["算力"],
                     symbols=[],
                     events=[
                         PolicyEventSettings(
@@ -78,6 +80,7 @@ def test_policy_overlay_applies_bonus_only_when_theme_heat_and_event_are_confirm
 
     assert context["status"] == "ACTIVE"
     assert context["theme_sentiment_label"] in {"warm", "hot"}
+    assert context["matched_candidates"] == 2
     assert context["matched_symbols"] == 2
     assert enriched.loc[enriched["symbol"] == "000001", "policy_bonus"].iloc[0] > 0.0
     assert enriched.loc[enriched["symbol"] == "000002", "policy_bonus"].iloc[0] > 0.0
@@ -87,6 +90,7 @@ def test_policy_overlay_applies_bonus_only_when_theme_heat_and_event_are_confirm
         in {"warm", "hot"}
     )
     assert context["active_themes"][0]["event_label"] == "fresh"
+    assert len(context["active_themes"][0]["watchlist_candidates"]) >= 2
 
 
 def test_policy_overlay_skips_bonus_when_theme_is_cold():
@@ -111,7 +115,9 @@ def test_policy_overlay_skips_bonus_when_theme_is_cold():
                     summary="test",
                     source_url="https://example.com/theme",
                     industries=["F 批发零售"],
+                    industry_aliases=["商业"],
                     name_keywords=[],
+                    watchlist_keywords=["家电"],
                     symbols=[],
                     events=[
                         PolicyEventSettings(
@@ -152,6 +158,7 @@ def test_policy_overlay_skips_bonus_when_theme_is_cold():
 
     assert context["status"] == "ACTIVE"
     assert context["theme_sentiment_label"] == "cold"
+    assert context["matched_candidates"] == 2
     assert context["matched_symbols"] == 0
     assert float(enriched["policy_bonus"].sum()) == 0.0
     assert context["active_themes"][0]["event_label"] in {"decay", "fresh"}
@@ -179,7 +186,9 @@ def test_policy_overlay_event_expiry_disables_bonus_after_decay_window():
                     summary="test",
                     source_url="https://example.com/theme",
                     industries=["I 信息技术"],
+                    industry_aliases=["软件"],
                     name_keywords=[],
+                    watchlist_keywords=["算力"],
                     symbols=[],
                     events=[
                         PolicyEventSettings(

@@ -84,7 +84,9 @@ class PolicyThemeSettings(BaseModel):
     summary: str
     source_url: str
     industries: list[str] = []
+    industry_aliases: list[str] = []
     name_keywords: list[str] = []
+    watchlist_keywords: list[str] = []
     symbols: list[str] = []
     events: list[PolicyEventSettings] = []
 

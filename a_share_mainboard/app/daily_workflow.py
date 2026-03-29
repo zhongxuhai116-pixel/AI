@@ -273,7 +273,9 @@ class DailyWorkflow:
 
             research_repo.delete_signals_for_trade_date(effective_trade_date)
             signal_count = 0
-            instruments_df = instruments_df[["symbol", "name", "industry_l1"]].copy()
+            instruments_df = instruments_df[
+                [column for column in ["symbol", "name", "industry_l1", "industry_l2"] if column in instruments_df.columns]
+            ].copy()
             policy_service = PolicyOverlayService(settings=self.settings.policy)
             rule_engine = RuleEngine(
                 settings=self.settings.strategy,
@@ -306,13 +308,14 @@ class DailyWorkflow:
             signals_df = research_repo.get_signals(effective_trade_date)
             if not signals_df.empty:
                 signals_df = signals_df.merge(
-                    instruments_df[["symbol", "name", "industry_l1"]],
+                    instruments_df,
                     on="symbol",
                     how="left",
                 )
-                policy_context["matched_symbols"] = int(
+                policy_context["matched_signals"] = int(
                     signals_df["rule_tags"].fillna("").str.contains("policy_gate").sum()
                 )
+                policy_context["matched_symbols"] = int(policy_context["matched_signals"])
             market_regime_df = research_repo.get_market_regime(effective_trade_date)
             market_regime = (
                 {}
@@ -444,17 +447,28 @@ class DailyWorkflow:
                 "theme_sentiment_label": "inactive",
                 "active_bonus_count": 0,
                 "active_themes": [],
+                "matched_candidates": 0,
+                "matched_bonus_candidates": 0,
+                "matched_signals": 0,
                 "matched_symbols": 0,
             }
 
         theme_map: dict[str, dict[str, Any]] = {}
         fallback_status = "INACTIVE"
-        matched_symbols = 0
+        matched_candidates = 0
+        matched_bonus_candidates = 0
         for context in policy_contexts:
             status = str(context.get("status", "INACTIVE"))
             if fallback_status == "INACTIVE" and status != "INACTIVE":
                 fallback_status = status
-            matched_symbols = max(matched_symbols, int(context.get("matched_symbols", 0) or 0))
+            matched_candidates = max(
+                matched_candidates,
+                int(context.get("matched_candidates", 0) or 0),
+            )
+            matched_bonus_candidates = max(
+                matched_bonus_candidates,
+                int(context.get("matched_bonus_candidates", 0) or 0),
+            )
             horizon = context.get("horizon")
             for theme in context.get("active_themes", []):
                 name = str(theme.get("name", ""))
@@ -489,6 +503,10 @@ class DailyWorkflow:
                 merged["bonus_active"] = bool(
                     existing.get("bonus_active") or candidate.get("bonus_active")
                 )
+                merged["watchlist_candidates"] = existing.get(
+                    "watchlist_candidates",
+                    [],
+                ) or candidate.get("watchlist_candidates", [])
                 theme_map[name] = merged
 
         active_themes = list(theme_map.values())
@@ -502,7 +520,10 @@ class DailyWorkflow:
                 1 for theme in active_themes if bool(theme.get("bonus_active"))
             ),
             "active_themes": active_themes,
-            "matched_symbols": matched_symbols,
+            "matched_candidates": matched_candidates,
+            "matched_bonus_candidates": matched_bonus_candidates,
+            "matched_signals": 0,
+            "matched_symbols": matched_bonus_candidates,
         }
 
     def _run_ai_explanations(
