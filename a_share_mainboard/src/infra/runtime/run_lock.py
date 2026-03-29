@@ -48,7 +48,7 @@ class RunLock:
                 return
             except FileExistsError:
                 existing = self._read_existing_lock()
-                if self._is_stale(existing):
+                if self._is_stale(existing) or self._is_orphaned(existing):
                     try:
                         self.lock_path.unlink()
                     except FileNotFoundError:
@@ -95,6 +95,25 @@ class RunLock:
             return True
         age_seconds = (datetime.now(timezone.utc) - acquired_at).total_seconds()
         return age_seconds > self.stale_seconds
+
+    @staticmethod
+    def _is_orphaned(payload: dict[str, Any]) -> bool:
+        raw_pid = payload.get("pid")
+        if raw_pid is None:
+            return True
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            return True
+        if pid <= 0:
+            return True
+        if pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, 0)
+            return False
+        except OSError:
+            return True
 
 
 def _utc_now_iso() -> str:
