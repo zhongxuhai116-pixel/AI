@@ -10,6 +10,9 @@ class AppSettings(BaseModel):
     data_root: str
     report_root: str
     log_root: str
+    run_lock_path: str = "data/logs/runtime.lock"
+    run_lock_stale_seconds: int = 21600
+    log_retention_days: int = 30
 
 
 class DataSettings(BaseModel):

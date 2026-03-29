@@ -26,6 +26,9 @@ dev = [
   "pytest>=8.3.0",
   "ruff>=0.6.0",
 ]
+desktop = [
+  "pyinstaller>=6.8.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

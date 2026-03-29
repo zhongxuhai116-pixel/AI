@@ -13,3 +13,6 @@ class ProviderUnavailableError(AppError):
 class AIResponseError(AppError):
     """Raised when the LLM response cannot be parsed."""
 
+
+class RuntimeBusyError(AppError):
+    """Raised when another workflow run is already in progress."""

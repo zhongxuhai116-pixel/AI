@@ -6,6 +6,9 @@ __pycache__/
 .venv/
 venv/
 .env
+build/
+dist/
+*.spec
 data/raw/**
 data/ods/**
 data/mart/**
@@ -16,4 +19,3 @@ data/logs/**
 !data/mart/.gitkeep
 !data/reports/.gitkeep
 !data/logs/.gitkeep
-

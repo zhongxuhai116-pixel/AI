@@ -373,16 +373,24 @@ class DailyWorkflow:
                 message="Daily report written",
                 payload={"report_path": str(report_path)},
             )
-            feishu_result = FeishuSyncService(settings=self.settings.feishu).send_daily_summary(
-                trade_date=effective_trade_date,
-                market_regime=market_regime,
-                signals_df=signals_df,
-                ai_outputs=ai_outputs,
-                report_path=str(report_path),
-                validation_outputs=validation_outputs,
-                policy_outputs=policy_context,
-                strategy_profile=strategy_profile,
-            )
+            if self.settings.feishu.enabled:
+                feishu_result = FeishuSyncService(
+                    settings=self.settings.feishu
+                ).send_daily_summary(
+                    trade_date=effective_trade_date,
+                    market_regime=market_regime,
+                    signals_df=signals_df,
+                    ai_outputs=ai_outputs,
+                    report_path=str(report_path),
+                    validation_outputs=validation_outputs,
+                    policy_outputs=policy_context,
+                    strategy_profile=strategy_profile,
+                )
+            else:
+                feishu_result = {
+                    "status": "SKIPPED",
+                    "message": "Feishu integration is deferred in the current phase.",
+                }
             self.run_logger.log_event(
                 run_id=run_id,
                 module="daily_workflow",

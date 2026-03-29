@@ -4,4 +4,6 @@ timezone = "Asia/Shanghai"
 data_root = "data"
 report_root = "data/reports"
 log_root = "data/logs"
-
+run_lock_path = "data/logs/runtime.lock"
+run_lock_stale_seconds = 21600
+log_retention_days = 30
