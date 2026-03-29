@@ -84,7 +84,8 @@ class FeishuSyncService:
             for theme in policy_themes[:3]:
                 label = theme.get("label", theme.get("name", ""))
                 heat = theme.get("sentiment_label", "inactive")
-                labels.append(f"{label}({heat})")
+                event = theme.get("event_label", "ongoing")
+                labels.append(f"{label}({heat}/{event})")
             lines.append("政策主线: " + "、".join(labels))
 
         validation_summaries = validation_outputs.get("summaries", {})

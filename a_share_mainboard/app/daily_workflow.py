@@ -57,10 +57,37 @@ class DailyWorkflow:
                 payload={"requested_trade_date": trade_date},
             )
 
-            calendar_count = TradeCalendarCollector(provider=provider, repo=market_repo).collect(
-                start_date=self.settings.data.default_start_date,
-                end_date=trade_date,
-            )
+            try:
+                calendar_count = TradeCalendarCollector(
+                    provider=provider,
+                    repo=market_repo,
+                ).collect(
+                    start_date=self.settings.data.default_start_date,
+                    end_date=trade_date,
+                )
+            except Exception as exc:
+                cached_calendar = market_repo.read_dataframe(
+                    """
+                    SELECT trade_date
+                    FROM trade_calendar
+                    WHERE trade_date BETWEEN ? AND ?
+                    """,
+                    (self.settings.data.default_start_date, trade_date),
+                )
+                if cached_calendar.empty:
+                    raise
+                calendar_count = int(len(cached_calendar))
+                self.run_logger.log_event(
+                    run_id=run_id,
+                    module="daily_workflow",
+                    level="WARNING",
+                    message="Trade calendar refresh failed; reused cached calendar",
+                    payload={
+                        "rows": calendar_count,
+                        "requested_trade_date": trade_date,
+                        "error": str(exc),
+                    },
+                )
             effective_trade_date = market_repo.get_latest_open_trade_date(trade_date)
             if effective_trade_date is None:
                 raise ValueError(f"No open trade date found on or before {trade_date}.")
@@ -77,8 +104,25 @@ class DailyWorkflow:
                 },
             )
 
-            instrument_count = InstrumentCollector(provider=provider, repo=market_repo).collect()
-            instrument_symbols = market_repo.get_instruments()["symbol"].tolist()
+            try:
+                instrument_count = InstrumentCollector(
+                    provider=provider,
+                    repo=market_repo,
+                ).collect()
+                instruments_df = market_repo.get_instruments()
+            except Exception as exc:
+                instruments_df = market_repo.get_instruments()
+                if instruments_df.empty:
+                    raise
+                instrument_count = int(len(instruments_df))
+                self.run_logger.log_event(
+                    run_id=run_id,
+                    module="daily_workflow",
+                    level="WARNING",
+                    message="Instrument universe refresh failed; reused cached instruments",
+                    payload={"rows": instrument_count, "error": str(exc)},
+                )
+            instrument_symbols = instruments_df["symbol"].tolist()
             self.run_logger.log_event(
                 run_id=run_id,
                 module="daily_workflow",
@@ -88,11 +132,38 @@ class DailyWorkflow:
             )
 
             index_start_date = add_days(effective_trade_date, -40)
-            index_count = IndexDailyCollector(provider=provider, repo=market_repo).collect(
-                start_date=index_start_date,
-                end_date=effective_trade_date,
-                index_codes=self.settings.data.index_codes,
-            )
+            try:
+                index_count = IndexDailyCollector(
+                    provider=provider,
+                    repo=market_repo,
+                ).collect(
+                    start_date=index_start_date,
+                    end_date=effective_trade_date,
+                    index_codes=self.settings.data.index_codes,
+                )
+            except Exception as exc:
+                cached_index = market_repo.get_index_history(
+                    start_date=index_start_date,
+                    end_date=effective_trade_date,
+                )
+                cached_index = cached_index[
+                    cached_index["index_code"].isin(self.settings.data.index_codes)
+                ].copy()
+                if cached_index.empty:
+                    raise
+                index_count = int(len(cached_index))
+                self.run_logger.log_event(
+                    run_id=run_id,
+                    module="daily_workflow",
+                    level="WARNING",
+                    message="Index history refresh failed; reused cached index history",
+                    payload={
+                        "rows": index_count,
+                        "start_date": index_start_date,
+                        "end_date": effective_trade_date,
+                        "error": str(exc),
+                    },
+                )
             self.run_logger.log_event(
                 run_id=run_id,
                 module="daily_workflow",
@@ -202,7 +273,7 @@ class DailyWorkflow:
 
             research_repo.delete_signals_for_trade_date(effective_trade_date)
             signal_count = 0
-            instruments_df = market_repo.get_instruments()[["symbol", "name", "industry_l1"]]
+            instruments_df = instruments_df[["symbol", "name", "industry_l1"]].copy()
             policy_service = PolicyOverlayService(settings=self.settings.policy)
             rule_engine = RuleEngine(
                 settings=self.settings.strategy,

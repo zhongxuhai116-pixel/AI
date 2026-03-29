@@ -11,4 +11,5 @@ def test_load_settings_smoke():
     assert settings.strategy.horizons == [5, 10]
     assert settings.policy.enabled is True
     assert settings.policy.min_theme_match_count == 2
+    assert settings.policy.fresh_event_days == 10
     assert len(settings.policy.themes) >= 1

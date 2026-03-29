@@ -64,6 +64,7 @@ def build_markdown_template(context: dict) -> str:
             lines.append(
                 "  "
                 f"heat={theme.get('sentiment_label', 'inactive')} | "
+                f"event={theme.get('event_label', 'ongoing')} | "
                 f"matches={int(theme.get('matched_count', 0) or 0)} | "
                 f"positive_ratio={theme.get('positive_ratio', 0.0):.2%} | "
                 f"avg_ret_5d={theme.get('avg_ret_5d', 0.0):.2%} | "
@@ -71,6 +72,16 @@ def build_markdown_template(context: dict) -> str:
                 f"avg_amount_ratio_5d={theme.get('avg_amount_ratio_5d', 0.0):.2f} | "
                 f"bonus={theme.get('effective_bonus', 0.0):.4f}"
             )
+            latest_event_date = theme.get("latest_event_date", "")
+            latest_event_title = theme.get("latest_event_title", "")
+            if latest_event_date or latest_event_title:
+                lines.append(
+                    "  "
+                    f"latest_event={latest_event_date} {latest_event_title}".rstrip()
+                )
+            latest_event_source_url = theme.get("latest_event_source_url", "")
+            if latest_event_source_url:
+                lines.append(f"  Event source: {latest_event_source_url}")
             source_url = theme.get("source_url", "")
             if source_url:
                 lines.append(f"  Source: {source_url}")

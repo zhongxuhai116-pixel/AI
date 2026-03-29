@@ -4,6 +4,9 @@ min_theme_match_count = 2
 min_theme_positive_ratio = 0.55
 min_theme_amount_ratio_5d = 1.0
 sentiment_multiplier_cap = 1.35
+fresh_event_days = 10
+decay_event_days = 45
+event_decay_floor = 0.35
 
 [[themes]]
 name = "two_new_2026"
@@ -12,10 +15,20 @@ start_date = "2026-01-01"
 end_date = "2026-12-31"
 weight = 0.001
 summary = "继续实施大规模设备更新和消费品以旧换新，优先偏向装备制造、零售流通和公用事业链条。"
-source_url = "https://www.ndrc.gov.cn/xwdt/ztzl/tddgmsbgxhxfpyjhx/gzdt/202503/t20250331_1396918.html"
+source_url = "https://www.ndrc.gov.cn/xwdt/ztzl/tddgmsbgxhxfpyjhx/gzdt/202602/t20260210_1403678.html"
 industries = ["C 制造业", "F 批发零售", "G 运输仓储", "D 水电煤气"]
 name_keywords = ["装备", "电力", "能源", "物流", "零售", "家电"]
 symbols = []
+
+[[themes.events]]
+date = "2026-01-04"
+title = "两新政策与绿色转型协同推进"
+source_url = "https://www.ndrc.gov.cn/wsdwhfz/202601/t20260104_1403014.html"
+
+[[themes.events]]
+date = "2026-02-10"
+title = "持续放大两新政策效能"
+source_url = "https://www.ndrc.gov.cn/xwdt/ztzl/tddgmsbgxhxfpyjhx/gzdt/202602/t20260210_1403678.html"
 
 [[themes]]
 name = "ai_plus_2026"
@@ -24,7 +37,17 @@ start_date = "2026-03-05"
 end_date = "2026-12-31"
 weight = 0.002
 summary = "围绕人工智能+、智能终端和智能制造装备，对科技与先进制造方向做政策加权。"
-source_url = "https://jgs.moa.gov.cn/zcjd/202503/t20250313_6471675.htm"
+source_url = "https://www.stats.gov.cn/zs/tjwh/tjkw/tjqk/zgxxb/202603/P020260306319732301033.pdf"
 industries = ["I 信息技术", "C 制造业", "M 科研服务"]
 name_keywords = ["智能", "机器人", "软件", "电子", "半导体", "通信", "汽车"]
 symbols = []
+
+[[themes.events]]
+date = "2026-01-09"
+title = "人工智能+制造专项行动实施意见"
+source_url = "https://www.digitalchina.gov.cn/2025/xwzx/szkx/"
+
+[[themes.events]]
+date = "2026-03-05"
+title = "政府工作报告继续深化拓展人工智能+"
+source_url = "https://www.stats.gov.cn/zs/tjwh/tjkw/tjqk/zgxxb/202603/P020260306319732301033.pdf"

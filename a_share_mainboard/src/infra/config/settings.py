@@ -69,6 +69,12 @@ class FeishuSettings(BaseModel):
     timeout_seconds: int = 15
 
 
+class PolicyEventSettings(BaseModel):
+    date: str
+    title: str
+    source_url: str
+
+
 class PolicyThemeSettings(BaseModel):
     name: str
     label: str
@@ -80,6 +86,7 @@ class PolicyThemeSettings(BaseModel):
     industries: list[str] = []
     name_keywords: list[str] = []
     symbols: list[str] = []
+    events: list[PolicyEventSettings] = []
 
 
 class PolicySettings(BaseModel):
@@ -89,6 +96,9 @@ class PolicySettings(BaseModel):
     min_theme_positive_ratio: float = 0.55
     min_theme_amount_ratio_5d: float = 1.0
     sentiment_multiplier_cap: float = 1.35
+    fresh_event_days: int = 10
+    decay_event_days: int = 45
+    event_decay_floor: float = 0.35
     themes: list[PolicyThemeSettings] = []
 
 

@@ -26,7 +26,11 @@ class PolicyOverlayService:
         for theme in active_themes:
             mask = self._match_theme(frame=frame, theme=theme)
             theme_frame = frame.loc[mask].copy()
-            theme_context = self._build_theme_context(theme=theme, theme_frame=theme_frame)
+            theme_context = self._build_theme_context(
+                theme=theme,
+                trade_date=trade_date,
+                theme_frame=theme_frame,
+            )
             theme_contexts.append(theme_context)
             if not mask.any() or theme_context["effective_bonus"] <= 0:
                 continue
@@ -62,22 +66,7 @@ class PolicyOverlayService:
         return self._build_applied_context(
             trade_date=trade_date,
             theme_contexts=[
-                {
-                    "name": theme.name,
-                    "label": theme.label,
-                    "weight": float(theme.weight),
-                    "effective_bonus": 0.0,
-                    "summary": theme.summary,
-                    "source_url": theme.source_url,
-                    "matched_count": 0,
-                    "positive_ratio": 0.0,
-                    "avg_ret_5d": 0.0,
-                    "avg_rs_index_10d": 0.0,
-                    "avg_amount_ratio_5d": 0.0,
-                    "sentiment_score": 0.0,
-                    "sentiment_label": "inactive",
-                    "bonus_active": False,
-                }
+                self._build_inactive_theme_context(theme=theme, trade_date=trade_date)
                 for theme in active_themes
             ],
             matched_symbols=0,
@@ -111,6 +100,7 @@ class PolicyOverlayService:
         self,
         *,
         theme: PolicyThemeSettings,
+        trade_date: str,
         theme_frame: pd.DataFrame,
     ) -> dict:
         match_count = int(len(theme_frame))
@@ -128,11 +118,13 @@ class PolicyOverlayService:
             avg_rs_index_10d=avg_rs_index_10d,
             avg_amount_ratio_5d=avg_amount_ratio_5d,
         )
+        event_context = self._build_event_context(theme=theme, trade_date=trade_date)
 
         tradeable = (
             match_count >= self.settings.min_theme_match_count
             and positive_ratio >= self.settings.min_theme_positive_ratio
             and avg_amount_ratio_5d >= self.settings.min_theme_amount_ratio_5d
+            and event_context["event_strength"] > 0
         )
         if not tradeable:
             sentiment_label = "cold"
@@ -142,13 +134,13 @@ class PolicyOverlayService:
             effective_bonus = float(theme.weight) * min(
                 self.settings.sentiment_multiplier_cap,
                 0.60 + sentiment_score,
-            )
+            ) * event_context["event_strength"]
         elif sentiment_score >= 0.58:
             sentiment_label = "warm"
             effective_bonus = float(theme.weight) * min(
                 self.settings.sentiment_multiplier_cap,
                 0.55 + sentiment_score,
-            )
+            ) * event_context["event_strength"]
         else:
             sentiment_label = "cold"
             effective_bonus = 0.0
@@ -168,6 +160,99 @@ class PolicyOverlayService:
             "sentiment_score": sentiment_score,
             "sentiment_label": sentiment_label,
             "bonus_active": effective_bonus > 0,
+            "event_label": event_context["event_label"],
+            "event_strength": event_context["event_strength"],
+            "latest_event_date": event_context["latest_event_date"],
+            "latest_event_title": event_context["latest_event_title"],
+            "latest_event_source_url": event_context["latest_event_source_url"],
+        }
+
+    def _build_inactive_theme_context(
+        self,
+        *,
+        theme: PolicyThemeSettings,
+        trade_date: str,
+    ) -> dict:
+        event_context = self._build_event_context(theme=theme, trade_date=trade_date)
+        return {
+            "name": theme.name,
+            "label": theme.label,
+            "weight": float(theme.weight),
+            "effective_bonus": 0.0,
+            "summary": theme.summary,
+            "source_url": theme.source_url,
+            "matched_count": 0,
+            "positive_ratio": 0.0,
+            "avg_ret_5d": 0.0,
+            "avg_rs_index_10d": 0.0,
+            "avg_amount_ratio_5d": 0.0,
+            "sentiment_score": 0.0,
+            "sentiment_label": "inactive",
+            "bonus_active": False,
+            "event_label": event_context["event_label"],
+            "event_strength": event_context["event_strength"],
+            "latest_event_date": event_context["latest_event_date"],
+            "latest_event_title": event_context["latest_event_title"],
+            "latest_event_source_url": event_context["latest_event_source_url"],
+        }
+
+    def _build_event_context(
+        self,
+        *,
+        theme: PolicyThemeSettings,
+        trade_date: str,
+    ) -> dict:
+        if not theme.events:
+            return {
+                "event_label": "ongoing",
+                "event_strength": 1.0,
+                "latest_event_date": "",
+                "latest_event_title": "",
+                "latest_event_source_url": theme.source_url,
+            }
+
+        trade_day = pd.to_datetime(trade_date).date()
+        sorted_events = sorted(theme.events, key=lambda item: item.date)
+        latest_event = None
+        for event in sorted_events:
+            event_day = pd.to_datetime(event.date).date()
+            if event_day <= trade_day:
+                latest_event = event
+
+        if latest_event is None:
+            return {
+                "event_label": "waiting",
+                "event_strength": 0.0,
+                "latest_event_date": "",
+                "latest_event_title": "",
+                "latest_event_source_url": theme.source_url,
+            }
+
+        latest_event_day = pd.to_datetime(latest_event.date).date()
+        days_since = (trade_day - latest_event_day).days
+        if days_since <= self.settings.fresh_event_days:
+            event_label = "fresh"
+            event_strength = 1.0
+        elif days_since <= self.settings.decay_event_days:
+            event_label = "decay"
+            decay_span = max(
+                self.settings.decay_event_days - self.settings.fresh_event_days,
+                1,
+            )
+            progress = (days_since - self.settings.fresh_event_days) / decay_span
+            event_strength = self.settings.event_decay_floor + (
+                1.0 - self.settings.event_decay_floor
+            ) * (1.0 - progress)
+        else:
+            event_label = "expired"
+            event_strength = 0.0
+
+        return {
+            "event_label": event_label,
+            "event_strength": float(event_strength),
+            "latest_event_date": latest_event_day.isoformat(),
+            "latest_event_title": latest_event.title,
+            "latest_event_source_url": latest_event.source_url,
         }
 
     def _resolve_active_themes(self, trade_date: str) -> list[PolicyThemeSettings]:
