@@ -4,6 +4,7 @@
 
 - Source visual truth: `assets/V6_Automation_UI_reference.png`
 - Implementation screenshot: `docs/reports/v1-ui-screenshot-final.png`
+- Provider settings evidence: `docs/reports/v1-minimax-settings.png`
 - Requested browser viewport: 1672 × 941 CSS px
 - Source pixels: 1672 × 941; implementation pixels: 1657 × 933 (browser content area excludes native scrollbar/chrome inset)
 - Density normalization: both reviewed at device scale 1 with the source shown at native size; no resampling-based findings
@@ -29,6 +30,7 @@ Focused review covered the navigation/brand block, project/step header, product 
 - Post-fix evidence: `docs/reports/v1-ui-screenshot-final.png` at the matched reference viewport.
 - The orange action hierarchy now maps to the source while blue remains limited to links and the V1 version badge.
 - No actionable P0/P1/P2 typography, spacing, color, imagery, copy, icon, responsiveness or accessibility mismatch remains for the intentionally reduced V1 state.
+- The MiniMax settings surface reuses the compact white-card, navy-sidebar and orange-action system; the password field clears after saving and no secret is visible in the evidence capture.
 
 ## Required fidelity surfaces
 

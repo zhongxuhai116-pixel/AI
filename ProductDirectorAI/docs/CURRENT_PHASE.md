@@ -3,7 +3,7 @@
 - 当前版本：V1 · 3D Director MVP
 - 状态：本机实现完成，等待用户用真实产品素材复验
 - 下一版本：V2 未授权
-- 外部 API：V1 不需要；待用户提供后再建立后端 Provider 凭证配置
+- 外部 API：MiniMax 中国区凭证已配置并认证；文本生成受 Token Plan 用量上限限制
 
 ## 已实现范围
 
@@ -12,11 +12,12 @@
 - 图片 FFmpeg 预演、GLB Blender Headless 三镜头渲染
 - SQLite 持久化任务、真实状态/阶段/进度、取消、错误记录
 - MP4 与 metadata.json 下载
+- 设置页 MiniMax 密钥输入、Windows 用户级加密保存、认证和最小生成测试
 - 深色侧栏、浅色卡片、橙色主动作的 V1 工作台
 
 ## 暂不实现
 
-- AI Provider、ComfyUI、MiniMax、字幕、配音、BGM
+- MiniMax 参与 DirectorPlan、ComfyUI、字幕、配音、BGM
 - Platform Profile、批量任务、成本中心、Automation API、一键发布
 - 云端 Worker 与外部平台发布
 

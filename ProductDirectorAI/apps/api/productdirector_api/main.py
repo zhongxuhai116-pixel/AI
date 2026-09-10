@@ -10,6 +10,10 @@ import subprocess
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
+import ctypes
+from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -112,6 +116,14 @@ def initialize_db() -> None:
               FOREIGN KEY(plan_id) REFERENCES plans(id),
               FOREIGN KEY(asset_id) REFERENCES assets(id)
             );
+            CREATE TABLE IF NOT EXISTS provider_credentials (
+              provider TEXT PRIMARY KEY,
+              encrypted_key BLOB NOT NULL,
+              base_url TEXT NOT NULL,
+              last_status TEXT,
+              last_message TEXT,
+              updated_at TEXT NOT NULL
+            );
             """
         )
 
@@ -147,6 +159,81 @@ class PlanUpdate(BaseModel):
 
 class RunRequest(BaseModel):
     plan_id: str
+
+
+class ProviderCredentialInput(BaseModel):
+    api_key: str = Field(min_length=20, max_length=512)
+
+
+class DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+
+def protect_secret(value: str) -> bytes:
+    raw = value.encode("utf-8")
+    buffer = ctypes.create_string_buffer(raw)
+    source = DataBlob(len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
+    target = DataBlob()
+    if not ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(source), "ProductDirectorAI MiniMax", None, None, None, 0,
+        ctypes.byref(target),
+    ):
+        raise RuntimeError("Windows 凭证加密失败")
+    try:
+        return ctypes.string_at(target.pbData, target.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(target.pbData)
+
+
+def unprotect_secret(value: bytes) -> str:
+    buffer = ctypes.create_string_buffer(value)
+    source = DataBlob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
+    target = DataBlob()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(source), None, None, None, None, 0, ctypes.byref(target),
+    ):
+        raise RuntimeError("Windows 凭证解密失败")
+    try:
+        return ctypes.string_at(target.pbData, target.cbData).decode("utf-8")
+    finally:
+        ctypes.windll.kernel32.LocalFree(target.pbData)
+
+
+def minimax_call(api_key: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        f"https://api.minimaxi.com{path}",
+        data=body,
+        method="POST" if payload is not None else "GET",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            return exc.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return exc.code, {"error": {"message": raw[-500:]}}
+
+
+def provider_row() -> sqlite3.Row | None:
+    with connect() as db:
+        return db.execute("SELECT * FROM provider_credentials WHERE provider = 'minimax'").fetchone()
+
+
+def provider_public_status(row: sqlite3.Row | None = None) -> dict:
+    row = row or provider_row()
+    return {
+        "provider": "minimax",
+        "region": "中国大陆",
+        "base_url": "https://api.minimaxi.com/v1",
+        "configured": bool(row),
+        "last_status": row["last_status"] if row else "NOT_CONFIGURED",
+        "last_message": row["last_message"] if row else "尚未配置 MiniMax API Key",
+        "updated_at": row["updated_at"] if row else None,
+    }
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:
@@ -361,6 +448,68 @@ def health() -> dict:
         "ffprobe": {"available": bool(FFPROBE), "path": FFPROBE},
         "storage": str(VAR),
     }
+
+
+@app.get("/api/v1/providers/minimax/status")
+def minimax_status() -> dict:
+    return provider_public_status()
+
+
+@app.post("/api/v1/providers/minimax/credentials")
+def save_minimax_credentials(request: ProviderCredentialInput) -> dict:
+    status, response = minimax_call(request.api_key, "/v1/models")
+    if status != 200 or not response.get("data"):
+        message = response.get("error", {}).get("message", "密钥验证失败")
+        raise HTTPException(status, message)
+    encrypted = protect_secret(request.api_key)
+    now = utc_now()
+    message = f"认证通过，可访问 {len(response['data'])} 个模型"
+    with connect() as db:
+        db.execute(
+            """INSERT INTO provider_credentials(provider, encrypted_key, base_url, last_status, last_message, updated_at)
+               VALUES('minimax', ?, ?, 'AUTHENTICATED', ?, ?)
+               ON CONFLICT(provider) DO UPDATE SET encrypted_key=excluded.encrypted_key,
+               base_url=excluded.base_url, last_status=excluded.last_status,
+               last_message=excluded.last_message, updated_at=excluded.updated_at""",
+            (encrypted, "https://api.minimaxi.com/v1", message, now),
+        )
+    return provider_public_status()
+
+
+@app.post("/api/v1/providers/minimax/test")
+def test_minimax_generation() -> dict:
+    row = provider_row()
+    if not row:
+        raise HTTPException(409, "请先保存 MiniMax API Key")
+    api_key = unprotect_secret(row["encrypted_key"])
+    status, response = minimax_call(
+        api_key,
+        "/v1/chat/completions",
+        {
+            "model": "MiniMax-M2.7",
+            "messages": [{"role": "user", "content": "只回复：连接成功"}],
+            "max_completion_tokens": 64,
+            "temperature": 0.1,
+        },
+    )
+    now = utc_now()
+    if status == 200:
+        state = "GENERATION_READY"
+        message = "认证与文本生成均可用"
+    elif status == 429:
+        state = "QUOTA_LIMITED"
+        message = response.get("error", {}).get("message", "认证通过，但当前额度受限")
+    else:
+        state = "TEST_FAILED"
+        message = response.get("error", {}).get("message", f"调用失败（HTTP {status}）")
+    with connect() as db:
+        db.execute(
+            "UPDATE provider_credentials SET last_status = ?, last_message = ?, updated_at = ? WHERE provider = 'minimax'",
+            (state, message, now),
+        )
+    result = provider_public_status()
+    result["http_status"] = status
+    return result
 
 
 @app.post("/api/v1/assets", status_code=201)

@@ -20,8 +20,9 @@ V1 已在本机实现。它是通用产品导演工作台，不绑定拳击靶�
 - 图片 FFmpeg 预演与 GLB Blender Headless 预演
 - SQLite 任务持久化、状态/阶段/进度/取消/失败信息
 - MP4 与 metadata.json 下载
+- 设置页配置中国区 MiniMax；API Key 由 Windows DPAPI 用户级加密保存
 
-V1 不需要外部 API。用户提供 API 后，必须先明确授权 V2，再把凭证接入后端 Provider 配置；禁止把密钥写进前端或 Git。
+V1 已允许保存和测试 MiniMax 连接，但尚不让 MiniMax 改写 DirectorPlan；生成式 Provider 编排仍属于 V2。禁止把密钥写进前端或 Git。
 
 ## 规划与记录
 
@@ -33,4 +34,4 @@ V1 不需要外部 API。用户提供 API 后，必须先明确授权 V2，再�
 
 将整个包一起保存可保留 Markdown 中的相对图片和合同链接。移动到产品仓库 `docs/` 后，要同步调整相对路径。若仓库已有 AGENTS.md 或源码，按主规划合并适用规则、保留已有工作。
 
-V2–V6 仍是待执行规格；真实 Provider、账号、云算力、价格和发布能力必须在对应版本实施时验证。
+V2–V6 仍是待执行规格；真实 Provider 编排、账号、云算力、价格和发布能力必须在对应版本实施时验证。

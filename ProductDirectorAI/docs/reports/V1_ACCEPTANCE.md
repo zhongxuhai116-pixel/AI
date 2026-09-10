@@ -16,6 +16,8 @@
 | 任务可追踪 | PASS | QUEUED/RUNNING/CANCEL_REQUESTED/CANCELLED/FAILED/SUCCEEDED |
 | 产物下载 | PASS | MP4 与 JSON Manifest |
 | 本机恢复 | PASS | 素材、计划、任务保存在 SQLite 与 `var/` |
+| MiniMax 凭证 | PASS | 中国区端点认证通过；Windows DPAPI 加密，本机数据库中无明文标记 |
+| MiniMax 文本生成 | LIMITED | 官方返回 429 / 2056：Token Plan 用量已达上限 |
 
 ## 工程验收
 
@@ -24,6 +26,7 @@
 - 图片端到端：PASS。
 - GLB 端到端：PASS。
 - 视觉 QA：PASS，详见 `../../design-qa.md`。
+- 设置界面：PASS，实际输入、保存、认证、生成测试；浏览器 console error/warning 为 0。
 - 控制台交互自动化：未使用；浏览器页面已实际渲染，核心接口与真实产物通过端到端测试。
 
 ## 已知限制
@@ -31,7 +34,8 @@
 - V1 是单机单用户原型，不提供账号、权限、云同步和多人协作。
 - 任务执行器为本机后台任务，不是跨进程可靠队列；服务重启时正在运行的任务需要重新提交。
 - 图片预演为二维推近/平移；真实 3D 运动要求 GLB。
-- Blender V1 使用统一工作室灯光和固定三段镜头，尚未接入 AI、ComfyUI 或 MiniMax。
+- Blender V1 使用统一工作室灯光和固定三段镜头，尚未让 MiniMax 参与 DirectorPlan，也未接入 ComfyUI。
+- MiniMax 当前 Token Plan 需要补充额度后才能通过文本生成测试。
 - 大型复杂 GLB 的材质兼容性和渲染耗时需用用户真实模型继续验证。
 
 ## 阶段退出条件

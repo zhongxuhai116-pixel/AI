@@ -171,10 +171,13 @@ function Library({ assets, onSelect }) {
   </section>;
 }
 
-function Settings({ health }) {
-  return <section className="page"><div className="page-head"><div><b>LOCAL RUNTIME</b><h1>本机执行环境</h1><p>V1 使用本机 Blender 与 FFmpeg。你提供 API 后，再按 V2 接入 Provider。</p></div></div><div className="settings">
+function Settings({ health, provider, onSaveProvider, onTestProvider, busy }) {
+  const [key, setKey] = useState("");
+  const tone = ["GENERATION_READY", "AUTHENTICATED"].includes(provider?.last_status) ? "SUCCEEDED" : provider?.last_status === "QUOTA_LIMITED" ? "CANCEL_REQUESTED" : "FAILED";
+  async function submit(event) { event.preventDefault(); if (key.trim()) { await onSaveProvider(key.trim()); setKey(""); } }
+  return <section className="page"><div className="page-head"><div><b>LOCAL RUNTIME</b><h1>本机执行环境</h1><p>本机 Blender / FFmpeg 与中国区 MiniMax Provider。密钥只在后端用 Windows 用户级加密保存。</p></div></div><div className="settings">
     {[["Blender", health?.blender, Cube], ["FFmpeg", health?.ffmpeg, FilmSlate], ["本地存储", { available: !!health, path: health?.storage }, FolderOpen]].map(([name, value, Icon]) => <div key={name}><em className={value?.available ? "ok" : "off"}><Icon /></em><p><strong>{name}</strong><small>{value?.path || "尚未连接"}</small></p><Pill status={value?.available ? "SUCCEEDED" : "FAILED"} /></div>)}
-  </div></section>;
+  </div><section className="provider-card"><div className="provider-head"><div><Sparkle weight="fill" /><p><strong>MiniMax · 中国大陆</strong><small>https://api.minimaxi.com/v1</small></p></div><Pill status={tone} /></div><p className="provider-message">{provider?.last_message || "尚未配置 MiniMax API Key"}</p><form onSubmit={submit}><label><span>API Key</span><input aria-label="MiniMax API Key" type="password" autoComplete="off" value={key} onChange={(e) => setKey(e.target.value)} placeholder={provider?.configured ? "已加密保存；输入新密钥可替换" : "输入 sk-cp-…"} /></label><button className="primary" disabled={busy || !key.trim()} type="submit">保存并验证</button><button type="button" disabled={busy || !provider?.configured} onClick={onTestProvider}>测试文本生成</button></form><small className="provider-note">不会把密钥返回给浏览器、写入前端存储或提交到 GitHub。</small></section></section>;
 }
 
 export function App() {
@@ -186,6 +189,7 @@ export function App() {
   const [intent, setIntent] = useState("在干净的现代工作室中，用三个清晰镜头展示产品外观、侧面结构与整体比例。");
   const [plan, setPlan] = useState(null);
   const [jobs, setJobs] = useState([]);
+  const [provider, setProvider] = useState(null);
   const [job, setJob] = useState(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState(null);
@@ -193,9 +197,10 @@ export function App() {
 
   async function refresh() {
     try {
-      const [h, a, j] = await Promise.all([fetch(`${API}/health`), fetch(`${API}/assets`), fetch(`${API}/jobs`)]);
+      const [h, a, j, p] = await Promise.all([fetch(`${API}/health`), fetch(`${API}/assets`), fetch(`${API}/jobs`), fetch(`${API}/providers/minimax/status`)]);
       if (!h.ok) throw new Error();
-      const nextHealth = await h.json(); const nextAssets = await a.json(); const nextJobs = await j.json();
+      const nextHealth = await h.json(); const nextAssets = await a.json(); const nextJobs = await j.json(); const nextProvider = p.ok ? await p.json() : null;
+      setProvider(nextProvider);
       setHealth(nextHealth); setAssets(nextAssets); setJobs(nextJobs);
       if (!asset && nextAssets[0]) { setAsset(nextAssets[0]); setAssetUrl(`${API}/assets/${nextAssets[0].id}/content`); }
       if (job) { const current = nextJobs.find((item) => item.id === job.id); if (current) setJob(current); }
@@ -243,13 +248,31 @@ export function App() {
     } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
   }
   async function cancel() { if (job) { await fetch(`${API}/jobs/${job.id}/cancel`, { method: "POST" }); refresh(); } }
+  async function saveProvider(apiKey) {
+    setBusy(true);
+    try {
+      const response = await fetch(`${API}/providers/minimax/credentials`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ api_key: apiKey }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || "MiniMax 密钥验证失败");
+      setProvider(result); setToast(["success", result.last_message]);
+    } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function testProvider() {
+    setBusy(true);
+    try {
+      const response = await fetch(`${API}/providers/minimax/test`, { method: "POST" });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || "MiniMax 测试失败");
+      setProvider(result); setToast([result.last_status === "GENERATION_READY" ? "success" : "danger", result.last_message]);
+    } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
+  }
   const filtered = useMemo(() => jobs.filter((item) => !search || JSON.stringify(item).toLowerCase().includes(search.toLowerCase())).slice(0, 6), [jobs, search]);
   function selectAsset(next) { setAsset(next); setAssetUrl(`${API}/assets/${next.id}/content`); setPlan(null); setJob(null); setActive("project"); }
 
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "settings" ? <Settings health={health} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">
