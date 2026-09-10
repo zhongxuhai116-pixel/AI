@@ -1,0 +1,55 @@
+{
+  "schema_version": "1.0",
+  "product_version_id": "33333333-3333-4333-8333-333333333333",
+  "intent": "以三个清晰镜头展示儿童拳击机的正面、侧面和立体结构；本例为模板导演的基础产品预演。",
+  "output": {
+    "width": 540,
+    "height": 960,
+    "fps": 24,
+    "container": "mp4",
+    "video_codec": "h264",
+    "pixel_format": "yuv420p"
+  },
+  "fidelity_mode": "STRICT",
+  "shots": [
+    {
+      "id": "shot_01",
+      "name": "正面推近",
+      "duration_frames": 48,
+      "camera": {
+        "focal_length_mm": 35,
+        "sensor_width_mm": 36,
+        "target_m": [0, 0, 0.6],
+        "path": {"type": "dolly_in", "start_m": [0, -3.8, 1.0], "end_m": [0, -3.0, 0.9]}
+      },
+      "product_pose": {"position_m": [0, 0, 0], "rotation_xyz_deg": [0, 0, 0], "scale": 1},
+      "scene": {"template": "studio_product", "background_color": "#F2F3F5", "lighting_preset": "softbox"}
+    },
+    {
+      "id": "shot_02",
+      "name": "侧向观察",
+      "duration_frames": 48,
+      "camera": {
+        "focal_length_mm": 35,
+        "sensor_width_mm": 36,
+        "target_m": [0, 0, 0.6],
+        "path": {"type": "side_track", "start_m": [-0.7, -3.2, 0.9], "end_m": [0.7, -3.2, 0.9]}
+      },
+      "product_pose": {"position_m": [0, 0, 0], "rotation_xyz_deg": [0, 0, 0], "scale": 1},
+      "scene": {"template": "studio_product", "background_color": "#F2F3F5", "lighting_preset": "softbox"}
+    },
+    {
+      "id": "shot_03",
+      "name": "立体环绕展示",
+      "duration_frames": 48,
+      "camera": {
+        "focal_length_mm": 35,
+        "sensor_width_mm": 36,
+        "target_m": [0, 0, 0.6],
+        "path": {"type": "hero_orbit", "radius_m": 3.2, "height_m": 1.0, "start_angle_deg": -20, "end_angle_deg": 35}
+      },
+      "product_pose": {"position_m": [0, 0, 0], "rotation_xyz_deg": [0, 0, 0], "scale": 1},
+      "scene": {"template": "studio_product", "background_color": "#F2F3F5", "lighting_preset": "softbox"}
+    }
+  ]
+}

@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:productdirectorai:director-plan:1.0",
+  "title": "ProductDirectorAI V1 DirectorPlan",
+  "description": "V1 executable plan shape. Product authorization, approval, camera feasibility and total duration require separate semantic validation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "product_version_id", "intent", "output", "fidelity_mode", "shots"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "product_version_id": {"$ref": "#/$defs/uuid"},
+    "intent": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "output": {"$ref": "#/$defs/output"},
+    "fidelity_mode": {"const": "STRICT"},
+    "shots": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {"$ref": "#/$defs/shot"}
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "vector3": {
+      "type": "array",
+      "prefixItems": [{"type": "number"}, {"type": "number"}, {"type": "number"}],
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "fps", "container", "video_codec", "pixel_format"],
+      "properties": {
+        "width": {"type": "integer", "enum": [540, 1080]},
+        "height": {"type": "integer", "enum": [960, 1920]},
+        "fps": {"const": 24},
+        "container": {"const": "mp4"},
+        "video_codec": {"const": "h264"},
+        "pixel_format": {"const": "yuv420p"}
+      },
+      "oneOf": [
+        {"properties": {"width": {"const": 540}, "height": {"const": 960}}},
+        {"properties": {"width": {"const": 1080}, "height": {"const": 1920}}}
+      ]
+    },
+    "shot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "duration_frames", "camera", "product_pose", "scene"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^shot_[a-z0-9_]{1,40}$"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 120},
+        "duration_frames": {"type": "integer", "minimum": 24, "maximum": 144},
+        "camera": {"$ref": "#/$defs/camera"},
+        "product_pose": {"$ref": "#/$defs/productPose"},
+        "scene": {"$ref": "#/$defs/scene"}
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["focal_length_mm", "sensor_width_mm", "target_m", "path"],
+      "properties": {
+        "focal_length_mm": {"type": "number", "minimum": 15, "maximum": 120},
+        "sensor_width_mm": {"const": 36},
+        "target_m": {"$ref": "#/$defs/vector3"},
+        "path": {
+          "oneOf": [
+            {"$ref": "#/$defs/orbitPath"},
+            {"$ref": "#/$defs/dollyPath"},
+            {"$ref": "#/$defs/trackPath"},
+            {"$ref": "#/$defs/staticPath"}
+          ]
+        }
+      }
+    },
+    "orbitPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "radius_m", "height_m", "start_angle_deg", "end_angle_deg"],
+      "properties": {
+        "type": {"const": "hero_orbit"},
+        "radius_m": {"type": "number", "exclusiveMinimum": 0, "maximum": 1000},
+        "height_m": {"type": "number", "minimum": 0, "maximum": 1000},
+        "start_angle_deg": {"type": "number", "minimum": -360, "maximum": 360},
+        "end_angle_deg": {"type": "number", "minimum": -360, "maximum": 360}
+      }
+    },
+    "dollyPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "start_m", "end_m"],
+      "properties": {
+        "type": {"const": "dolly_in"},
+        "start_m": {"$ref": "#/$defs/vector3"},
+        "end_m": {"$ref": "#/$defs/vector3"}
+      }
+    },
+    "trackPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "start_m", "end_m"],
+      "properties": {
+        "type": {"const": "side_track"},
+        "start_m": {"$ref": "#/$defs/vector3"},
+        "end_m": {"$ref": "#/$defs/vector3"}
+      }
+    },
+    "staticPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "position_m"],
+      "properties": {
+        "type": {"const": "static"},
+        "position_m": {"$ref": "#/$defs/vector3"}
+      }
+    },
+    "productPose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position_m", "rotation_xyz_deg", "scale"],
+      "properties": {
+        "position_m": {"$ref": "#/$defs/vector3"},
+        "rotation_xyz_deg": {"$ref": "#/$defs/vector3"},
+        "scale": {"const": 1}
+      }
+    },
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["template", "background_color", "lighting_preset"],
+      "properties": {
+        "template": {"const": "studio_product"},
+        "background_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+        "lighting_preset": {"enum": ["softbox", "three_point"]}
+      }
+    }
+  }
+}
