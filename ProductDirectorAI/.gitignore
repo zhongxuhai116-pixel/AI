@@ -1,0 +1,7 @@
+.venv/
+var/
+work/
+apps/web/node_modules/
+apps/web/dist/
+*.pyc
+__pycache__/

@@ -1,16 +1,16 @@
 # 交给 Codex SOL 5.6 的首条执行指令
 
-先将本规划包放到目标产品仓库中。选择你准备使用的 SOL 5.6 执行任务，然后复制下方指令。当前交付只有开发规格和合同示例，尚未创建产品源码或运行产品测试。
+选择你准备使用的 SOL 5.6 执行任务，然后复制下方指令。当前仓库已经包含 V1 本机实现、真实图片/GLB 验收记录和完整 V1–V6 规划；V2 尚未授权。
 
 ## 可直接复制的指令
 
 你负责实现 ProductDirectorAI。请完整读取 `ProductDirectorAI_V1-V6_Codex_Development_Plan.md`、`assets/V6_Automation_UI_reference.png`、`contracts/director-plan.v1.schema.json`、`contracts/director-plan.v1.example.json`，以及当前仓库全部适用工程说明。
 
-先检查仓库、现有实现、未提交改动和运行环境，保留用户工作，复用合适代码。将总规划纳入 `docs/MASTER_PLAN.md`，确保其中参考图和合同文件的相对链接在移动后仍然有效；建立或合并 `AGENTS.md`、`docs/CURRENT_PHASE.md` 与 `docs/EXECUTION_LOG.md`。按完整总规划提取 `docs/phases/V1.md`，保留对共用架构/数据/API/Provider/验收规范的引用。不要现在实现其他版本。
+先检查仓库、现有实现、未提交改动和运行环境，保留用户工作。读取根目录 `AGENTS.md`、`docs/CURRENT_PHASE.md`、`docs/EXECUTION_LOG.md`、`docs/reports/P0_ENVIRONMENT.md`、`docs/reports/V1_ACCEPTANCE.md` 和 `design-qa.md`。不要重写已经通过的 V1，不要现在实现其他版本。
 
-当前仅授权 V1。先执行 V1-00 的 P0 技术验证；P0 通过后继续 V1-01 至 V1-09。完成 V1 后停止，不进入 V2–V6，不自动修改授权版本。
+当前仅授权维护 V1。先在本机复跑前端 build、Sites worker 测试、API 健康检查和一个最小图片预演；发现回归时仅修复 V1。复验通过后停止，不进入 V2–V6，不自动修改授权版本。
 
-P0 必须实测 Blender Headless、FFmpeg/ffprobe、数据库与可执行 Worker，完成 GLB 导入、尺寸/朝向规范化、hero_orbit/dolly_in/side_track、真实帧序列、MP4 和 metadata。没有用户真实产品模型时，使用明确标识、可再生成的测试模型进行技术验证；不得将测试模型当用户真实产品。没有可用 Blender、节点或必要依赖时，完成安全诊断和不依赖这些条件的工作，记录准确的 BLOCKED 项，不能用占位视频让 P0 通过。
+若用户提供真实产品素材，用它做业务复验；否则保留 `tests/fixtures/generic-product.glb` 作为明确标识、可再生成的通用测试夹具。产品不一定是拳击靶，禁止加入品类绑定。不能用占位视频让验收通过。
 
 V1 实现独立 Web 工作台：产品图片/3D 入口、产品版本审核、模板三镜头 DirectorPlan、分镜编辑与确认、3D/图片预演、真实渲染任务、真实进度/错误/取消/重试、视频与 Manifest 下载、本地及已配置云端 Worker。界面使用参考图的深色导航、浅色卡片和橙色主动作，按 V1 范围展示功能。
 
