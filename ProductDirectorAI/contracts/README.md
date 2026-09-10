@@ -1,5 +1,7 @@
 # 起始合同说明
 
+> 当前状态：此处是目标合同与结构示例，不是当前 FastAPI 全量接口，也不是 V1 完整验收证明。当前实现使用简化 Pydantic 请求；差异见 `../docs/V1_IMPLEMENTATION_GAPS.md`。
+
 `director-plan.v1.schema.json` 是 JSON Schema Draft 2020-12 的 V1 3D 计划合同；`director-plan.v1.example.json` 是对应的有效结构示例。
 
 本例是 3 个 48 帧镜头，总共 144 帧、24fps、6 秒。UUID 是格式合法的占位值，实际生产需替换成可访问、已批准、尺寸已规范化的产品版本。相机示例针对约 1.2 米高的测试产品，执行前仍需按包围盒校验构图。
@@ -15,4 +17,4 @@
 
 仅有图片时使用主规划定义的 ImagePreviewSpec，不强行套用此 3D Schema。V2–V6 增加人物、参考与后期能力时，新增有版本号的 Schema 和迁移，不关闭 `additionalProperties` 检查来绕过合同。
 
-本包的检查只证明文档和示例结构一致；没有执行实际 Blender、数据库、Provider 或发布测试。
+本包的合同检查只证明文档和示例结构一致；历史 Blender/数据库测试另见报告，Provider、发布、新电脑和云端结果不能由本合同推断。

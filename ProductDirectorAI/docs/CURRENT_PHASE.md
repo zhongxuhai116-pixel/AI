@@ -1,19 +1,20 @@
 # 当前阶段
 
 - 当前版本：V1 · 3D Director MVP
-- 状态：本机实现完成，等待用户用真实产品素材复验
+- 状态：PARTIAL；本机核心已有历史实现与技术证据，完整 V1 尚未验收，用户真实素材与新电脑环境均未复验
 - 下一版本：V2 未授权
-- 外部 API：MiniMax 中国区凭证已配置并认证；文本生成受 Token Plan 用量上限限制
+- 当前优先：先将文档/源码交接到 GitHub并在新电脑恢复；服务器排查与部署暂停
+- 外部 API：旧电脑历史记录显示 MiniMax 中国区认证曾通过、文本生成曾受额度限制；DPAPI 凭证不可直接迁移，当前不调用收费 API
 
 ## 已实现范围
 
 - 通用产品图片/GLB 上传与素材库
-- 模板三镜头 DirectorPlan、镜头名称/机位编辑、保存与确认
+- 模板三镜头 DirectorPlan、镜头名称/机位编辑、保存与确认；编辑保存已有，但渲染器应用这些字段仍有差距，见 `V1_IMPLEMENTATION_GAPS.md`
 - 图片 FFmpeg 预演、GLB Blender Headless 三镜头渲染
 - SQLite 持久化任务、真实状态/阶段/进度、取消、错误记录
 - MP4 与 metadata.json 下载
 - 设置页 MiniMax 密钥输入、Windows 用户级加密保存、认证和最小生成测试
-- 设置页展示云 GPU 选型快照：优云智算 5090 32GB 为默认、3090 24GB 为节省档、4090 48GB 为视频稳妥档；仅展示，不购买或创建实例
+- 设置页展示的是购买前 GPU 候选快照；实际已购为优云智算华北二 A RTX 4090 24GB 节点，尚未部署 Blender/FFmpeg/ProductDirectorAI
 - 深色侧栏、浅色卡片、橙色主动作的 V1 工作台
 
 ## 暂不实现
@@ -24,4 +25,4 @@
 
 ## 继续施工入口
 
-运行 `scripts/start-api.ps1` 与 `scripts/start-web.ps1`，浏览器打开 `http://127.0.0.1:4173/`。主规划与 SOL 5.6 执行提示分别位于根目录规划书和 `CODEX_SOL56_START_HERE.md`。
+先按 `docs/HANDOFF_NEW_COMPUTER.md` 克隆、安装与复验，再使用启动脚本。差距见 `docs/V1_IMPLEMENTATION_GAPS.md`，云端事实见 `docs/CLOUD_SERVER_HANDOFF.md`；不得根据历史 PASS 自动宣布 V1 完成。

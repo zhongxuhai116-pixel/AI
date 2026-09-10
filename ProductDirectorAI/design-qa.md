@@ -1,5 +1,7 @@
 # ProductDirectorAI V1 Design QA
 
+> 状态：**PARTIAL / 历史截图审查**。本报告只覆盖下列旧电脑截图和当时 V1 界面；新增 GPU 卡、新电脑运行态、交互语义、真实用户素材、云端页面及完整可访问性未在本轮复验。文末 `passed` 仅指当时截图范围，不是完整 V1 验收。
+
 ## Evidence
 
 - Source visual truth: `assets/V6_Automation_UI_reference.png`
@@ -57,4 +59,4 @@ No actionable P0, P1 or P2 findings remain.
 - [x] Use real assets and a consistent icon library.
 - [x] Capture final browser evidence at the reference viewport.
 
-final result: passed
+historical screenshot result: passed within the stated evidence scope; current overall V1 status: PARTIAL

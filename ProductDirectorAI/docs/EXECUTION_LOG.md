@@ -2,6 +2,8 @@
 
 ## 2026-09-10
 
+> 本节多数为旧电脑同日历史记录，不等于新电脑复验或完整 V1 负责人验收；当前总状态见 `CURRENT_PHASE.md`。
+
 - V1-00：安装并验证 Blender 5.2.1 LTS、FFmpeg 9.0.1、Python/FastAPI、Node/Vite。
 - V1-01：建立 React 工作台及参考 V6 图的信息架构；V1 只显示当前阶段功能。
 - V1-02：实现通用 PNG/JPEG/WebP/GLB 上传、哈希、大小限制、本地素材存储。
@@ -15,6 +17,9 @@
 - 用户增量：在设置页加入 MiniMax 中国区 Provider 配置；密钥通过 Windows DPAPI 加密保存。认证与模型列表测试通过，最小文本生成返回 429 / 2056（Token Plan 用量上限）。
 - 用户增量：核对优云智算创建页与官方计费，确认截图中的单卡 RTX 5090 32GB、14C64GB、按量计费适合 V1；要求系统盘至少 100GB，ComfyUI/视频建议 200GB 或独立云盘。
 - 用户增量：增加 `docs/GPU_CLOUD_SELECTION.md` 与设置页 GPU 选型卡。主平台建议优云智算，AutoDL 作为低成本开发/备用；V1 不调用云平台 API、不创建实例、不产生费用。
+- 后续事实覆盖购买前选型：用户实际购买优云智算华北二 A、RTX 4090 24GB、16 核/94GB、Ubuntu 22.04.4 节点；根分区已扩容到约 291G。网页 SSH 成功，旧电脑公网 SSH 在认证前超时且监听窗口未观察到对应 SYN，原因未定。
+- 云部署状态：Blender、FFmpeg 和 ProductDirectorAI 尚未部署；ComfyUI 不属于 V1 退出门。最新请求暂停服务器排查/部署，优先完成 GitHub 文档与新电脑交接。
+- 交接文档：新增 `docs/HANDOFF_NEW_COMPUTER.md`、`docs/CLOUD_SERVER_HANDOFF.md`、`docs/V1_IMPLEMENTATION_GAPS.md`、`docs/decisions/ADR-001-V1-PROTOTYPE-BASELINE.md`，并统一入口与历史验收口径。
 
 ## 关键决定
 

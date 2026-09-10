@@ -5,3 +5,13 @@ apps/web/node_modules/
 apps/web/dist/
 *.pyc
 __pycache__/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
