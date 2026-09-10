@@ -31,6 +31,7 @@ V1 已允许保存和测试 MiniMax 连接，但尚不让 MiniMax 改写 Directo
 - [原始 V6 UI 参考图](assets/V6_Automation_UI_reference.png)：用户提供的界面依据。
 - [起始合同说明](contracts/README.md)、[V1 DirectorPlan Schema](contracts/director-plan.v1.schema.json)、[有效示例](contracts/director-plan.v1.example.json)。
 - [当前阶段](docs/CURRENT_PHASE.md)、[执行记录](docs/EXECUTION_LOG.md)、[V1 验收](docs/reports/V1_ACCEPTANCE.md)、[视觉 QA](design-qa.md)。
+- [云 GPU 选型与部署规范](docs/GPU_CLOUD_SELECTION.md)：优云智算/AutoDL 对比、5090/4090 48G/3090 档位、计费、存储、API 预留和验收门。
 
 将整个包一起保存可保留 Markdown 中的相对图片和合同链接。移动到产品仓库 `docs/` 后，要同步调整相对路径。若仓库已有 AGENTS.md 或源码，按主规划合并适用规则、保留已有工作。
 

@@ -503,6 +503,25 @@ UI 提供输入、测试、替换、删除；提交后只显示掩码、指纹�
 
 MiniMax 的生成视频不自动拥有 Blender 的深度、产品 Mask 或精确相机轨迹。Strict 路线只使用可以安全作为背景/人物层的成果；不能用 Provider 的“参考一致性”宣传替代产品保真检测。
 
+### 6.9 云 GPU 基准选型（2026-09-10）
+
+ProductDirectorAI 当前采用“优云智算主平台、AutoDL 开发/备用”的多 Provider 策略，详见 [`docs/GPU_CLOUD_SELECTION.md`](docs/GPU_CLOUD_SELECTION.md)。这是一份可复核的选型快照，不是自动购买授权，也不把任何价格永久写死在领域逻辑中。
+
+| Profile | 默认候选 | 当前公开参考价 | 适用边界 |
+| --- | --- | ---: | --- |
+| `DEV_ECO` | RTX 3090 24GB | 优云智算 ¥1.19/h | 低成本开发、Blender/图片预演；不作为大型视频默认卡 |
+| `DEFAULT_FAST` | RTX 5090 32GB | 优云截图 ¥3.20/h；AutoDL ¥2.78/h | V1 云 Blender、普通 ComfyUI 和多数短视频试验 |
+| `VIDEO_SAFE` | RTX 4090 48GB | 优云智算 ¥3.30/h | 大模型视频、长时序、多 ControlNet 或显存敏感工作流 |
+| `LARGE_MODEL` | H20/A800/A100/PRO 6000 | 创建前现场查询 | 仅在 48GB 基准失败或多租户吞吐证明需要时启用 |
+
+用户于 2026-09-10 提供的创建页配置为单卡 RTX 5090 32GB、14C64GB、上海区域、50GB 系统盘、按量 ¥3.20/h。结论：GPU/CPU/内存适合作为当前默认试跑，但系统盘至少调整到 100GB；加入 ComfyUI 和视频模型时建议 200GB 或独立持久化模型盘。先按量运行 2–5 小时，完成图片、GLB 与一个批准的 ComfyUI 工作流基准后再决定包日/包月。
+
+镜像路线按任务分开：只运行 ComfyUI 时优先经过验证的“ComfyUI 纯净版”；部署完整 ProductDirectorAI、Blender、FFmpeg、API 与 Worker 时优先 Ubuntu-nvidia 22.04 系统镜像。平台 CUDA 13.2/PyTorch 2.13 基础容器镜像不能因为版本新就直接作为生产基线，自定义节点、xFormers/Flash Attention 和模型要求必须通过锁版本测试。
+
+路由不得只比较小时价。平台候选需同时评估 48GB+ 显存能力、库存、持久化存储、固定网络入口、端口/防火墙、实例生命周期 API、关机计费语义、抢占恢复和 `cost_per_successful_run`。优云智算提供价格、库存、创建、查询、启停、释放 API/CLI，适合作为 V6 自动化主候选；AutoDL 容器实例 Pro API 作为备用，必须先通过相同合同测试。
+
+V1 设置页只展示 GPU Profile、价格日期和磁盘提醒，不接收云密钥、不调用云 API、不创建实例。V2 或后续云 Worker 获得明确授权后，才实现只读探测与受限写操作；创建、续费、充值和付款始终受管理员策略与预算门控制。
+
 ---
 
 ## 7. V1：产品素材与 3D 导演 MVP
@@ -1865,6 +1884,10 @@ Content-Type: application/json
 | [ComfyUI 服务路由](https://docs.comfy.org/development/comfyui-server/comms_routes) | prompt、事件、历史与节点信息入口 | 按已部署版本/工作流做合同测试 |
 | [ComfyUI Cloud 提交工作流](https://docs.comfy.org/api-reference/cloud/workflow/submit-a-workflow-for-execution) | 云端鉴权/路径与本地不同 | 云适配器单独探测，不混用 |
 | [MiniMax 视频生成指南](https://platform.minimax.io/docs/guides/video-generation) | 当前指南的版本化异步流程 | 账号区域、模型、接口、限制和价格实施时重新确认 |
+| [优云智算价格列表](https://compshare.cn/price-list) | 5090/4090 48G/3090 当前规格与价格 | 以创建页实际结算价为准，保存价格快照 |
+| [优云智算卡型与区域](https://compshare.cn/docs/operation/introduce/gpu) | 卡型能力、显存与区域可用性 | 创建前再查库存；48GB 视频路线单独基准 |
+| [优云智算实例 API](https://compshare.cn/docs/gpus/instance/createcompshareinstance) | 库存检查、实例创建与计费参数 | V1 禁用写操作；V2+ 需幂等、预算与人工授权门 |
+| [AutoDL GPU 价格与卡型](https://www.autodl.com/home) | 低成本开发/备用平台参考价 | 使用 Pro API 前完成实名认证、合同与安全测试 |
 | [TikTok Direct Post](https://developers.tiktok.com/docs/en/content-posting-api-get-started) | scope/授权、creator info、提交与状态查询 | 实际应用审核和用户交互规则决定可发布方式 |
 | [OpenAI 官方模型使用指导](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.5) | 明确成果、测试证据、约束和停止条件的任务组织原则 | 仅借鉴通用执行指导；不据此推断 SOL 5.6 特定能力 |
 

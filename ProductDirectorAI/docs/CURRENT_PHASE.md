@@ -13,13 +13,14 @@
 - SQLite 持久化任务、真实状态/阶段/进度、取消、错误记录
 - MP4 与 metadata.json 下载
 - 设置页 MiniMax 密钥输入、Windows 用户级加密保存、认证和最小生成测试
+- 设置页展示云 GPU 选型快照：优云智算 5090 32GB 为默认、3090 24GB 为节省档、4090 48GB 为视频稳妥档；仅展示，不购买或创建实例
 - 深色侧栏、浅色卡片、橙色主动作的 V1 工作台
 
 ## 暂不实现
 
 - MiniMax 参与 DirectorPlan、ComfyUI、字幕、配音、BGM
 - Platform Profile、批量任务、成本中心、Automation API、一键发布
-- 云端 Worker 与外部平台发布
+- 云端 Worker 的真实创建/启停/调度与外部平台发布（选型文档已完成，V2 未授权）
 
 ## 继续施工入口
 

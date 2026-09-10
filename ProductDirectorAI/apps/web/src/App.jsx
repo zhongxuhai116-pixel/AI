@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
-  Clock, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
+  Clock, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
   MagnifyingGlass, MonitorPlay, Package, PencilSimple, Play, Plus, Queue,
   SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, WarningCircle, X,
 } from "@phosphor-icons/react";
@@ -175,9 +175,24 @@ function Settings({ health, provider, onSaveProvider, onTestProvider, busy }) {
   const [key, setKey] = useState("");
   const tone = ["GENERATION_READY", "AUTHENTICATED"].includes(provider?.last_status) ? "SUCCEEDED" : provider?.last_status === "QUOTA_LIMITED" ? "CANCEL_REQUESTED" : "FAILED";
   async function submit(event) { event.preventDefault(); if (key.trim()) { await onSaveProvider(key.trim()); setKey(""); } }
-  return <section className="page"><div className="page-head"><div><b>LOCAL RUNTIME</b><h1>本机执行环境</h1><p>本机 Blender / FFmpeg 与中国区 MiniMax Provider。密钥只在后端用 Windows 用户级加密保存。</p></div></div><div className="settings">
-    {[["Blender", health?.blender, Cube], ["FFmpeg", health?.ffmpeg, FilmSlate], ["本地存储", { available: !!health, path: health?.storage }, FolderOpen]].map(([name, value, Icon]) => <div key={name}><em className={value?.available ? "ok" : "off"}><Icon /></em><p><strong>{name}</strong><small>{value?.path || "尚未连接"}</small></p><Pill status={value?.available ? "SUCCEEDED" : "FAILED"} /></div>)}
-  </div><section className="provider-card"><div className="provider-head"><div><Sparkle weight="fill" /><p><strong>MiniMax · 中国大陆</strong><small>https://api.minimaxi.com/v1</small></p></div><Pill status={tone} /></div><p className="provider-message">{provider?.last_message || "尚未配置 MiniMax API Key"}</p><form onSubmit={submit}><label><span>API Key</span><input aria-label="MiniMax API Key" type="password" autoComplete="off" value={key} onChange={(e) => setKey(e.target.value)} placeholder={provider?.configured ? "已加密保存；输入新密钥可替换" : "输入 sk-cp-…"} /></label><button className="primary" disabled={busy || !key.trim()} type="submit">保存并验证</button><button type="button" disabled={busy || !provider?.configured} onClick={onTestProvider}>测试文本生成</button></form><small className="provider-note">不会把密钥返回给浏览器、写入前端存储或提交到 GitHub。</small></section></section>;
+  const gpuProfiles = [
+    { name: "开发节省", gpu: "RTX 3090 · 24GB", price: "¥1.19/小时", use: "低成本开发与基础预演" },
+    { name: "当前推荐", gpu: "RTX 5090 · 32GB", price: "¥3.20/小时", use: "V1、Blender 与普通 ComfyUI", recommended: true },
+    { name: "视频稳妥", gpu: "RTX 4090 · 48GB", price: "¥3.30/小时", use: "大模型视频与显存敏感工作流" },
+  ];
+  return <section className="page">
+    <div className="page-head"><div><b>RUNTIME & PROVIDERS</b><h1>执行环境</h1><p>本机运行时、MiniMax 中国区连接与云端 GPU 选型。V1 不会自动购买或创建云资源。</p></div></div>
+    <div className="settings">
+      {[["Blender", health?.blender, Cube], ["FFmpeg", health?.ffmpeg, FilmSlate], ["本地存储", { available: !!health, path: health?.storage }, FolderOpen]].map(([name, value, Icon]) => <div key={name}><em className={value?.available ? "ok" : "off"}><Icon /></em><p><strong>{name}</strong><small>{value?.path || "尚未连接"}</small></p><Pill status={value?.available ? "SUCCEEDED" : "FAILED"} /></div>)}
+    </div>
+    <section className="provider-card"><div className="provider-head"><div><Sparkle weight="fill" /><p><strong>MiniMax · 中国大陆</strong><small>https://api.minimaxi.com/v1</small></p></div><Pill status={tone} /></div><p className="provider-message">{provider?.last_message || "尚未配置 MiniMax API Key"}</p><form onSubmit={submit}><label><span>API Key</span><input aria-label="MiniMax API Key" type="password" autoComplete="off" value={key} onChange={(e) => setKey(e.target.value)} placeholder={provider?.configured ? "已加密保存；输入新密钥可替换" : "输入 sk-cp-…"} /></label><button className="primary" disabled={busy || !key.trim()} type="submit">保存并验证</button><button type="button" disabled={busy || !provider?.configured} onClick={onTestProvider}>测试文本生成</button></form><small className="provider-note">不会把密钥返回给浏览器、写入前端存储或提交到 GitHub。</small></section>
+    <section className="provider-card gpu-card">
+      <div className="provider-head"><div><Cpu weight="duotone" /><p><strong>优云智算 · 云 GPU 方案</strong><small>2026-09-10 选型快照 · 实际库存与结算价以控制台为准</small></p></div><span className="recommend-badge">推荐 5090 32G</span></div>
+      <div className="gpu-profile-grid">{gpuProfiles.map((profile) => <article className={profile.recommended ? "recommended" : ""} key={profile.name}><div><span>{profile.name}</span>{profile.recommended && <CheckCircle weight="fill" />}</div><strong>{profile.gpu}</strong><b>{profile.price}</b><small>{profile.use}</small></article>)}</div>
+      <div className="gpu-guidance"><WarningCircle weight="fill" /><p><strong>你截图里的 5090 配置可以开。</strong><span>单卡、14 核 64GB、按量计费；系统盘从 50GB 调到至少 100GB，ComfyUI/视频模型建议 200GB 或独立云盘。先跑 2–5 小时基准，不先买包月。</span></p></div>
+      <div className="gpu-card-footer"><small>V1 仅展示已核对的选型，不保存云账号、不创建实例、不产生费用。</small><a href="https://compshare.cn/price-list" target="_blank" rel="noreferrer">查看官方价格 <CaretRight /></a></div>
+    </section>
+  </section>;
 }
 
 export function App() {
