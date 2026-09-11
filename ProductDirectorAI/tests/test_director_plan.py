@@ -11,7 +11,13 @@ from pydantic import ValidationError
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "apps" / "api"))
 
-from productdirector_api.main import PlanUpdate, build_image_filtergraph  # noqa: E402
+from productdirector_api.main import (  # noqa: E402
+    OutputSpec,
+    PlanRequest,
+    PlanUpdate,
+    parse_r_frame_rate,
+    build_image_filtergraph,
+)
 
 
 def plan_payload(durations: tuple[int, int, int] = (48, 48, 48)) -> dict:
@@ -52,7 +58,7 @@ class DirectorPlanContractTests(unittest.TestCase):
         self.assertEqual(sum(shot["duration_frames"] for shot in decoded["shots"]), 144)
 
     def test_image_preview_compiles_every_shot_from_the_frozen_snapshot(self):
-        graph = build_image_filtergraph(plan_payload((24, 72, 48)))
+        graph = build_image_filtergraph(plan_payload((24, 72, 48)), OutputSpec(width=540, height=960, fps=24, duration_seconds=6))
 
         self.assertEqual(graph.count("zoompan="), 3)
         self.assertIn("d=24", graph)
@@ -61,7 +67,38 @@ class DirectorPlanContractTests(unittest.TestCase):
         self.assertIn("0.16*on/23", graph)  # dolly-in
         self.assertIn("0.08+0.84*on/71", graph)  # side track
         self.assertIn("sin(PI*on/47)", graph)  # 2D orbit approximation
+        self.assertIn("s=540x960:fps=24", graph)
         self.assertIn("concat=n=3:v=1:a=0", graph)
+
+    def test_image_preview_filter_respects_1080x1920_output(self):
+        graph = build_image_filtergraph(plan_payload((24, 72, 48)), OutputSpec(width=1080, height=1920, fps=24, duration_seconds=6))
+
+        self.assertIn("s=1080x1920:fps=24", graph)
+
+    def test_plan_request_enforces_output_9_16_ratio(self):
+        with self.assertRaises(ValidationError):
+            PlanRequest(
+                product_asset_id="P1",
+                intent="demo",
+                output={"width": 540, "height": 1080},
+            )
+
+    def test_plan_request_enforces_duration_and_output_consistency(self):
+        with self.assertRaises(ValidationError):
+            PlanRequest(
+                product_asset_id="P1",
+                intent="demo",
+                duration_seconds=8,
+                output={"width": 540, "height": 960, "duration_seconds": 6},
+            )
+
+    def test_parse_r_frame_rate_supports_fraction_and_raw(self):
+        self.assertAlmostEqual(parse_r_frame_rate("30000/1001"), 29.97002997002997)
+        self.assertEqual(parse_r_frame_rate("24"), 24.0)
+
+    def test_parse_r_frame_rate_is_fault_tolerant(self):
+        self.assertEqual(parse_r_frame_rate("not-a-rate"), 0.0)
+        self.assertEqual(parse_r_frame_rate("24/0"), 0.0)
 
 
 if __name__ == "__main__":

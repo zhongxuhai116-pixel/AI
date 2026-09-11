@@ -2,6 +2,10 @@
 
 ## 2026-09-11
 
+- V1-06 PASS：后端 `PlanRequest` 支持 `output` 规格（540×960 / 1080×1920）、执行期按快照输出规格校验宽高/帧率/帧数；前端导演台新增输出分辨率选择；`tests/test_director_plan.py` 增加 1080 兼容构建用例。已补齐云端回归与现网验收。
+- V1-06b PASS（本地验收）：补充 `OutputSpec` 与输出规格链路的单测覆盖，`python -m unittest tests/test_director_plan.py` 通过（9/9）；新增失败边界覆盖（`duration_seconds` 与 `output.duration_seconds` 不一致、非 9:16 输出会被拒绝、`ffprobe` 帧率字段非标准格式容错）；修复测试环境下 `ffmpeg.exe` 路径扫描权限导致的导入中断（WinGet 目录 OSError 兜底）。  
+  - 本地限制：当前工作站未检测到 `npm` 命令，无法在本地完成前端 build 与 Sites worker 测试；需在具备 Node/NPM 的环境补跑 build（`apps/web`）与后续 worker 回归测试。
+- V1-06c PASS（云端验收）：在新云节点执行 1080×1920 的真实 DirectorPlan 作业复验，参数为 `width=1080` / `height=1920` / `fps=24` / `duration_seconds=6`，作业 `bdaee1e7-8109-4610-b0e0-4dd25d243714` 终态 `SUCCEEDED`。manifest 记录 `1080 / 1920 / 24 / 144 / 6.0`；预览文件 SHA-256 为 `0c0f3603e98fad32f8e0d8f66c9a1f35bd812154f8b76c9700b308a848ab62ed`，`metadata.json` SHA-256 为 `97390ee5e5ba5a50c0ae0b6514a502fb8206e7d5351839af3368acdbb47afe3b`。Python 合同测试维持 4/4；与前版本相比该 run 保留冻结 DirectorPlan 快照与计划哈希，且无 `blackdetect` 黑帧告警。
 - 新优云智算节点公网 SSH 已通过专用 ED25519 密钥连接；首次连接前从网页终端核对服务器 ED25519 指纹。仓库和文档不保存地址、实例 ID、密码或私钥。
 - CLOUD-01 PASS：Ubuntu 22.04.4、RTX 4090 24564 MiB、驱动 570.153.02、16 核/94GB；新节点根分区约 97GB，不能沿用旧节点“291GB 已扩容”的结论。
 - CLOUD-02 PASS：安装官方 Blender 5.2.1 LTS、官方 Node.js 22.23.2、Ubuntu FFmpeg/ffprobe 4.4.2；Blender 与 Node 下载均完成官方 SHA-256 校验。

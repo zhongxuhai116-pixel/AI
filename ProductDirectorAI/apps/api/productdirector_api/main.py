@@ -59,11 +59,24 @@ FFMPEG = find_executable(
         r"%LOCALAPPDATA%\Microsoft\WinGet\Links\ffmpeg.exe",
     ],
 )
+
+
+def _find_winget_ffmpeg(packages_root: str) -> str | None:
+    try:
+        packages = Path(os.path.expandvars(packages_root))
+        if not packages.exists():
+            return None
+        for match in packages.rglob("ffmpeg.exe"):
+            return str(match)
+    except OSError:
+        return None
+    return None
+
+
 if not FFMPEG:
-    packages = Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages"))
-    match = next(packages.rglob("ffmpeg.exe"), None) if packages.exists() else None
+    match = _find_winget_ffmpeg(r"%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages")
     if match:
-        FFMPEG = str(match)
+        FFMPEG = match
 FFPROBE = None
 if FFMPEG:
     ffprobe_candidate = Path(FFMPEG).with_name("ffprobe.exe")
@@ -133,6 +146,12 @@ processes: dict[str, subprocess.Popen] = {}
 process_lock = threading.Lock()
 
 
+DEFAULT_OUTPUT_WIDTH = 540
+DEFAULT_OUTPUT_HEIGHT = 960
+DEFAULT_FPS = 24
+DEFAULT_DURATION_SECONDS = 6
+
+
 class Shot(BaseModel):
     id: str
     name: str
@@ -141,11 +160,35 @@ class Shot(BaseModel):
     focal_length_mm: int = Field(ge=15, le=120)
 
 
+class OutputSpec(BaseModel):
+    width: Literal[540, 1080] = DEFAULT_OUTPUT_WIDTH
+    height: Literal[960, 1920] = DEFAULT_OUTPUT_HEIGHT
+    fps: Literal[24] = DEFAULT_FPS
+    duration_seconds: Literal[6] = DEFAULT_DURATION_SECONDS
+
+    @model_validator(mode="after")
+    def validate_output_ratio(self):
+        if self.width * 16 != self.height * 9:
+            raise ValueError("输出分辨率必须为 9:16")
+        return self
+
+    @property
+    def frame_count(self) -> int:
+        return self.fps * self.duration_seconds
+
+
 class PlanRequest(BaseModel):
     product_asset_id: str
     intent: str = Field(min_length=1, max_length=4000)
     ratio: Literal["9:16"] = "9:16"
     duration_seconds: Literal[6] = 6
+    output: OutputSpec = Field(default_factory=OutputSpec)
+
+    @model_validator(mode="after")
+    def validate_output_duration(self):
+        if self.duration_seconds != self.output.duration_seconds:
+            raise ValueError("duration_seconds 与 output.duration_seconds 必须保持一致")
+        return self
 
 
 class PlanApproval(BaseModel):
@@ -269,7 +312,7 @@ def image_base_zoom(focal_length_mm: int) -> float:
     return round(1.05 + (focal_length_mm - 15) / 105 * 0.35, 4)
 
 
-def image_shot_filter(shot: Shot, index: int) -> str:
+def image_shot_filter(shot: Shot, index: int, fps: int, size: str) -> str:
     """Compile one frozen shot into deterministic FFmpeg 2D camera motion.
 
     Image previews cannot perform a physical 3D orbit.  The orbit template
@@ -296,31 +339,47 @@ def image_shot_filter(shot: Shot, index: int) -> str:
         x, y = center_x, center_y
     return (
         f"[source_{index}]zoompan=z='{zoom}':x='{x}':y='{y}':"
-        f"d={duration}:s=540x960:fps=24,trim=end_frame={duration},"
+        f"d={duration}:s={size}:fps={fps},trim=end_frame={duration},"
         f"setpts=PTS-STARTPTS[shot_{index}]"
     )
 
 
-def build_image_filtergraph(plan_snapshot: dict) -> str:
+def build_image_filtergraph(plan_snapshot: dict, output: OutputSpec) -> str:
     """Turn the persisted DirectorPlan snapshot into a fixed 144-frame edit."""
     validated = PlanUpdate.model_validate(
         {"intent": plan_snapshot.get("intent"), "shots": plan_snapshot.get("shots")}
     )
     sources = "".join(f"[source_{index}]" for index in range(3))
+    preview_width = int(round(output.width * 64 / 27))
+    preview_height = int(round(output.height * 64 / 27))
     filters = [
-        "[0:v]scale=1280:2276:force_original_aspect_ratio=increase,"
-        "crop=1280:2276:(iw-ow)/2:(ih-oh)/2,split=3" + sources,
+        f"[0:v]scale={preview_width}:{preview_height}:force_original_aspect_ratio=increase,"
+        f"crop={preview_width}:{preview_height}:(iw-ow)/2:(ih-oh)/2,split=3" + sources,
     ]
-    filters.extend(image_shot_filter(shot, index) for index, shot in enumerate(validated.shots))
+    filters.extend(image_shot_filter(shot, index, output.fps, f"{output.width}x{output.height}") for index, shot in enumerate(validated.shots))
     filters.append("[shot_0][shot_1][shot_2]concat=n=3:v=1:a=0,format=yuv420p[video]")
     return ";".join(filters)
 
 
-def render_image_job(job_id: str, asset: dict, output: Path, plan_snapshot: dict) -> None:
+def parse_r_frame_rate(value: str) -> float:
+    try:
+        if "/" in value:
+            numerator, denominator = value.split("/", 1)
+            if not numerator or not denominator:
+                return 0.0
+            return float(numerator) / float(denominator)
+        return float(value)
+    except ValueError:
+        return 0.0
+    except ZeroDivisionError:
+        return 0.0
+
+
+def render_image_job(job_id: str, asset: dict, output: Path, plan_snapshot: dict, output_spec: OutputSpec) -> None:
     if not FFMPEG:
         raise RuntimeError("FFmpeg 未安装或未找到")
     input_path = Path(asset["path"])
-    filtergraph = build_image_filtergraph(plan_snapshot)
+    filtergraph = build_image_filtergraph(plan_snapshot, output_spec)
     command = [
         FFMPEG,
         "-y",
@@ -329,8 +388,9 @@ def render_image_job(job_id: str, asset: dict, output: Path, plan_snapshot: dict
         "-i", str(input_path),
         "-filter_complex", filtergraph,
         "-map", "[video]",
-        "-frames:v", "144",
-        "-r", "24",
+        "-frames:v", str(output_spec.frame_count),
+        "-r", str(output_spec.fps),
+        "-s", f"{output_spec.width}x{output_spec.height}",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-preset", "medium",
@@ -351,7 +411,7 @@ def render_image_job(job_id: str, asset: dict, output: Path, plan_snapshot: dict
         raise RuntimeError(stderr.decode("utf-8", errors="replace")[-2000:])
 
 
-def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_path: Path) -> None:
+def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_path: Path, output_spec: OutputSpec) -> None:
     if not BLENDER:
         raise RuntimeError("Blender 未安装或未找到")
     if not FFMPEG:
@@ -365,8 +425,8 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_p
         "--",
         "--input", asset["path"],
         "--output", str(frames),
-        "--width", "540",
-        "--height", "960",
+        "--width", str(output_spec.width),
+        "--height", str(output_spec.height),
         "--frames", "144",
         "--plan", str(plan_path),
     ]
@@ -407,8 +467,6 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_p
     )
     if encode.returncode != 0:
         raise RuntimeError(encode.stderr[-2000:])
-
-
 def execute_job(job_id: str) -> None:
     try:
         job = get_job(job_id)
@@ -425,11 +483,12 @@ def execute_job(job_id: str) -> None:
             plan_snapshot = json.loads(plan_snapshot_bytes)
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"任务缺少有效的 DirectorPlan 快照: {exc}") from exc
+        output_spec = OutputSpec.model_validate(plan_snapshot.get("output", {}))
         output = run_dir / "preview.mp4"
         if asset["kind"] == "model":
-            render_glb_job(job_id, asset, run_dir, output, plan_path)
+            render_glb_job(job_id, asset, run_dir, output, plan_path, output_spec)
         else:
-            render_image_job(job_id, asset, output, plan_snapshot)
+            render_image_job(job_id, asset, output, plan_snapshot, output_spec)
         if get_job(job_id)["status"] == "CANCELLED":
             return
         update_job(job_id, stage="QA", progress=94)
@@ -451,8 +510,17 @@ def execute_job(job_id: str) -> None:
         probe = json.loads(probe_result.stdout)
         stream = probe.get("streams", [{}])[0]
         duration = float(probe.get("format", {}).get("duration", 0))
-        if stream.get("width") != 540 or stream.get("height") != 960 or not 5.8 <= duration <= 6.2:
+        framerate = parse_r_frame_rate(stream.get("r_frame_rate", f"{output_spec.fps}/1"))
+        frame_count = int(stream.get("nb_frames", output_spec.frame_count))
+        if stream.get("width") != output_spec.width or stream.get("height") != output_spec.height:
             raise RuntimeError(f"视频技术检查失败: {stream.get('width')}x{stream.get('height')}, {duration:.3f}s")
+        if abs(framerate - output_spec.fps) > 0.05 or frame_count != output_spec.frame_count:
+            raise RuntimeError(
+                f"视频技术检查失败: fps={framerate}, frames={frame_count}, "
+                f"duration={duration:.3f}s"
+            )
+        if not 5.8 <= duration <= 6.2:
+            raise RuntimeError(f"视频技术检查失败: 时长不满足 6 秒: {duration:.3f}s")
         manifest = {
             "schema_version": "1.0",
             "job_id": job_id,
@@ -460,11 +528,11 @@ def execute_job(job_id: str) -> None:
             "asset_id": asset["id"],
             "asset_sha256": asset["sha256"],
             "preview_kind": "BLENDER_3D" if asset["kind"] == "model" else "IMAGE_2D",
-            "width": 540,
-            "height": 960,
-            "fps": 24,
-            "frame_count": 144,
-            "duration_seconds": 6,
+            "width": output_spec.width,
+            "height": output_spec.height,
+            "fps": output_spec.fps,
+            "frame_count": output_spec.frame_count,
+            "duration_seconds": output_spec.duration_seconds,
             "ffprobe": {"duration": duration, "video_stream": stream},
             "director_plan": plan_snapshot,
             "director_plan_snapshot_sha256": hashlib.sha256(plan_snapshot_bytes).hexdigest(),
@@ -636,7 +704,7 @@ def create_plan(request: PlanRequest) -> dict:
         "schema_version": "1.0",
         "product_asset_id": request.product_asset_id,
         "intent": request.intent,
-        "output": {"width": 540, "height": 960, "fps": 24, "duration_seconds": 6},
+        "output": request.output.model_dump(),
         "fidelity_mode": "STRICT_REQUESTED",
         "shots": [shot.model_dump() for shot in shots],
     }

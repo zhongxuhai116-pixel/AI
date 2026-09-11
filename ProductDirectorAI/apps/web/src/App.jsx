@@ -21,6 +21,10 @@ const defaultShots = [
   { id: "shot_02", name: "侧向观察", camera: "side_track", focal_length_mm: 35, duration_frames: 48 },
   { id: "shot_03", name: "细节定格", camera: "static", focal_length_mm: 50, duration_frames: 48 },
 ];
+const outputPresets = [
+  { label: "540 × 960（快出）", width: 540, height: 960 },
+  { label: "1080 × 1920（高清）", width: 1080, height: 1920 },
+];
 const cameraLabels = {
   dolly_in: "Dolly In · 推近", side_track: "Side Track · 侧移",
   hero_orbit: "Hero Orbit · 环绕", static: "Static · 定格",
@@ -122,12 +126,20 @@ function AssetCard({ asset, assetUrl, onUpload, onDemo, busy }) {
   </section>;
 }
 
-function DirectorCard({ intent, setIntent, plan, onGenerate, busy }) {
+function DirectorCard({ intent, setIntent, plan, output, onOutputChange, onGenerate, busy }) {
   return <section className="card director-card">
     <div className="card-head"><div><h2>导演描述</h2><span>V1 模板导演</span></div><button>高级设置 <CaretRight /></button></div>
     <textarea value={intent} onChange={(e) => setIntent(e.target.value)} />
     <div className="counter"><span>{intent.length} / 4000</span><span>API Provider 将在 V2 接入</span></div>
-    <div className="outputs">{[["视频比例", "9:16 竖屏"], ["总时长", "6 秒"], ["帧率", "24 fps"]].map(([label, value]) => <label key={label}><span>{label}</span><button>{value}<CaretDown /></button></label>)}</div>
+    <div className="outputs">
+      {[["视频比例", "9:16 竖屏"], ["总时长", "6 秒"], ["帧率", "24 fps"]].map(([label, value]) => <label key={label}><span>{label}</span><button>{value}<CaretDown /></button></label>)}
+      <label>
+        <span>输出分辨率</span>
+        <select value={`${output.width}x${output.height}`} onChange={(event) => onOutputChange(event.target.value)}>
+          {outputPresets.map((item) => <option key={`${item.width}x${item.height}`} value={`${item.width}x${item.height}`}>{item.label}</option>)}
+        </select>
+      </label>
+    </div>
     <button className="primary wide" disabled={busy} onClick={onGenerate}><Sparkle weight="fill" />{busy ? "正在生成..." : plan ? "重新生成三镜头" : "生成三镜头计划"}</button>
   </section>;
 }
@@ -203,6 +215,7 @@ export function App() {
   const [asset, setAsset] = useState(null);
   const [assetUrl, setAssetUrl] = useState("");
   const [intent, setIntent] = useState("在干净的现代工作室中，用三个清晰镜头展示产品外观、侧面结构与整体比例。");
+  const [output, setOutput] = useState(outputPresets[0]);
   const [plan, setPlan] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [provider, setProvider] = useState(null);
@@ -244,7 +257,11 @@ export function App() {
     if (!asset) return setToast(["danger", "请先上传产品图片或 GLB。"]);
     setBusy(true);
     try {
-      const response = await fetch(`${API}/plans/template`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ product_asset_id: asset.id, intent, ratio: "9:16", duration_seconds: 6 }) });
+      const response = await fetch(`${API}/plans/template`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ product_asset_id: asset.id, intent, ratio: "9:16", duration_seconds: 6, output }),
+      });
       if (!response.ok) throw new Error((await response.json()).detail || "计划生成失败");
       setPlan(await response.json()); setToast(["success", "三镜头计划已生成，可以继续调整。"]);
     } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
@@ -262,6 +279,10 @@ export function App() {
       const next = { id: created.job_id, status: "QUEUED", stage: "PREPARE", progress: 0, created_at: new Date().toISOString(), kind: asset.kind };
       setJob(next); setJobs((value) => [next, ...value]); setToast(["success", "预演任务已提交，正在后台执行。"]);
     } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
+  }
+  function updateOutput(eventValue) {
+    const [width, height] = eventValue.split("x").map((value) => Number(value));
+    setOutput(outputPresets.find((item) => item.width === width && item.height === height) || outputPresets[0]);
   }
   async function cancel() { if (job) { await fetch(`${API}/jobs/${job.id}/cancel`, { method: "POST" }); refresh(); } }
   async function saveProvider(apiKey) {
@@ -293,7 +314,15 @@ export function App() {
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">
           <AssetCard asset={asset} assetUrl={assetUrl} onUpload={upload} onDemo={useDemo} busy={busy} />
-          <DirectorCard intent={intent} setIntent={setIntent} plan={plan} onGenerate={generatePlan} busy={busy} />
+          <DirectorCard
+            intent={intent}
+            setIntent={setIntent}
+            plan={plan}
+            output={output}
+            onOutputChange={updateOutput}
+            onGenerate={generatePlan}
+            busy={busy}
+          />
           <RenderCard health={health} plan={plan} job={job} onRender={run} onCancel={cancel} />
           <Shots plan={plan} setPlan={setPlan} assetUrl={asset?.kind === "image" ? assetUrl : ""} />
           <Jobs jobs={filtered} selected={job?.id} onOpen={setJob} />

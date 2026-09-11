@@ -33,7 +33,7 @@
 | CLOUD-06 受限远程 Worker | 当前仅 localhost 服务，无远程鉴权/调度 | NOT_STARTED |
 | CLOUD-07 生产级对照 | 3 次真实任务、成本/恢复/回滚 | NOT_STARTED |
 
-完整全链路产物：540×960、24fps、144 帧、6.000 秒、H.264。视频 SHA-256：`fadc6f3b41579289c1a81089554bd47df6d7b13d12a3d76fbf4ac026515baef7`。该结果证明 V1 通用 GLB 基础链路，不证明 1080×1920、用户真实素材、可靠远程 Worker 或完整 V1 产品验收。
+完整全链路产物：540×960、24fps、144 帧、6.000 秒、H.264。视频 SHA-256：`fadc6f3b41579289c1a81089554bd47df6d7b13d12a3d76fbf4ac026515baef7`。追加的 1080×1920 验收产物 SHA-256 为 `0c0f3603e98fad32f8e0d8f66c9a1f35bd812154f8b76c9700b308a848ab62ed`（作业 `bdaee1e7-8109-4610-b0e0-4dd25d243714`）。该结果证明 V1 通用 GLB 基础链路，不代替用户真实素材、远程鉴权、稳定性与完整 V1 验收。
 
 计划语义复验使用同一通用 GLB：24 帧 85mm 定格、72 帧 24mm 侧向移动、48 帧 55mm 环绕。导出视频仍为 540×960、24fps、144 帧、6 秒；Manifest 保存冻结计划与 SHA-256。该作业的具体标识、地址和运行目录不进入 Git；可复验步骤见 `docs/reports/V1_DIRECTORPLAN_ACCEPTANCE.md`。
 

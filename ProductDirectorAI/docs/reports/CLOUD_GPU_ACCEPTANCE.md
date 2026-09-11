@@ -39,6 +39,18 @@
 | 视频 SHA-256 | `fadc6f3b41579289c1a81089554bd47df6d7b13d12a3d76fbf4ac026515baef7` |
 | Manifest SHA-256 | `0fa5cba661823bd57a87c28184dace670b6241ce3ce0008b976f2b16b9c4c153` |
 
+补充一次 1080×1920 的真实基线回归（作业 `bdaee1e7-8109-4610-b0e0-4dd25d243714`）：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 分辨率 | 1080×1920 |
+| 帧率 | 24fps |
+| 帧数 | 144 |
+| 时长 | 6.000 秒 |
+| 视频大小 | 355112 字节 |
+| 视频 SHA-256 | `0c0f3603e98fad32f8e0d8f66c9a1f35bd812154f8b76c9700b308a848ab62ed` |
+| Manifest SHA-256 | `97390ee5e5ba5a50c0ae0b6514a502fb8206e7d5351839af3368acdbb47afe3b` |
+
 ## DirectorPlan 相机语义证据
 
 本次更新后，GLB Run 在创建时将已批准计划写入作业目录；Blender 只读取该快照并验证三段帧数合计为 144。真实云端复验使用 24 / 72 / 48 帧三段计划，结果如下：
@@ -57,10 +69,9 @@
 
 ## 未通过或未覆盖
 
-- 1080×1920 输出质量门。
 - 任务租约、重启恢复、幂等、取消竞争和独立 Worker。
 - 远程身份鉴权与授权、受限隧道或安全公网 API。
 - 用户真实产品与至少 3 次稳定性/成本对照。
-- MiniMax H3 与 ProductDirectorAI 的真实 Provider 集成；服务器已有独立单卡 ComfyUI 量化试验，但尚未接入。
+- MiniMax H3 与 ProductDirectorAI 的真实 Provider 集成；服务器已有独立单卡 ComfyUI 量化试验，但尚未接入。 
 
 因此本报告不能替代产品负责人或用户的完整 V1 ACCEPTED 决定。
