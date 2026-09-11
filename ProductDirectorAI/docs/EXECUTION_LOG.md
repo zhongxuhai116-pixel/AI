@@ -1,5 +1,13 @@
 # V1 执行记录
 
+## 2026-09-11 · 换电脑保存点
+
+- 用户要求同步 GitHub 后更换电脑。新增 `NEXT_COMPUTER_START.md`、`reports/A05_SECURITY_HANDOFF.md`，统一继续入口，纠正“仅授权 V1”和“A01–A04 全部完成”的旧口径。
+- 完成本轮 A05 私有单 Owner 会话/CSRF、Worker HTTP 认证与身份、Owner/项目/素材检查、同源代理、相对文件引用和 Linux Fernet 加密。缺配置时拒绝匿名访问，密钥不进入前端构建。
+- 本地 compileall、后端 23/23、Vite build、Sites 4/4 通过。刷新 npm lockfile，增加测试依赖清单。worker-once 渲染测试为 mock，不代表真实成片。
+- 本次 SSH 超时；未登录、未部署、未运行云任务、未调用真实 Provider。A04/A05/V1 保持 PARTIAL，后续具体缺口见新报告。
+- Git 同步仅包括源码、测试、锁文件和脱敏文档；模型、私钥、会话/Provider 凭证、数据库、素材及成片不进仓库。版本以包含此保存点的 Git 提交为准。
+
 ## 2026-09-11
 
 - A04 第一段验收：新增 Worker 租约/事件恢复基线，并保持原有 BackgroundTasks 兼容入口。

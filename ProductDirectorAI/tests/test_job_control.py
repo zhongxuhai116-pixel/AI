@@ -22,6 +22,15 @@ from productdirector_api import main  # noqa: E402
 
 class JobControlAcceptanceTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._owner_token = patch.object(main.security, "OWNER_TOKEN", "test-only-owner-" + "x" * 32)
+        self._owner_token.start()
+        self.addCleanup(self._owner_token.stop)
+        # These tests exercise lease contracts. Security boundary tests use real dependencies.
+        main.app.dependency_overrides[main._ensure_worker_token] = lambda: None
+        self.addCleanup(main.app.dependency_overrides.clear)
+        self._worker_identity = patch.object(main.security, "check_worker_id")
+        self._worker_identity.start()
+        self.addCleanup(self._worker_identity.stop)
         self._original_db_path = main.DB_PATH
         self._original_var = main.VAR
         self._original_uploads = main.UPLOADS
@@ -39,7 +48,7 @@ class JobControlAcceptanceTests(unittest.TestCase):
         else:
             self._original_db_env = None
         os.environ["DB_PATH"] = str(main.DB_PATH)
-        self.client = TestClient(main.app)
+        self.client = TestClient(main.app, headers={"Authorization": f"Bearer {main.security.OWNER_TOKEN}"})
         self.asset_file = (PROJECT / "tests" / "fixtures" / "generic-product.glb").read_bytes()
 
     def tearDown(self) -> None:
@@ -300,6 +309,10 @@ class JobControlAcceptanceTests(unittest.TestCase):
         self.assertEqual(result["job_id"], job_id)
         self.assertEqual(result["status"], "SUCCEEDED")
         self.assertTrue((run_dir / "metadata.json").exists())
+        video = self.client.get(f"/api/v1/jobs/{job_id}/video")
+        self.assertEqual(video.status_code, 200)
+        self.assertEqual(video.content, b"0" * 2048)
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}/manifest").json()["job_id"], job_id)
 
 
 if __name__ == "__main__":

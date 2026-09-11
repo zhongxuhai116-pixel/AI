@@ -1,5 +1,7 @@
 # ProductDirectorAI 换电脑接手手册（Windows）
 
+> 本次换电脑先读 [最新继续入口](NEXT_COMPUTER_START.md) 与 [A05 交接验收](reports/A05_SECURITY_HANDOFF.md)。下文是历史手册，其中仅授权 V1、固定 localhost、npm 阻塞等内容已由最新入口覆盖。当前代码新增登录鉴权，需按新入口配置。
+
 更新日期：2026-09-11。源码与文档已在新 Windows 电脑恢复；V1 云基础设施与通用 GLB 全链路已通过，但完整 V1 仍为 **PARTIAL**。用户已授权逐阶段继续到 V6，必须每期验收后再前进。
 
 ## 1. Git 会带走什么

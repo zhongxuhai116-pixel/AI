@@ -1,9 +1,11 @@
 # 当前阶段
 
+> 2026-09-11 换电脑最新结论：V1、A04、A05 均为 PARTIAL。本轮后端 23/23、前端 build、Sites 4/4 通过；SSH 超时，未部署云端。先读 [最新继续入口](NEXT_COMPUTER_START.md) 与 [A05 交接报告](reports/A05_SECURITY_HANDOFF.md)。下方分时记录的“完整验收”标题仅反映历史局部检查。
+
 - 当前版本：V1 · 3D Director MVP
 - 状态：PARTIAL；新云节点 V1 基础设施、GPU 渲染、通用 GLB/图片端到端链路、DirectorPlan 分镜语义及 1080×1920 基线导出已 PASS，完整产品合同、可靠任务、鉴权和用户真实素材仍待验收
 - 下一版本：V2 已获用户明确授权，但必须等 V1 阶段门完成后再进入
-- 当前优先：补齐 V1 产品差距并逐项验收；当前已完成 A01（环境与记录基线）、A02（合同与版本约束）、A03（Run 幂等与上下文）、A04（独立执行与恢复），下一步进入 A05（安全远程闭环）。
+- 当前优先：保存本轮成果并换电脑接续。A01–A03 已有局部实现/证据，完整退出门仍须按主规划核对；A04 恢复竞争/长任务及 A05 真实远程闭环尚未完成，不再笼统声明 A01–A04 全部完成。
 - 加速执行入口：[V1 → V6 加速执行计划](V6_ACCELERATION_PLAN.md)；云端 H3 已确认存在，V2 继续按现有环境接入排期，不重复安装，不替代 V1 关键门。
 - 外部 API：旧电脑历史记录显示 MiniMax 中国区认证曾通过、文本生成曾受额度限制；DPAPI 凭证不可直接迁移，当前不调用收费 API
 - A01 完整验收结果（2026-09-11 14:11:19）：
@@ -53,4 +55,4 @@
 
 从 `docs/V1_IMPLEMENTATION_GAPS.md` 的剩余门逐项推进；`A01`–`A04` 的执行依据为 `docs/reports/A01_ENVIRONMENT_BASELINE.md`、`docs/reports/A02_A03_ACCEPTANCE.md` 与 `docs/reports/A04_ACCEPTANCE.md`。下一步执行 A05：同源会话/CSRF、Worker 身份边界、远程 API 基址配置与 Linux 凭证适配。云端证据见 `docs/reports/CLOUD_GPU_ACCEPTANCE.md`、`docs/reports/V1_DIRECTORPLAN_ACCEPTANCE.md` 与 `docs/CLOUD_SERVER_HANDOFF.md`。V2 选择 MiniMax H3 的开放权重路线；现有单卡量化环境只作为后续集成候选，先完成 V1，不跨阶段宣布完成。
 
-当前阻塞项：需补齐 `npm`、前端 `vite` 路径可读权限（当前出现 `Access is denied` 导致 `vite.config.mjs` 加载失败）、`blender`、`ffmpeg` / `ffprobe` 命令可执行性后，才能完成前端 build/sites 复核与真实渲染联调。
+当前阻塞项：云 SSH 在建立连接前超时，本轮真实渲染和云端恢复联调未执行。前端构建阻塞已解除，npm lockfile 已刷新，build/sites 通过；新电脑按最新入口复验。A04/A05 具体代码缺口见交接报告。

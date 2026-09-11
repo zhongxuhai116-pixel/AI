@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -19,11 +21,14 @@ from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, Depends, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
+from cryptography.fernet import Fernet, InvalidToken
+from . import security
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -37,6 +42,15 @@ DEFAULT_OWNER_ID = "owner-default"
 DEFAULT_WORKSPACE_ID = "workspace-default"
 DEFAULT_PROJECT_ID = "project-default"
 LEASE_SECONDS = 60
+MINIMAX_API_BASE_URL = os.getenv("MINIMAX_API_BASE_URL", "https://api.minimaxi.com").rstrip("/")
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "PRODUCTDIRECTOR_ALLOWED_ORIGINS",
+        "http://localhost:4173,http://127.0.0.1:4173",
+    ).split(",")
+    if origin.strip()
+]
 for folder in (VAR, UPLOADS, RUNS):
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -265,11 +279,19 @@ def initialize_db() -> None:
               last_message TEXT,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+              token_hash TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              csrf_token TEXT NOT NULL,
+              expires_at REAL NOT NULL,
+              key_fingerprint TEXT NOT NULL
+            );
             """
         )
         ensure_column(db, "run_jobs", "lease_owner", "TEXT")
         ensure_column(db, "run_jobs", "lease_expires_at", "TEXT")
         ensure_column(db, "run_jobs", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(db, "assets", "owner_id", "TEXT NOT NULL DEFAULT 'owner-default'")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
         legacy_index = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_runs_idempotency'"
@@ -391,6 +413,7 @@ class WorkerFailRequest(WorkerLeaseRequest):
 
 
 class ProviderCredentialInput(BaseModel):
+    base_url: str | None = None
     api_key: str = Field(min_length=20, max_length=512)
 
 
@@ -399,6 +422,8 @@ class DataBlob(ctypes.Structure):
 
 
 def protect_secret(value: str) -> bytes:
+    if os.name != "nt":
+        return b"fernetv1:" + linux_cipher().encrypt(value.encode("utf-8"))
     raw = value.encode("utf-8")
     buffer = ctypes.create_string_buffer(raw)
     source = DataBlob(len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
@@ -415,6 +440,13 @@ def protect_secret(value: str) -> bytes:
 
 
 def unprotect_secret(value: bytes) -> str:
+    if os.name != "nt":
+        if not value.startswith(b"fernetv1:"):
+            raise HTTPException(409, "凭证格式不兼容，请在当前系统重新配置")
+        try:
+            return linux_cipher().decrypt(value[len(b"fernetv1:"):]).decode("utf-8")
+        except InvalidToken:
+            raise HTTPException(409, "凭证无法解密，请核对密钥或重新配置") from None
     buffer = ctypes.create_string_buffer(value)
     source = DataBlob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
     target = DataBlob()
@@ -428,10 +460,19 @@ def unprotect_secret(value: bytes) -> str:
         ctypes.windll.kernel32.LocalFree(target.pbData)
 
 
-def minimax_call(api_key: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+def linux_cipher() -> Fernet:
+    key = os.getenv("PRODUCTDIRECTOR_SECRET_KEY", "")
+    try:
+        return Fernet(key.encode("ascii"))
+    except (ValueError, UnicodeError):
+        raise HTTPException(503, "Linux 凭证存储需要独立配置 Fernet 密钥") from None
+
+
+def minimax_call(api_key: str, path: str, payload: dict | None = None, base_url: str | None = None) -> tuple[int, dict]:
+    base = _normalize_minimax_base_url(base_url or MINIMAX_API_BASE_URL)
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(
-        f"https://api.minimaxi.com{path}",
+        f"{base}{path}",
         data=body,
         method="POST" if payload is not None else "GET",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -457,12 +498,95 @@ def provider_public_status(row: sqlite3.Row | None = None) -> dict:
     return {
         "provider": "minimax",
         "region": "中国大陆",
-        "base_url": "https://api.minimaxi.com/v1",
+        "base_url": row["base_url"] if row else MINIMAX_API_BASE_URL,
         "configured": bool(row),
         "last_status": row["last_status"] if row else "NOT_CONFIGURED",
         "last_message": row["last_message"] if row else "尚未配置 MiniMax API Key",
         "updated_at": row["updated_at"] if row else None,
     }
+
+
+def _normalize_allowed_origin(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value.rstrip("/")
+
+
+def _is_allowed_origin(origin: str | None) -> bool:
+    normalized = _normalize_allowed_origin(origin)
+    if not normalized:
+        return False
+    return normalized in ALLOWED_ORIGINS
+
+
+def _is_browser_client(request: Request) -> bool:
+    user_agent = (request.headers.get("user-agent") or "").lower()
+    return "mozilla" in user_agent or "chrome" in user_agent or "safari" in user_agent
+
+
+def _normalize_minimax_base_url(value: str) -> str:
+    normalized = value.strip().rstrip("/")
+    if not normalized:
+        raise HTTPException(400, "MiniMax API 基础地址不能为空")
+    parsed = urlsplit(normalized)
+    if (parsed.scheme != "https" or parsed.hostname not in {"api.minimaxi.com", "api.minimax.io"}
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.netloc != parsed.hostname or parsed.path not in {"", "/v1"}):
+        raise HTTPException(400, "仅允许官方 MiniMax HTTPS API 地址")
+    return f"https://{parsed.hostname}"
+
+
+def _safe_artifact_name(value: str) -> str:
+    if not value:
+        raise HTTPException(400, "产物路径不能为空")
+    safe = str(Path(value).name).strip()
+    if not safe:
+        raise HTTPException(400, "产物路径无效")
+    if re.search(r"^\.\.?(?:[\\\\/]|$)", safe):
+        raise HTTPException(400, "产物路径不允许目录穿越")
+    return safe
+
+
+def _storage_reference(job_id: str, value: str | None) -> str | None:
+    if not value:
+        return None
+    safe_name = _safe_artifact_name(value)
+    return str(Path(job_id) / safe_name).replace("\\", "/")
+
+
+def _resolve_job_artifact_path(job_id: str, value: str | None) -> Path:
+    if not value:
+        raise HTTPException(409, "任务尚未生成产物")
+    reference = Path(value)
+    if reference.is_absolute():
+        # 历史数据可能写入绝对路径，先尝试兼容；但要求必须在 RUNS 目录内。
+        absolute_path = reference
+    else:
+        absolute_path = RUNS / value
+    absolute_path = absolute_path.resolve()
+    try:
+        absolute_path.relative_to((RUNS / job_id).resolve())
+    except ValueError:
+        raise HTTPException(403, "产物路径不在授权目录内")
+    if not absolute_path.exists() or not absolute_path.is_file():
+        raise HTTPException(409, "产物文件不存在")
+    return absolute_path
+
+
+_ensure_worker_token = security.ensure_worker
+
+
+def resolve_job_owner_scope(job_id: str, owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJECT_ID) -> None:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        row = db.execute("SELECT r.owner_id, pv.project_id FROM runs r "
+                         "JOIN plan_contracts pc ON pc.id = r.plan_contract_id "
+                         "JOIN product_versions pv ON pv.id = pc.product_version_id "
+                         "WHERE r.job_id = ? ORDER BY r.created_at DESC LIMIT 1", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "任务不存在")
+    if row["owner_id"] != owner_id or row["project_id"] != project_id:
+        raise HTTPException(403, "越权访问任务")
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:
@@ -474,6 +598,8 @@ def canonical_payload(payload: dict) -> str:
 
 
 def normalize_contract_context(owner_id: str, project_id: str, workspace_id: str | None = None) -> tuple[str, str, str]:
+    if security.current_owner.get() is not None and owner_id != security.current_owner.get():
+        raise HTTPException(403, "Owner 与登录身份不匹配")
     with connect() as db:
         owner = db.execute(
             "SELECT id FROM owners WHERE id = ?", (owner_id,),
@@ -828,9 +954,9 @@ def complete_leased_job(job_id: str, request: WorkerCompleteRequest) -> dict:
         run_job = require_active_lease(db, job_id, request.worker_id, request.lease_epoch)
     values: dict[str, object] = {"status": "SUCCEEDED", "stage": "ARTIFACT", "progress": 100, "error": None}
     if request.output_path:
-        values["output_path"] = request.output_path
+        values["output_path"] = _storage_reference(job_id, request.output_path)
     if request.manifest_path:
-        values["manifest_path"] = request.manifest_path
+        values["manifest_path"] = _storage_reference(job_id, request.manifest_path)
     update_job(job_id, **values)
     with connect() as db:
         db.execute(
@@ -1232,6 +1358,7 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
         if not asset_row or not plan_row:
             raise RuntimeError("任务输入不存在")
         asset = row_to_dict(asset_row)
+        asset["path"] = str(resolve_asset_path(asset))
         run_dir = RUNS / job_id
         plan_path = run_dir / "director_plan.json"
         try:
@@ -1292,8 +1419,8 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             "ffprobe": {"duration": duration, "video_stream": stream},
             "director_plan": plan_snapshot,
             "director_plan_snapshot_sha256": hashlib.sha256(plan_snapshot_bytes).hexdigest(),
-            "blender": BLENDER,
-            "ffmpeg": FFMPEG,
+            "blender": Path(BLENDER).name if BLENDER else None,
+            "ffmpeg": Path(FFMPEG).name if FFMPEG else None,
             "created_at": utc_now(),
         }
         manifest_path = run_dir / "metadata.json"
@@ -1303,8 +1430,8 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             status="SUCCEEDED",
             stage="ARTIFACT",
             progress=100,
-            output_path=str(output),
-            manifest_path=str(manifest_path),
+            output_path=_storage_reference(job_id, str(output)),
+            manifest_path=_storage_reference(job_id, str(manifest_path)),
             error=None,
         )
         release_worker_lease(job_id, worker_id, lease_epoch, "worker.completed")
@@ -1333,11 +1460,54 @@ def run_worker_once(worker_id: str) -> dict:
 app = FastAPI(title="ProductDirectorAI V1", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4173", "http://127.0.0.1:4173"],
+    allow_origins=ALLOWED_ORIGINS or ["http://localhost:4173", "http://127.0.0.1:4173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    context = None
+    try:
+        if request.method != "OPTIONS" and not request.url.path.startswith("/internal/"):
+            if not (request.url.path == "/api/v1/session" and request.method == "POST"):
+                owner = security.authenticate(request, connect, ALLOWED_ORIGINS)
+                context = security.current_owner.set(owner)
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+    except HTTPException as exc:
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                            headers={"Cache-Control": "no-store"})
+    finally:
+        if context is not None:
+            security.current_owner.reset(context)
+
+
+class SessionInput(BaseModel):
+    token: str = Field(min_length=1, max_length=512)
+
+
+@app.post("/api/v1/session")
+def login(body: SessionInput, request: Request, response: Response):
+    return security.create_session(request, response, body.token, connect, ALLOWED_ORIGINS)
+
+
+@app.get("/api/v1/session")
+def session_status(request: Request):
+    return {"owner_id": security.current_owner.get(), "csrf_token": request.state.csrf_token}
+
+
+@app.delete("/api/v1/session")
+def logout(request: Request, response: Response):
+    with connect() as db:
+        db.execute("DELETE FROM auth_sessions WHERE token_hash = ?",
+                   (security.digest(request.cookies.get(security.COOKIE, "")),))
+    response.delete_cookie(security.COOKIE, path="/")
+    return {"ok": True}
 
 
 @app.get("/api/v1/health")
@@ -1358,12 +1528,15 @@ def minimax_status() -> dict:
 
 
 @app.post("/api/v1/providers/minimax/credentials")
-def save_minimax_credentials(request: ProviderCredentialInput) -> dict:
-    status, response = minimax_call(request.api_key, "/v1/models")
+def save_minimax_credentials(
+    request: ProviderCredentialInput,
+) -> dict:
+    base_url = _normalize_minimax_base_url(request.base_url or MINIMAX_API_BASE_URL)
+    encrypted = protect_secret(request.api_key)
+    status, response = minimax_call(request.api_key, "/v1/models", base_url=base_url)
     if status != 200 or not response.get("data"):
         message = response.get("error", {}).get("message", "密钥验证失败")
         raise HTTPException(status, message)
-    encrypted = protect_secret(request.api_key)
     now = utc_now()
     message = f"认证通过，可访问 {len(response['data'])} 个模型"
     with connect() as db:
@@ -1373,7 +1546,7 @@ def save_minimax_credentials(request: ProviderCredentialInput) -> dict:
                ON CONFLICT(provider) DO UPDATE SET encrypted_key=excluded.encrypted_key,
                base_url=excluded.base_url, last_status=excluded.last_status,
                last_message=excluded.last_message, updated_at=excluded.updated_at""",
-            (encrypted, "https://api.minimaxi.com/v1", message, now),
+            (encrypted, base_url, message, now),
         )
     return provider_public_status()
 
@@ -1384,6 +1557,7 @@ def test_minimax_generation() -> dict:
     if not row:
         raise HTTPException(409, "请先保存 MiniMax API Key")
     api_key = unprotect_secret(row["encrypted_key"])
+    base_url = row["base_url"]
     status, response = minimax_call(
         api_key,
         "/v1/chat/completions",
@@ -1393,6 +1567,7 @@ def test_minimax_generation() -> dict:
             "max_completion_tokens": 64,
             "temperature": 0.1,
         },
+        base_url=base_url,
     )
     now = utc_now()
     if status == 200:
@@ -1432,8 +1607,9 @@ async def create_asset(file: UploadFile = File(...)) -> dict:
     created = utc_now()
     with connect() as db:
         db.execute(
-            "INSERT INTO assets VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (asset_id, file.filename or stored.name, kind, mime, len(data), digest, str(stored), created),
+            "INSERT INTO assets (id, name, kind, mime, size_bytes, sha256, path, created_at, owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (asset_id, file.filename or stored.name, kind, mime, len(data), digest, stored.name, created,
+             security.current_owner.get() or DEFAULT_OWNER_ID),
         )
     return {
         "id": asset_id,
@@ -1449,8 +1625,21 @@ async def create_asset(file: UploadFile = File(...)) -> dict:
 @app.get("/api/v1/assets")
 def list_assets() -> list[dict]:
     with connect() as db:
-        rows = db.execute("SELECT * FROM assets ORDER BY created_at DESC").fetchall()
-    return [row_to_dict(row) for row in rows]
+        rows = db.execute("SELECT * FROM assets WHERE owner_id = ? ORDER BY created_at DESC",
+                          (security.current_owner.get() or DEFAULT_OWNER_ID,)).fetchall()
+    return [{key: row[key] for key in row.keys() if key != "path"} for row in rows]
+
+
+def resolve_asset_path(asset) -> Path:
+    reference = Path(asset["path"])
+    path = (reference if reference.is_absolute() else UPLOADS / reference).resolve()
+    try:
+        path.relative_to(UPLOADS.resolve())
+    except ValueError:
+        raise HTTPException(403, "素材路径超出授权目录") from None
+    if path.name != f"{asset['id']}{path.suffix}" or not path.is_file():
+        raise HTTPException(409, "素材引用无效或文件缺失")
+    return path
 
 
 @app.get("/api/v1/assets/{asset_id}/content")
@@ -1459,7 +1648,9 @@ def asset_content(asset_id: str):
         row = db.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
     if not row:
         raise HTTPException(404, "素材不存在")
-    return FileResponse(row["path"], media_type=row["mime"], filename=row["name"])
+    if row["owner_id"] != security.current_owner.get():
+        raise HTTPException(403, "越权访问素材")
+    return FileResponse(resolve_asset_path(row), media_type=row["mime"], filename=row["name"])
 
 
 @app.post("/api/v1/plans/template", status_code=201)
@@ -1471,6 +1662,8 @@ def create_plan(request: PlanRequest) -> dict:
         asset = db.execute("SELECT * FROM assets WHERE id = ?", (request.product_asset_id,)).fetchone()
         if not asset:
             raise HTTPException(404, "产品素材不存在")
+        if asset["owner_id"] != owner_id:
+            raise HTTPException(403, "越权使用素材")
         shots = [
             Shot(
                 id=f"shot_0{index + 1}",
@@ -1602,19 +1795,42 @@ def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
 
 
 @app.get("/api/v1/jobs")
-def list_jobs() -> list[dict]:
+def list_jobs(owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJECT_ID) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
     with connect() as db:
-        rows = db.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
+        rows = db.execute(
+            """
+            SELECT j.*
+            FROM jobs j
+            INNER JOIN runs r ON r.job_id = j.id
+            INNER JOIN plan_contracts pc ON pc.id = r.plan_contract_id
+            INNER JOIN product_versions pv ON pv.id = pc.product_version_id
+            WHERE r.owner_id = ? AND pv.project_id = ?
+            GROUP BY j.id
+            ORDER BY j.created_at DESC
+            """,
+            (owner_id, project_id),
+        ).fetchall()
     return [row_to_dict(row) for row in rows]
 
 
 @app.get("/api/v1/jobs/{job_id}")
-def job_detail(job_id: str) -> dict:
+def job_detail(
+    job_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> dict:
+    resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
     return get_job(job_id)
 
 
 @app.post("/api/v1/jobs/{job_id}/cancel")
-def cancel_job(job_id: str) -> dict:
+def cancel_job(
+    job_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> dict:
+    resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
     job = get_job(job_id)
     if job["status"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
         return job
@@ -1626,34 +1842,43 @@ def cancel_job(job_id: str) -> dict:
     return get_job(job_id)
 
 
-@app.post("/internal/v1/workers/claim")
+@app.post("/internal/v1/workers/claim", dependencies=[Depends(_ensure_worker_token)])
 def worker_claim(request: WorkerClaimRequest) -> dict:
+    security.check_worker_id(request.worker_id)
     return claim_job(request.worker_id, request.job_id)
 
 
-@app.post("/internal/v1/workers/reconcile")
+@app.post("/internal/v1/workers/reconcile", dependencies=[Depends(_ensure_worker_token)])
 def worker_reconcile() -> dict:
     return reconcile_stale_jobs()
 
 
-@app.post("/internal/v1/workers/jobs/{job_id}/heartbeat")
+@app.post("/internal/v1/workers/jobs/{job_id}/heartbeat", dependencies=[Depends(_ensure_worker_token)])
 def worker_heartbeat(job_id: str, request: WorkerLeaseRequest) -> dict:
+    security.check_worker_id(request.worker_id)
     return heartbeat_job(job_id, request.worker_id, request.lease_epoch)
 
 
-@app.post("/internal/v1/workers/jobs/{job_id}/complete")
+@app.post("/internal/v1/workers/jobs/{job_id}/complete", dependencies=[Depends(_ensure_worker_token)])
 def worker_complete(job_id: str, request: WorkerCompleteRequest) -> dict:
+    security.check_worker_id(request.worker_id)
     return complete_leased_job(job_id, request)
 
 
-@app.post("/internal/v1/workers/jobs/{job_id}/fail")
+@app.post("/internal/v1/workers/jobs/{job_id}/fail", dependencies=[Depends(_ensure_worker_token)])
 def worker_fail(job_id: str, request: WorkerFailRequest) -> dict:
+    security.check_worker_id(request.worker_id)
     return fail_leased_job(job_id, request)
 
 
 @app.get("/api/v1/jobs/{job_id}/events")
-def job_events(job_id: str, last_event_id: str | None = Header(default=None, alias="Last-Event-ID")):
-    get_job(job_id)
+def job_events(
+    job_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+) -> StreamingResponse:
+    resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
     try:
         after_sequence = int(last_event_id) if last_event_id else 0
     except ValueError:
@@ -1688,19 +1913,37 @@ def job_events(job_id: str, last_event_id: str | None = Header(default=None, ali
 
 
 @app.get("/api/v1/jobs/{job_id}/video")
-def job_video(job_id: str):
+def job_video(
+    job_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+):
+    resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
     job = get_job(job_id)
     if job["status"] != "SUCCEEDED" or not job["output_path"]:
         raise HTTPException(409, "视频尚未准备完成")
-    return FileResponse(job["output_path"], media_type="video/mp4", filename=f"product-preview-{job_id}.mp4")
+    return FileResponse(
+        _resolve_job_artifact_path(job_id, job["output_path"]),
+        media_type="video/mp4",
+        filename=f"product-preview-{job_id}.mp4",
+    )
 
 
 @app.get("/api/v1/jobs/{job_id}/manifest")
-def job_manifest(job_id: str):
+def job_manifest(
+    job_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+):
+    resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
     job = get_job(job_id)
     if job["status"] != "SUCCEEDED" or not job["manifest_path"]:
         raise HTTPException(409, "清单尚未准备完成")
-    return FileResponse(job["manifest_path"], media_type="application/json", filename=f"metadata-{job_id}.json")
+    return FileResponse(
+        _resolve_job_artifact_path(job_id, job["manifest_path"]),
+        media_type="application/json",
+        filename=f"metadata-{job_id}.json",
+    )
 
 
 def main_cli(argv: list[str] | None = None) -> int:

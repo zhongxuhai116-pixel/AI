@@ -8,7 +8,9 @@ import {
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
-const API = "http://127.0.0.1:8000/api/v1";
+const API_BASE = (import.meta.env.VITE_API_BASE || "").trim().replace(/\/$/, "");
+const API = `${API_BASE}/api/v1`;
+let sessionCsrfToken = "";
 const demoImage = "/assets/boxing-trainer.png";
 const navItems = [
   ["project", "项目", SquaresFour], ["products", "产品库", Cube],
@@ -64,7 +66,7 @@ function ModelPreview({ url }) {
     const key = new THREE.DirectionalLight(0xffffff, 4); key.position.set(-2, -3, 5); scene.add(key);
     scene.add(new THREE.GridHelper(8, 16, 0xd7dce3, 0xe4e7eb));
     let object; let frame; let down = false; let previous = 0;
-    new GLTFLoader().load(url, (gltf) => {
+    new GLTFLoader().setWithCredentials(true).load(url, (gltf) => {
       object = gltf.scene;
       const box = new THREE.Box3().setFromObject(object);
       const size = box.getSize(new THREE.Vector3());
@@ -209,6 +211,10 @@ function Settings({ health, provider, onSaveProvider, onTestProvider, busy }) {
 }
 
 export function App() {
+  const [session, setSession] = useState(null);
+  const [accessKey, setAccessKey] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
   const [active, setActive] = useState("project");
   const [health, setHealth] = useState(null);
   const [assets, setAssets] = useState([]);
@@ -226,8 +232,16 @@ export function App() {
 
   async function refresh() {
     try {
-      const [h, a, j, p] = await Promise.all([fetch(`${API}/health`), fetch(`${API}/assets`), fetch(`${API}/jobs`), fetch(`${API}/providers/minimax/status`)]);
-      if (!h.ok) throw new Error();
+      const [h, a, j, p] = await Promise.all([
+        apiRequest("/health"),
+        apiRequest("/assets"),
+        apiRequest("/jobs"),
+        apiRequest("/providers/minimax/status"),
+      ]);
+      if ([h, a, j, p].some((response) => response.status === 401)) {
+        sessionCsrfToken = ""; setSession(null); return;
+      }
+      if (!h.ok || !a.ok || !j.ok) throw new Error();
       const nextHealth = await h.json(); const nextAssets = await a.json(); const nextJobs = await j.json(); const nextProvider = p.ok ? await p.json() : null;
       setProvider(nextProvider);
       setHealth(nextHealth); setAssets(nextAssets); setJobs(nextJobs);
@@ -235,14 +249,24 @@ export function App() {
       if (job) { const current = nextJobs.find((item) => item.id === job.id); if (current) setJob(current); }
     } catch { setHealth(null); }
   }
-  useEffect(() => { refresh(); const timer = setInterval(refresh, 1800); return () => clearInterval(timer); }, [job?.id, asset?.id]);
+  useEffect(() => {
+    apiRequest("/session").then(async (response) => {
+      if (response.ok) {
+        const data = await response.json(); sessionCsrfToken = data.csrf_token || ""; setSession(data);
+      }
+    }).catch(() => setLoginError("暂时无法连接服务，请检查连接"));
+  }, []);
+  useEffect(() => {
+    if (!session) return;
+    refresh(); const timer = setInterval(refresh, 1800); return () => clearInterval(timer);
+  }, [session, job?.id, asset?.id]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(null), 4000); return () => clearTimeout(timer); }, [toast]);
 
   async function upload(file) {
     if (!file) return; setBusy(true);
     const form = new FormData(); form.append("file", file);
     try {
-      const response = await fetch(`${API}/assets`, { method: "POST", body: form });
+      const response = await apiRequest("/assets", { method: "POST", body: form });
       if (!response.ok) throw new Error((await response.json()).detail || "上传失败");
       const uploaded = await response.json();
       setAsset(uploaded); setAssetUrl(uploaded.kind === "image" ? URL.createObjectURL(file) : `${API}/assets/${uploaded.id}/content`);
@@ -257,7 +281,7 @@ export function App() {
     if (!asset) return setToast(["danger", "请先上传产品图片或 GLB。"]);
     setBusy(true);
     try {
-      const response = await fetch(`${API}/plans/template`, {
+      const response = await apiRequest("/plans/template", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ product_asset_id: asset.id, intent, ratio: "9:16", duration_seconds: 6, output }),
@@ -269,11 +293,23 @@ export function App() {
   async function run() {
     setBusy(true);
     try {
-      const saved = await fetch(`${API}/plans/${plan.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ intent, shots: plan.shots }) });
+      const saved = await apiRequest(`/plans/${plan.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ intent, shots: plan.shots }),
+      });
       if (!saved.ok) throw new Error("分镜保存失败");
-      const approval = await fetch(`${API}/plans/${plan.id}/approve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ approved: true }) });
+      const approval = await apiRequest(`/plans/${plan.id}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approved: true }),
+      });
       if (!approval.ok) throw new Error("分镜确认失败");
-      const response = await fetch(`${API}/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ plan_id: plan.id }) });
+      const response = await apiRequest("/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plan_id: plan.id }),
+      });
       if (!response.ok) throw new Error((await response.json()).detail || "任务创建失败");
       const created = await response.json();
       const next = { id: created.job_id, status: "QUEUED", stage: "PREPARE", progress: 0, created_at: new Date().toISOString(), kind: asset.kind };
@@ -284,11 +320,15 @@ export function App() {
     const [width, height] = eventValue.split("x").map((value) => Number(value));
     setOutput(outputPresets.find((item) => item.width === width && item.height === height) || outputPresets[0]);
   }
-  async function cancel() { if (job) { await fetch(`${API}/jobs/${job.id}/cancel`, { method: "POST" }); refresh(); } }
+  async function cancel() { if (job) { await apiRequest(`/jobs/${job.id}/cancel`, { method: "POST" }); refresh(); } }
   async function saveProvider(apiKey) {
     setBusy(true);
     try {
-      const response = await fetch(`${API}/providers/minimax/credentials`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ api_key: apiKey }) });
+      const response = await apiRequest("/providers/minimax/credentials", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: apiKey }),
+      });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "MiniMax 密钥验证失败");
       setProvider(result); setToast(["success", result.last_message]);
@@ -297,7 +337,7 @@ export function App() {
   async function testProvider() {
     setBusy(true);
     try {
-      const response = await fetch(`${API}/providers/minimax/test`, { method: "POST" });
+      const response = await apiRequest("/providers/minimax/test", { method: "POST" });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "MiniMax 测试失败");
       setProvider(result); setToast([result.last_status === "GENERATION_READY" ? "success" : "danger", result.last_message]);
@@ -305,6 +345,29 @@ export function App() {
   }
   const filtered = useMemo(() => jobs.filter((item) => !search || JSON.stringify(item).toLowerCase().includes(search.toLowerCase())).slice(0, 6), [jobs, search]);
   function selectAsset(next) { setAsset(next); setAssetUrl(`${API}/assets/${next.id}/content`); setPlan(null); setJob(null); setActive("project"); }
+
+  if (!session) return <main style={{ maxWidth: 440, margin: "12vh auto", padding: 24 }}>
+    <h1>登录 ProductDirectorAI</h1>
+    <p>输入此服务的访问密钥，继续你的产品项目。</p>
+    <form onSubmit={async (event) => {
+      event.preventDefault(); setLoggingIn(true); setLoginError("");
+      try {
+        const response = await apiRequest("/session", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: accessKey }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "登录失败");
+        sessionCsrfToken = data.csrf_token; setSession(data);
+      } catch (error) { setLoginError(error.message || "暂时无法连接服务"); }
+      finally { setAccessKey(""); setLoggingIn(false); }
+    }}>
+      <label htmlFor="access-key">访问密钥</label>
+      <input id="access-key" type="password" autoComplete="off" required value={accessKey}
+        onChange={(event) => setAccessKey(event.target.value)} style={{ display: "block", width: "100%", margin: "12px 0", padding: 12 }} />
+      <button type="submit" disabled={loggingIn}>{loggingIn ? "登录中…" : "进入工作台"}</button>
+      {loginError && <p role="alert">{loginError}</p>}
+    </form>
+  </main>;
 
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
@@ -331,4 +394,12 @@ export function App() {
     </main></div>
     {toast && <div className={`toast ${toast[0]}`}>{toast[0] === "success" ? <CheckCircle weight="fill" /> : <WarningCircle weight="fill" />}<span>{toast[1]}</span><button onClick={() => setToast(null)}><X /></button></div>}
   </div>;
+}
+async function apiRequest(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (sessionCsrfToken && !["GET", "HEAD"].includes((options.method || "GET").toUpperCase())) {
+    headers["X-CSRF-Token"] = sessionCsrfToken;
+  }
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return fetch(`${API}${normalizedPath}`, { ...options, headers, credentials: "include" });
 }

@@ -4,6 +4,8 @@
 
 ## 先读这四份
 
+**本次换电脑先读 [NEXT_COMPUTER_START.md](NEXT_COMPUTER_START.md)**，其中包含最新恢复步骤和继续指令。[A05 交接报告](reports/A05_SECURITY_HANDOFF.md) 记录本地 23 项后端测试与待完成项。
+
 1. [换电脑接手手册](HANDOFF_NEW_COMPUTER.md)：克隆、恢复环境、私人数据、凭证与接手提示。
 2. [当前阶段](CURRENT_PHASE.md)：当前范围、阻断与下一步。
 3. [V1 实现与规划差距](V1_IMPLEMENTATION_GAPS.md)：不要把原型或历史 PASS 当作完整 V1 验收。
