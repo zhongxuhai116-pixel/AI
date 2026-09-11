@@ -10,7 +10,7 @@
 - 执行器：FastAPI BackgroundTasks、进程内线程锁/子进程表；不是独立、持久、带租约的 Worker 系统。
 - 素材：单文件图片/GLB 上传；本机 var/ 存放原件、数据库和成果。
 - 模板：固定 6 秒、24fps、9:16，默认 540×960 三镜头。
-- 预演：图片 FFmpeg，GLB Blender + FFmpeg；GLB 每次 Run 在作业目录冻结 DirectorPlan，并将三段 `camera`、`focal_length_mm`、`duration_frames` 编译为 Blender 相机关键帧。
+- 预演：图片 FFmpeg，GLB Blender + FFmpeg；每次 Run 在作业目录冻结 DirectorPlan。GLB 将三段 `camera`、`focal_length_mm`、`duration_frames` 编译为 Blender 相机关键帧；图片将同一快照编译为 2D 平移/缩放片段。
 - MiniMax：中国区认证/测试入口；DPAPI 加密仅实现 Windows 路径。历史生成测试受额度限制，不代表当前额度状态。
 - 云 GPU 卡片：历史选型展示，不是当前租赁资源查询或远程调度功能。
 
@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | 项目与产品版本 | 当前围绕 asset/plan/job；无完整 Project/ProductVersion 审核与不可变版本模型 | 主规划第 4、7 章实体与授权校验 |
 | 计划合同 | Pydantic 简化请求与根目录 JSON Schema 不是同一全量合同；未统一验证 | 明确迁移/兼容方案，正负例与语义校验 |
-| 分镜编辑影响真实片 | GLB 已通过真实云端验收：冻结计划、相机模板、焦距和三段时长均进入 Blender；图片 FFmpeg 预演仍使用固定 2D 运动 | 为图片设计并验收可编辑 2D 平移/缩放合同；保留 GLB 快照回归 |
+| 分镜编辑影响真实片 | GLB 与图片均已通过真实云端验收：冻结计划、相机模板、焦距和三段时长会进入对应渲染器；图片 `hero_orbit` 是可见的 2D 视差近似 | 保留 GLB/图片快照回归；物理 3D 环绕仅适用于 GLB 或后续多视图资产 |
 | 状态与恢复 | 已有状态、取消、SQLite 保存；无租约/事件 Outbox/SSE、可靠重启恢复 | 故障、重试幂等、取消竞争、重启对账测试 |
 | 输出与 QA | 540×960 基础历史预演；存在性检查不等于全量质量门 | 1080×1920、黑帧/可见性/帧数/解码验证 |
 | 远程节点 | 新云节点已本机部署并通过 GLB 全链路；尚无受鉴权的远程 Renderer/Worker 调度 | 远程存储、权限、调度、真实任务与恢复 |

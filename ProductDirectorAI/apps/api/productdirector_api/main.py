@@ -264,27 +264,75 @@ def get_job(job_id: str) -> dict:
     return row_to_dict(row)
 
 
-def render_image_job(job_id: str, asset: dict, output: Path) -> None:
+def image_base_zoom(focal_length_mm: int) -> float:
+    """Map the editable V1 focal-length field to a conservative 2D crop."""
+    return round(1.05 + (focal_length_mm - 15) / 105 * 0.35, 4)
+
+
+def image_shot_filter(shot: Shot, index: int) -> str:
+    """Compile one frozen shot into deterministic FFmpeg 2D camera motion.
+
+    Image previews cannot perform a physical 3D orbit.  The orbit template
+    therefore combines eased lateral and vertical parallax with a light zoom.
+    GLB previews continue to use the physical Blender camera implementation.
+    """
+    duration = shot.duration_frames
+    denominator = max(1, duration - 1)
+    zoom = f"{image_base_zoom(shot.focal_length_mm):.4f}"
+    center_x = "iw/2-(iw/zoom/2)"
+    center_y = "ih/2-(ih/zoom/2)"
+    if shot.camera == "dolly_in":
+        zoom = f"{zoom}+0.16*on/{denominator}"
+        x, y = center_x, center_y
+    elif shot.camera == "side_track":
+        zoom = f"{zoom}+0.03*on/{denominator}"
+        x = f"(iw-iw/zoom)*(0.08+0.84*on/{denominator})"
+        y = center_y
+    elif shot.camera == "hero_orbit":
+        zoom = f"{zoom}+0.08*sin(PI*on/{denominator})"
+        x = f"(iw-iw/zoom)*(0.50+0.32*sin(PI*(on/{denominator}-0.5)))"
+        y = f"(ih-ih/zoom)*(0.50+0.07*sin(2*PI*on/{denominator}))"
+    else:  # static
+        x, y = center_x, center_y
+    return (
+        f"[source_{index}]zoompan=z='{zoom}':x='{x}':y='{y}':"
+        f"d={duration}:s=540x960:fps=24,trim=end_frame={duration},"
+        f"setpts=PTS-STARTPTS[shot_{index}]"
+    )
+
+
+def build_image_filtergraph(plan_snapshot: dict) -> str:
+    """Turn the persisted DirectorPlan snapshot into a fixed 144-frame edit."""
+    validated = PlanUpdate.model_validate(
+        {"intent": plan_snapshot.get("intent"), "shots": plan_snapshot.get("shots")}
+    )
+    sources = "".join(f"[source_{index}]" for index in range(3))
+    filters = [
+        "[0:v]scale=1280:2276:force_original_aspect_ratio=increase,"
+        "crop=1280:2276:(iw-ow)/2:(ih-oh)/2,split=3" + sources,
+    ]
+    filters.extend(image_shot_filter(shot, index) for index, shot in enumerate(validated.shots))
+    filters.append("[shot_0][shot_1][shot_2]concat=n=3:v=1:a=0,format=yuv420p[video]")
+    return ";".join(filters)
+
+
+def render_image_job(job_id: str, asset: dict, output: Path, plan_snapshot: dict) -> None:
     if not FFMPEG:
         raise RuntimeError("FFmpeg 未安装或未找到")
     input_path = Path(asset["path"])
-    filtergraph = (
-        "scale=720:-2:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=0xF3F4F6,"
-        "zoompan=z='min(zoom+0.0007,1.08)':"
-        "x='iw/2-(iw/zoom/2)+sin(on/18)*6':"
-        "y='ih/2-(ih/zoom/2)':d=144:s=540x960:fps=24,"
-        "format=yuv420p"
-    )
+    filtergraph = build_image_filtergraph(plan_snapshot)
     command = [
         FFMPEG,
         "-y",
         "-loop", "1",
+        "-framerate", "1",
         "-i", str(input_path),
-        "-vf", filtergraph,
-        "-t", "6",
+        "-filter_complex", filtergraph,
+        "-map", "[video]",
+        "-frames:v", "144",
         "-r", "24",
         "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
         "-preset", "medium",
         "-movflags", "+faststart",
         str(output),
@@ -381,7 +429,7 @@ def execute_job(job_id: str) -> None:
         if asset["kind"] == "model":
             render_glb_job(job_id, asset, run_dir, output, plan_path)
         else:
-            render_image_job(job_id, asset, output)
+            render_image_job(job_id, asset, output, plan_snapshot)
         if get_job(job_id)["status"] == "CANCELLED":
             return
         update_job(job_id, stage="QA", progress=94)

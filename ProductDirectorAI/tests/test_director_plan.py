@@ -11,7 +11,7 @@ from pydantic import ValidationError
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "apps" / "api"))
 
-from productdirector_api.main import PlanUpdate  # noqa: E402
+from productdirector_api.main import PlanUpdate, build_image_filtergraph  # noqa: E402
 
 
 def plan_payload(durations: tuple[int, int, int] = (48, 48, 48)) -> dict:
@@ -50,6 +50,18 @@ class DirectorPlanContractTests(unittest.TestCase):
         self.assertEqual(decoded["shots"][0]["duration_frames"], 24)
         self.assertEqual(decoded["shots"][1]["focal_length_mm"], 45)
         self.assertEqual(sum(shot["duration_frames"] for shot in decoded["shots"]), 144)
+
+    def test_image_preview_compiles_every_shot_from_the_frozen_snapshot(self):
+        graph = build_image_filtergraph(plan_payload((24, 72, 48)))
+
+        self.assertEqual(graph.count("zoompan="), 3)
+        self.assertIn("d=24", graph)
+        self.assertIn("d=72", graph)
+        self.assertIn("d=48", graph)
+        self.assertIn("0.16*on/23", graph)  # dolly-in
+        self.assertIn("0.08+0.84*on/71", graph)  # side track
+        self.assertIn("sin(PI*on/47)", graph)  # 2D orbit approximation
+        self.assertIn("concat=n=3:v=1:a=0", graph)
 
 
 if __name__ == "__main__":

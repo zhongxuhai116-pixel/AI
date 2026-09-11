@@ -21,7 +21,7 @@
 | [GPU 历史选型](GPU_CLOUD_SELECTION.md) | 保留候选比较，已购节点事实以云交接记录为准；价格非实时报价 |
 | [V1 验收](reports/V1_ACCEPTANCE.md) | 本机核心历史结果；完整 V1 为 PARTIAL，非负责人验收 |
 | [V1 云 GPU 验收](reports/CLOUD_GPU_ACCEPTANCE.md) | 新节点环境、GPU 探针、API 全链路与未覆盖项 |
-| [V1 分镜语义验收](reports/V1_DIRECTORPLAN_ACCEPTANCE.md) | 三段镜头编辑、冻结快照和 Blender 相机关键帧证据 |
+| [V1 分镜语义验收](reports/V1_DIRECTORPLAN_ACCEPTANCE.md) | 三段镜头编辑、冻结快照、Blender 相机与图片 2D 预演证据 |
 | [P0 环境](reports/P0_ENVIRONMENT.md) | 旧电脑环境和历史测试，不代表新电脑/云端 |
 | [视觉 QA](../design-qa.md) | 旧界面截图范围；GPU 卡和迁移后界面未复验 |
 | [差异决策记录](decisions/ADR-001-V1-PROTOTYPE-BASELINE.md) | React JSX、SQLite、后台执行器与目标规格的区别 |
@@ -37,7 +37,7 @@
 
 | 版本 | 主规划章节 | 重点 | 当前状态 |
 | --- | --- | --- | --- |
-| V1 | 第 7 章 | 素材、模板导演、Blender/FFmpeg、任务、导出 | 云基础设施、GLB 链路与分镜相机语义 PASS；完整退出门未通过 |
+| V1 | 第 7 章 | 素材、模板导演、Blender/FFmpeg、任务、导出 | 云基础设施、GLB/图片链路与分镜语义 PASS；完整退出门未通过 |
 | V2 | 第 8 章 | AI Director、Provider、ComfyUI、MiniMax H3 | 已授权；等待 V1 阶段门 |
 | V3 | 第 9 章 | 产品保真、多视图、分层、QA | 已授权；未实施，不能越级 |
 | V4 | 第 10 章 | 人体 Proxy、动作、接触与交互审核 | 已授权；未实施，不能越级 |

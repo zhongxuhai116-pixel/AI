@@ -14,7 +14,7 @@
 | Blender | 官方 Blender 5.2.1 LTS，`/usr/local/bin/blender` | PASS |
 | FFmpeg | Ubuntu FFmpeg/ffprobe 4.4.2，`/usr/bin` | PASS |
 | Node | 官方 Node.js 22.23.2，`/opt/productdirector/node` | PASS |
-| 项目 | GitHub commit `68532ec554c9f952907bc004bd4da176e65ceed3` | PASS |
+| 项目 | GitHub `main` 已同步最新已验收 V1 代码与文档 | PASS |
 | 服务 | API `localhost:8000`；Web `localhost:4173`；systemd enabled/active | PASS；未公网暴露 |
 
 旧节点曾完成约 291GB 根分区扩容，但该事实不得套用到当前新节点。当前节点禁止重复执行旧 growpart/resize2fs 记录，也不要在未核对云盘配置前格式化、重分区或假设已有 300GB。
@@ -29,12 +29,15 @@
 | CLOUD-04 GPU 证据 | 12 帧期间 21 次采样；峰值 GPU 61%、显存 1114 MiB | PASS |
 | CLOUD-05 全链路 | API 上传→计划→批准→运行→H.264/Manifest | PASS |
 | CLOUD-05b 计划语义 | 冻结 DirectorPlan → Blender 关键帧 → 成片/Manifest/scene.blend 复核 | PASS |
+| CLOUD-05c 图片计划语义 | 冻结 DirectorPlan → FFmpeg 三段 2D 运动 → 成片/Manifest/边界帧复核 | PASS |
 | CLOUD-06 受限远程 Worker | 当前仅 localhost 服务，无远程鉴权/调度 | NOT_STARTED |
 | CLOUD-07 生产级对照 | 3 次真实任务、成本/恢复/回滚 | NOT_STARTED |
 
 完整全链路产物：540×960、24fps、144 帧、6.000 秒、H.264。视频 SHA-256：`fadc6f3b41579289c1a81089554bd47df6d7b13d12a3d76fbf4ac026515baef7`。该结果证明 V1 通用 GLB 基础链路，不证明 1080×1920、用户真实素材、可靠远程 Worker 或完整 V1 产品验收。
 
 计划语义复验使用同一通用 GLB：24 帧 85mm 定格、72 帧 24mm 侧向移动、48 帧 55mm 环绕。导出视频仍为 540×960、24fps、144 帧、6 秒；Manifest 保存冻结计划与 SHA-256。该作业的具体标识、地址和运行目录不进入 Git；可复验步骤见 `docs/reports/V1_DIRECTORPLAN_ACCEPTANCE.md`。
+
+图片计划语义复验使用程序生成的通用 PNG，采用同一组时长与镜头字段，输出仍为 H.264、540×960、24fps、144 帧、6 秒；四个边界帧均有不同哈希。单图路径的 `hero_orbit` 是受控 2D 视差近似，并不表示图片得到物理 3D 环绕。该作业的具体标识、地址和运行目录不进入 Git。
 
 ## 服务与恢复
 
