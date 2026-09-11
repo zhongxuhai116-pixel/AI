@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import mimetypes
@@ -7,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -18,9 +20,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -30,12 +32,21 @@ UPLOADS = VAR / "uploads"
 RUNS = VAR / "runs"
 DB_PATH = VAR / "productdirector.db"
 BLENDER_SCRIPT = ROOT / "blender" / "scripts" / "render_product.py"
+
+DEFAULT_OWNER_ID = "owner-default"
+DEFAULT_WORKSPACE_ID = "workspace-default"
+DEFAULT_PROJECT_ID = "project-default"
+LEASE_SECONDS = 60
 for folder in (VAR, UPLOADS, RUNS):
     folder.mkdir(parents=True, exist_ok=True)
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value)
 
 
 def find_executable(name: str, candidates: list[str]) -> str | None:
@@ -89,6 +100,12 @@ def connect() -> sqlite3.Connection:
     return connection
 
 
+def ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def initialize_db() -> None:
     with connect() as db:
         db.executescript(
@@ -103,6 +120,28 @@ def initialize_db() -> None:
               path TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS owners (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS workspaces (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(owner_id) REFERENCES owners(id)
+            );
+            CREATE TABLE IF NOT EXISTS projects (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              workspace_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              deleted_at TEXT,
+              FOREIGN KEY(owner_id) REFERENCES owners(id),
+              FOREIGN KEY(workspace_id) REFERENCES workspaces(id)
+            );
             CREATE TABLE IF NOT EXISTS plans (
               id TEXT PRIMARY KEY,
               product_asset_id TEXT NOT NULL,
@@ -111,6 +150,35 @@ def initialize_db() -> None:
               approved INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
               FOREIGN KEY(product_asset_id) REFERENCES assets(id)
+            );
+            CREATE TABLE IF NOT EXISTS product_versions (
+              id TEXT PRIMARY KEY,
+              product_asset_id TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              schema_version TEXT NOT NULL DEFAULT '1.0',
+              version INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'ACTIVE',
+              created_at TEXT NOT NULL,
+              snapshot_sha256 TEXT,
+              UNIQUE(product_asset_id, owner_id, project_id, version),
+              FOREIGN KEY(product_asset_id) REFERENCES assets(id),
+              FOREIGN KEY(owner_id) REFERENCES owners(id),
+              FOREIGN KEY(project_id) REFERENCES projects(id)
+            );
+            CREATE TABLE IF NOT EXISTS plan_contracts (
+              id TEXT PRIMARY KEY,
+              plan_id TEXT NOT NULL,
+              product_version_id TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              schema_version TEXT NOT NULL,
+              contract_status TEXT NOT NULL DEFAULT 'DRAFT',
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(plan_id) REFERENCES plans(id),
+              FOREIGN KEY(product_version_id) REFERENCES product_versions(id)
             );
             CREATE TABLE IF NOT EXISTS jobs (
               id TEXT PRIMARY KEY,
@@ -129,6 +197,66 @@ def initialize_db() -> None:
               FOREIGN KEY(plan_id) REFERENCES plans(id),
               FOREIGN KEY(asset_id) REFERENCES assets(id)
             );
+            CREATE TABLE IF NOT EXISTS runs (
+              id TEXT PRIMARY KEY,
+              plan_id TEXT NOT NULL,
+              plan_contract_id TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              request_hash TEXT NOT NULL,
+              idempotency_key TEXT,
+              status TEXT NOT NULL,
+              stage TEXT NOT NULL,
+              progress INTEGER NOT NULL,
+              job_id TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(plan_id) REFERENCES plans(id),
+              FOREIGN KEY(plan_contract_id) REFERENCES plan_contracts(id),
+              FOREIGN KEY(owner_id) REFERENCES owners(id),
+              FOREIGN KEY(job_id) REFERENCES jobs(id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_idempotency ON runs(idempotency_key);
+            CREATE TABLE IF NOT EXISTS run_jobs (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              attempt INTEGER NOT NULL DEFAULT 1,
+              status TEXT NOT NULL,
+              stage TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              error TEXT,
+              lease_owner TEXT,
+              lease_expires_at TEXT,
+              lease_epoch INTEGER NOT NULL DEFAULT 0,
+              FOREIGN KEY(run_id) REFERENCES runs(id),
+              FOREIGN KEY(job_id) REFERENCES jobs(id)
+            );
+            CREATE TABLE IF NOT EXISTS job_attempts (
+              id TEXT PRIMARY KEY,
+              run_job_id TEXT NOT NULL,
+              attempt INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              completed_at TEXT,
+              error TEXT,
+              metadata TEXT,
+              FOREIGN KEY(run_job_id) REFERENCES run_jobs(id)
+            );
+            CREATE TABLE IF NOT EXISTS job_events (
+              id TEXT PRIMARY KEY,
+              job_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL,
+              event_type TEXT NOT NULL,
+              status TEXT NOT NULL,
+              stage TEXT NOT NULL,
+              progress INTEGER NOT NULL,
+              payload TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(job_id, sequence),
+              FOREIGN KEY(job_id) REFERENCES jobs(id)
+            );
             CREATE TABLE IF NOT EXISTS provider_credentials (
               provider TEXT PRIMARY KEY,
               encrypted_key BLOB NOT NULL,
@@ -138,6 +266,30 @@ def initialize_db() -> None:
               updated_at TEXT NOT NULL
             );
             """
+        )
+        ensure_column(db, "run_jobs", "lease_owner", "TEXT")
+        ensure_column(db, "run_jobs", "lease_expires_at", "TEXT")
+        ensure_column(db, "run_jobs", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")
+        # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
+        legacy_index = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_runs_idempotency'"
+        ).fetchone()
+        if legacy_index:
+            db.execute("DROP INDEX idx_runs_idempotency")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_plan_id_idempotency ON runs(plan_id, idempotency_key)")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_contracts_plan_version ON plan_contracts(plan_id, version)")
+        now = utc_now()
+        db.execute(
+            "INSERT OR IGNORE INTO owners(id, name, created_at) VALUES (?, ?, ?)",
+            (DEFAULT_OWNER_ID, "ProductDirector Default Owner", now),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO workspaces(id, owner_id, name, created_at) VALUES (?, ?, ?, ?)",
+            (DEFAULT_WORKSPACE_ID, DEFAULT_OWNER_ID, "ProductDirector Default Workspace", now),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO projects(id, owner_id, workspace_id, name, created_at) VALUES (?, ?, ?, ?, ?)",
+            (DEFAULT_PROJECT_ID, DEFAULT_OWNER_ID, DEFAULT_WORKSPACE_ID, "ProductDirector Default Project", now),
         )
 
 
@@ -183,6 +335,8 @@ class PlanRequest(BaseModel):
     ratio: Literal["9:16"] = "9:16"
     duration_seconds: Literal[6] = 6
     output: OutputSpec = Field(default_factory=OutputSpec)
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
 
     @model_validator(mode="after")
     def validate_output_duration(self):
@@ -193,11 +347,15 @@ class PlanRequest(BaseModel):
 
 class PlanApproval(BaseModel):
     approved: bool = True
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
 
 
 class PlanUpdate(BaseModel):
     intent: str = Field(min_length=1, max_length=4000)
     shots: list[Shot] = Field(min_length=3, max_length=3)
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
 
     @model_validator(mode="after")
     def validate_total_duration(self):
@@ -208,6 +366,28 @@ class PlanUpdate(BaseModel):
 
 class RunRequest(BaseModel):
     plan_id: str
+    idempotency_key: str | None = None
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
+
+
+class WorkerClaimRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=120)
+    job_id: str | None = None
+
+
+class WorkerLeaseRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=120)
+    lease_epoch: int = Field(ge=1)
+
+
+class WorkerCompleteRequest(WorkerLeaseRequest):
+    output_path: str | None = None
+    manifest_path: str | None = None
+
+
+class WorkerFailRequest(WorkerLeaseRequest):
+    error: str = Field(min_length=1, max_length=4000)
 
 
 class ProviderCredentialInput(BaseModel):
@@ -289,14 +469,531 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
 
 
-def update_job(job_id: str, **values) -> None:
-    values["updated_at"] = utc_now()
-    assignments = ", ".join(f"{key} = ?" for key in values)
+def canonical_payload(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def normalize_contract_context(owner_id: str, project_id: str, workspace_id: str | None = None) -> tuple[str, str, str]:
+    with connect() as db:
+        owner = db.execute(
+            "SELECT id FROM owners WHERE id = ?", (owner_id,),
+        ).fetchone()
+        if not owner:
+            raise HTTPException(404, "owner 不存在")
+        if workspace_id is None:
+            workspace = db.execute(
+                "SELECT id FROM workspaces WHERE owner_id = ? AND id = ?",
+                (owner_id, DEFAULT_WORKSPACE_ID),
+            ).fetchone()
+            if not workspace:
+                raise HTTPException(404, "默认 workspace 不存在")
+            workspace_id = workspace["id"]
+        else:
+            workspace = db.execute(
+                "SELECT id FROM workspaces WHERE owner_id = ? AND id = ?",
+                (owner_id, workspace_id),
+            ).fetchone()
+            if not workspace:
+                raise HTTPException(404, "workspace 不存在")
+        project = db.execute(
+            "SELECT id, workspace_id, owner_id FROM projects WHERE id = ?", (project_id,),
+        ).fetchone()
+        if not project:
+            raise HTTPException(404, "project 不存在")
+        if project["owner_id"] != owner_id or project["workspace_id"] != workspace_id:
+            raise HTTPException(403, "越权访问计划项目")
+        return owner_id, workspace_id, project_id
+
+
+def plan_contract_snapshot_hash(payload: str) -> str:
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def plan_contract_payload_hash(payload: dict) -> tuple[str, str]:
+    payload_text = canonical_payload(payload)
+    return payload_text, plan_contract_snapshot_hash(payload_text)
+
+
+def get_default_contract(plan_id: str, db: sqlite3.Connection | None = None, owner_id: str | None = None, project_id: str | None = None) -> sqlite3.Row | None:
+    connection = db or connect()
+    close_connection = db is None
+    try:
+        if owner_id is None or project_id is None:
+            row = connection.execute(
+                """
+                SELECT * FROM plan_contracts
+                WHERE plan_id = ?
+                ORDER BY version DESC, created_at DESC
+                LIMIT 1
+                """,
+                (plan_id,),
+            ).fetchone()
+            return row
+        return connection.execute(
+            """
+            SELECT pc.*
+            FROM plan_contracts pc
+            JOIN product_versions pv ON pv.id = pc.product_version_id
+            WHERE pc.plan_id = ? AND pv.owner_id = ? AND pv.project_id = ?
+            ORDER BY pc.version DESC, pc.created_at DESC
+            LIMIT 1
+            """,
+            (plan_id, owner_id, project_id),
+        ).fetchone()
+    finally:
+        if close_connection:
+            connection.close()
+
+
+def next_contract_version(plan_id: str, db: sqlite3.Connection | None = None) -> int:
+    connection = db or connect()
+    close_connection = db is None
+    try:
+        row = connection.execute(
+            "SELECT MAX(version) AS latest_version FROM plan_contracts WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        if row and row["latest_version"] is not None:
+            return int(row["latest_version"]) + 1
+        return 1
+    finally:
+        if close_connection:
+            connection.close()
+
+
+def upsert_plan_contract(
+    plan_id: str,
+    product_version_id: str,
+    payload: dict,
+    db: sqlite3.Connection | None = None,
+) -> dict:
+    now = utc_now()
+    payload_text, payload_sha256 = plan_contract_payload_hash(payload)
+    contract_id = str(uuid.uuid4())
+    connection = db or connect()
+    close_connection = db is None
+    try:
+        contract_version = next_contract_version(plan_id, connection)
+        connection.execute(
+            """
+            INSERT INTO plan_contracts
+            (id, plan_id, product_version_id, version, schema_version, contract_status, payload, payload_sha256, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?)
+            """,
+            (
+                contract_id,
+                plan_id,
+                product_version_id,
+                contract_version,
+                "1.0",
+                payload_text,
+                payload_sha256,
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "UPDATE plans SET intent = ?, payload = ?, approved = 0 WHERE id = ?",
+            (payload["intent"], json.dumps(payload, ensure_ascii=False), plan_id),
+        )
+    finally:
+        if close_connection:
+            connection.close()
+    return {
+        "contract_id": contract_id,
+        "contract_version": contract_version,
+        "snapshot": payload,
+        "snapshot_sha256": payload_sha256,
+        "created_at": now,
+    }
+
+
+def create_product_version(
+    product_asset_id: str,
+    owner_id: str,
+    project_id: str,
+    snapshot_sha256: str,
+    db: sqlite3.Connection | None = None,
+) -> str:
+    connection = db or connect()
+    close_connection = db is None
+    try:
+        latest = connection.execute(
+            """
+            SELECT COALESCE(MAX(version), 0) AS version
+            FROM product_versions
+            WHERE product_asset_id = ? AND owner_id = ? AND project_id = ?
+            """,
+            (product_asset_id, owner_id, project_id),
+        ).fetchone()
+        version = int(latest["version"]) + 1
+        product_version_id = str(uuid.uuid4())
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT INTO product_versions
+            (id, product_asset_id, owner_id, project_id, version, status, schema_version, created_at, snapshot_sha256)
+            VALUES (?, ?, ?, ?, ?, 'ACTIVE', '1.0', ?, ?)
+            """,
+            (
+                product_version_id,
+                product_asset_id,
+                owner_id,
+                project_id,
+                version,
+                now,
+                snapshot_sha256,
+            ),
+        )
+        return product_version_id
+    finally:
+        if close_connection:
+            connection.close()
+
+
+def ensure_plan_contract(
+    db: sqlite3.Connection,
+    plan_row: sqlite3.Row,
+    owner_id: str,
+    project_id: str,
+) -> sqlite3.Row:
+    contract = get_default_contract(plan_row["id"], db, owner_id, project_id)
+    if contract:
+        return contract
+
+    has_contract = db.execute("SELECT 1 FROM plan_contracts WHERE plan_id = ?", (plan_row["id"],)).fetchone()
+    if has_contract:
+        raise HTTPException(403, "越权访问计划项目")
+
+    payload = json.loads(plan_row["payload"])
+    product_version_id = create_product_version(
+        plan_row["product_asset_id"],
+        owner_id,
+        project_id,
+        plan_contract_payload_hash(payload)[1],
+        db,
+    )
+    upsert_plan_contract(plan_row["id"], product_version_id, payload, db=db)
+    contract = get_default_contract(plan_row["id"], db, owner_id, project_id)
+    if not contract:
+        raise HTTPException(409, "计划合同创建失败")
+    return contract
+
+
+def append_job_event(db: sqlite3.Connection, job_id: str, event_type: str, payload: dict | None = None) -> None:
+    job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job:
+        return
+    latest = db.execute("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM job_events WHERE job_id = ?", (job_id,)).fetchone()
+    sequence = int(latest["sequence"]) + 1
+    event_payload = payload or {}
+    db.execute(
+        """
+        INSERT INTO job_events
+        (id, job_id, sequence, event_type, status, stage, progress, payload, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            job_id,
+            sequence,
+            event_type,
+            job["status"],
+            job["stage"],
+            job["progress"],
+            json.dumps(event_payload, ensure_ascii=False),
+            utc_now(),
+        ),
+    )
+
+
+def latest_run_job(db: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
+    return db.execute(
+        """
+        SELECT *
+        FROM run_jobs
+        WHERE job_id = ?
+        ORDER BY created_at DESC, attempt DESC
+        LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+
+
+def require_active_lease(db: sqlite3.Connection, job_id: str, worker_id: str, lease_epoch: int) -> sqlite3.Row:
+    run_job = latest_run_job(db, job_id)
+    if not run_job:
+        raise HTTPException(404, "run_job 不存在")
+    if run_job["lease_owner"] != worker_id or int(run_job["lease_epoch"]) != lease_epoch:
+        raise HTTPException(409, "租约已过期或不是当前 worker")
+    if run_job["lease_expires_at"] and parse_utc(run_job["lease_expires_at"]) < datetime.now(timezone.utc):
+        raise HTTPException(409, "租约已过期")
+    return run_job
+
+
+def claim_job(worker_id: str, job_id: str | None = None) -> dict:
+    now = utc_now()
+    lease_expires_at = (datetime.now(timezone.utc).replace(microsecond=0).timestamp() + LEASE_SECONDS)
+    lease_expires_text = datetime.fromtimestamp(lease_expires_at, timezone.utc).isoformat()
+    with connect() as db:
+        params: list[object] = []
+        filter_sql = ""
+        if job_id:
+            filter_sql = "AND j.id = ?"
+            params.append(job_id)
+        row = db.execute(
+            f"""
+            SELECT rj.*, j.status AS job_status
+            FROM run_jobs rj
+            JOIN jobs j ON j.id = rj.job_id
+            WHERE j.status IN ('QUEUED', 'RUNNING')
+              AND j.cancel_requested = 0
+              AND (
+                rj.lease_owner IS NULL
+                OR rj.lease_expires_at IS NULL
+                OR rj.lease_expires_at < ?
+              )
+              {filter_sql}
+            ORDER BY j.created_at ASC
+            LIMIT 1
+            """,
+            [now, *params],
+        ).fetchone()
+        if not row:
+            if job_id:
+                existing = db.execute("SELECT id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if not existing:
+                    raise HTTPException(404, "任务不存在")
+            return {"claimed": False}
+        lease_epoch = int(row["lease_epoch"]) + 1
+        db.execute(
+            """
+            UPDATE run_jobs
+            SET lease_owner = ?, lease_expires_at = ?, lease_epoch = ?, status = 'RUNNING', updated_at = ?
+            WHERE id = ?
+            """,
+            (worker_id, lease_expires_text, lease_epoch, now, row["id"]),
+        )
+        db.execute(
+            "UPDATE job_attempts SET status = 'RUNNING', started_at = ? WHERE run_job_id = ? AND attempt = ?",
+            (now, row["id"], row["attempt"]),
+        )
+        db.execute(
+            "UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE id = ?",
+            (now, row["job_id"]),
+        )
+        db.execute(
+            "UPDATE runs SET status = 'RUNNING', updated_at = ? WHERE id = ?",
+            (now, row["run_id"]),
+        )
+        append_job_event(
+            db,
+            row["job_id"],
+            "worker.claimed",
+            {"worker_id": worker_id, "lease_epoch": lease_epoch, "lease_expires_at": lease_expires_text},
+        )
+        return {
+            "claimed": True,
+            "job_id": row["job_id"],
+            "run_id": row["run_id"],
+            "run_job_id": row["id"],
+            "lease_epoch": lease_epoch,
+            "lease_expires_at": lease_expires_text,
+        }
+
+
+def heartbeat_job(job_id: str, worker_id: str, lease_epoch: int) -> dict:
+    now = utc_now()
+    lease_expires_text = datetime.fromtimestamp(
+        datetime.now(timezone.utc).replace(microsecond=0).timestamp() + LEASE_SECONDS,
+        timezone.utc,
+    ).isoformat()
+    with connect() as db:
+        run_job = require_active_lease(db, job_id, worker_id, lease_epoch)
+        db.execute(
+            "UPDATE run_jobs SET lease_expires_at = ?, updated_at = ? WHERE id = ?",
+            (lease_expires_text, now, run_job["id"]),
+        )
+        append_job_event(
+            db,
+            job_id,
+            "worker.heartbeat",
+            {"worker_id": worker_id, "lease_epoch": lease_epoch, "lease_expires_at": lease_expires_text},
+        )
+    return {"ok": True, "job_id": job_id, "lease_epoch": lease_epoch, "lease_expires_at": lease_expires_text}
+
+
+def complete_leased_job(job_id: str, request: WorkerCompleteRequest) -> dict:
+    with connect() as db:
+        run_job = require_active_lease(db, job_id, request.worker_id, request.lease_epoch)
+    values: dict[str, object] = {"status": "SUCCEEDED", "stage": "ARTIFACT", "progress": 100, "error": None}
+    if request.output_path:
+        values["output_path"] = request.output_path
+    if request.manifest_path:
+        values["manifest_path"] = request.manifest_path
+    update_job(job_id, **values)
     with connect() as db:
         db.execute(
-            f"UPDATE jobs SET {assignments} WHERE id = ?",
-            [*values.values(), job_id],
+            "UPDATE run_jobs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?",
+            (utc_now(), run_job["id"]),
         )
+        append_job_event(
+            db,
+            job_id,
+            "worker.completed",
+            {"worker_id": request.worker_id, "lease_epoch": request.lease_epoch},
+        )
+    return get_job(job_id)
+
+
+def fail_leased_job(job_id: str, request: WorkerFailRequest) -> dict:
+    with connect() as db:
+        run_job = require_active_lease(db, job_id, request.worker_id, request.lease_epoch)
+    update_job(job_id, status="FAILED", stage="FAILED", error=request.error[-4000:])
+    with connect() as db:
+        db.execute(
+            "UPDATE run_jobs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?",
+            (utc_now(), run_job["id"]),
+        )
+        append_job_event(
+            db,
+            job_id,
+            "worker.failed",
+            {"worker_id": request.worker_id, "lease_epoch": request.lease_epoch, "error": request.error[-4000:]},
+        )
+    return get_job(job_id)
+
+
+def release_worker_lease(job_id: str, worker_id: str, lease_epoch: int, event_type: str, payload: dict | None = None) -> None:
+    with connect() as db:
+        run_job = latest_run_job(db, job_id)
+        if not run_job or run_job["lease_owner"] != worker_id or int(run_job["lease_epoch"]) != lease_epoch:
+            return
+        db.execute(
+            "UPDATE run_jobs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?",
+            (utc_now(), run_job["id"]),
+        )
+        event_payload = {"worker_id": worker_id, "lease_epoch": lease_epoch}
+        if payload:
+            event_payload.update(payload)
+        append_job_event(db, job_id, event_type, event_payload)
+
+
+def reconcile_stale_jobs() -> dict:
+    now = utc_now()
+    reconciled: list[str] = []
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT rj.*
+            FROM run_jobs rj
+            JOIN jobs j ON j.id = rj.job_id
+            WHERE j.status = 'RUNNING'
+              AND rj.lease_owner IS NOT NULL
+              AND rj.lease_expires_at IS NOT NULL
+              AND rj.lease_expires_at < ?
+            """,
+            (now,),
+        ).fetchall()
+        for row in rows:
+            db.execute(
+                """
+                UPDATE run_jobs
+                SET lease_owner = NULL, lease_expires_at = NULL, status = 'QUEUED', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, row["id"]),
+            )
+            db.execute("UPDATE jobs SET status = 'QUEUED', updated_at = ? WHERE id = ?", (now, row["job_id"]))
+            db.execute("UPDATE runs SET status = 'QUEUED', updated_at = ? WHERE id = ?", (now, row["run_id"]))
+            append_job_event(
+                db,
+                row["job_id"],
+                "worker.reconciled",
+                {
+                    "previous_worker_id": row["lease_owner"],
+                    "lease_epoch": row["lease_epoch"],
+                    "lease_expires_at": row["lease_expires_at"],
+                },
+            )
+            reconciled.append(row["job_id"])
+    return {"reconciled": len(reconciled), "job_ids": reconciled}
+
+
+def update_job(job_id: str, **values) -> None:
+    if not values:
+        return
+    values["updated_at"] = utc_now()
+    # 同步到 runs 的字段不能包含 error；error 仅用于 jobs / run_jobs / job_attempts
+    run_updates = {k: values[k] for k in values if k in {"status", "stage", "progress"}}
+    run_job_updates = {
+        key: value
+        for key, value in (("status", values.get("status")), ("stage", values.get("stage")), ("error", values.get("error")))
+        if value is not None
+    }
+    status_terminal = {"SUCCEEDED", "FAILED", "CANCELLED"}
+    latest_run_status = None
+    latest_run = None
+    with connect() as db:
+        db.execute("UPDATE jobs SET " + ", ".join(f"{key} = ?" for key in values) + " WHERE id = ?", [*values.values(), job_id])
+        if run_updates:
+            run_assignments = ", ".join(f"{key} = ?" for key in run_updates)
+            row = db.execute(
+                "SELECT run_id FROM run_jobs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if row:
+                latest_run = row["run_id"]
+                latest_run_job = db.execute(
+                    """
+                    SELECT id AS run_job_id, status, attempt
+                    FROM run_jobs
+                    WHERE run_id = ?
+                    ORDER BY created_at DESC, attempt DESC
+                    LIMIT 1
+                    """,
+                    (latest_run,),
+                ).fetchone()
+                latest_run_status = latest_run_job["status"] if latest_run_job else None
+                run_job = db.execute(
+                    """
+                    SELECT rj.id AS run_job_id, rj.attempt
+                    FROM run_jobs rj
+                    WHERE rj.run_id = ?
+                    ORDER BY rj.created_at DESC, rj.attempt DESC
+                    LIMIT 1
+                    """,
+                    (latest_run,),
+                ).fetchone()
+                now = utc_now()
+                db.execute(
+                    f"UPDATE runs SET {run_assignments}, updated_at = ? WHERE id = ?",
+                    [*run_updates.values(), now, latest_run],
+                )
+                if run_job:
+                    if run_job_updates:
+                        db.execute(
+                            "UPDATE run_jobs SET " + ", ".join(f"{key} = ?" for key in run_job_updates) + ", updated_at = ? WHERE id = ?",
+                            [*run_job_updates.values(), now, run_job["run_job_id"]],
+                        )
+                    if "status" in run_updates and run_job:
+                        status = run_updates["status"]
+                        if status == "RUNNING":
+                            db.execute(
+                                "UPDATE job_attempts SET status = ?, completed_at = NULL WHERE run_job_id = ? AND attempt = ?",
+                                ("RUNNING", run_job["run_job_id"], run_job["attempt"]),
+                            )
+                        elif status in status_terminal and latest_run_status not in status_terminal:
+                            db.execute(
+                                "UPDATE job_attempts SET status = ?, error = ?, completed_at = ? WHERE run_job_id = ? AND attempt = ?",
+                                (status, run_updates.get("error"), now, run_job["run_job_id"], run_job["attempt"]),
+                            )
+        if "status" in values and values["status"] in status_terminal and latest_run and latest_run_status not in status_terminal:
+            db.execute(
+                "UPDATE runs SET attempt_count = COALESCE(attempt_count, 0) + 1 WHERE id = ?",
+                (latest_run,),
+            )
+        append_job_event(db, job_id, "job.updated", {key: value for key, value in values.items() if key != "updated_at"})
 
 
 def get_job(job_id: str) -> dict:
@@ -305,6 +1002,63 @@ def get_job(job_id: str) -> dict:
     if not row:
         raise HTTPException(404, "任务不存在")
     return row_to_dict(row)
+
+
+def create_run_record(
+    plan_row: sqlite3.Row,
+    owner_id: str,
+    project_id: str,
+    idempotency_key: str | None,
+    request_hash: str,
+) -> tuple[str, str, bool]:
+    now = utc_now()
+    run_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    with connect() as db:
+        contract = ensure_plan_contract(db, plan_row, owner_id, project_id)
+        asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan_row["product_asset_id"],)).fetchone()
+        if not asset:
+            raise HTTPException(409, "计划绑定的产品素材不存在")
+        if idempotency_key:
+            existing = db.execute(
+                "SELECT id, job_id, request_hash, status FROM runs WHERE idempotency_key = ? AND plan_id = ? ORDER BY created_at DESC LIMIT 1",
+                (idempotency_key, plan_row["id"]),
+            ).fetchone()
+            if existing:
+                if existing["request_hash"] != request_hash:
+                    raise HTTPException(409, "同一 idempotency_key 的计划内容冲突")
+                return existing["id"], existing["job_id"], False
+        db.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, 'QUEUED', 'PREPARE', 0, NULL, NULL, NULL, 0, ?, ?)",
+            (job_id, plan_row["id"], asset["id"], asset["kind"], now, now),
+        )
+        db.execute(
+            "INSERT INTO runs (id, plan_id, plan_contract_id, owner_id, request_hash, idempotency_key, status, stage, progress, job_id, attempt_count, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', 'PREPARE', 0, ?, 1, ?, ?)",
+            (
+                run_id,
+                plan_row["id"],
+                contract["id"],
+                owner_id,
+                request_hash,
+                idempotency_key,
+                job_id,
+                now,
+                now,
+            ),
+        )
+        db.execute(
+            "INSERT INTO run_jobs (id, run_id, job_id, attempt, status, stage, created_at, updated_at, error) "
+            "VALUES (?, ?, ?, 1, 'QUEUED', 'PREPARE', ?, ?, NULL)",
+            (str(uuid.uuid4()), run_id, job_id, now, now),
+        )
+        db.execute(
+            "INSERT INTO job_attempts (id, run_job_id, attempt, status, started_at, completed_at, error, metadata) "
+            "VALUES (?, (SELECT id FROM run_jobs WHERE run_id = ? ORDER BY created_at DESC LIMIT 1), 1, 'CREATED', ?, NULL, NULL, NULL)",
+            (str(uuid.uuid4()), run_id, now),
+        )
+        append_job_event(db, job_id, "job.created", {"run_id": run_id, "plan_id": plan_row["id"]})
+    return run_id, job_id, True
 
 
 def image_base_zoom(focal_length_mm: int) -> float:
@@ -467,8 +1221,10 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_p
     )
     if encode.returncode != 0:
         raise RuntimeError(encode.stderr[-2000:])
-def execute_job(job_id: str) -> None:
+def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
     try:
+        with connect() as db:
+            require_active_lease(db, job_id, worker_id, lease_epoch)
         job = get_job(job_id)
         with connect() as db:
             asset_row = db.execute("SELECT * FROM assets WHERE id = ?", (job["asset_id"],)).fetchone()
@@ -551,9 +1307,27 @@ def execute_job(job_id: str) -> None:
             manifest_path=str(manifest_path),
             error=None,
         )
+        release_worker_lease(job_id, worker_id, lease_epoch, "worker.completed")
     except Exception as exc:
         if get_job(job_id)["status"] != "CANCELLED":
             update_job(job_id, status="FAILED", stage="FAILED", error=str(exc)[-4000:])
+        release_worker_lease(job_id, worker_id, lease_epoch, "worker.failed", {"error": str(exc)[-4000:]})
+
+
+def execute_job(job_id: str) -> None:
+    claim = claim_job("local-background", job_id)
+    if not claim.get("claimed"):
+        return
+    execute_claimed_job(job_id, "local-background", int(claim["lease_epoch"]))
+
+
+def run_worker_once(worker_id: str) -> dict:
+    reconcile_stale_jobs()
+    claim = claim_job(worker_id)
+    if not claim.get("claimed"):
+        return {"claimed": False}
+    execute_claimed_job(claim["job_id"], worker_id, int(claim["lease_epoch"]))
+    return {"claimed": True, "job_id": claim["job_id"], "lease_epoch": claim["lease_epoch"], "status": get_job(claim["job_id"])["status"]}
 
 
 app = FastAPI(title="ProductDirectorAI V1", version="1.0.0")
@@ -690,88 +1464,141 @@ def asset_content(asset_id: str):
 
 @app.post("/api/v1/plans/template", status_code=201)
 def create_plan(request: PlanRequest) -> dict:
+    owner_id, _, project_id = normalize_contract_context(request.owner_id, request.project_id)
+    plan_id = str(uuid.uuid4())
+    created = utc_now()
     with connect() as db:
         asset = db.execute("SELECT * FROM assets WHERE id = ?", (request.product_asset_id,)).fetchone()
-    if not asset:
-        raise HTTPException(404, "产品素材不存在")
-    cameras = ["dolly_in", "side_track", "hero_orbit" if asset["kind"] == "model" else "static"]
-    names = ["正面推近", "侧向观察", "立体环绕展示" if asset["kind"] == "model" else "细节定格"]
-    shots = [
-        Shot(id=f"shot_0{index + 1}", name=names[index], duration_frames=48, camera=cameras[index], focal_length_mm=35)
-        for index in range(3)
-    ]
-    payload = {
+        if not asset:
+            raise HTTPException(404, "产品素材不存在")
+        shots = [
+            Shot(
+                id=f"shot_0{index + 1}",
+                name=["正面推近", "侧向观察", "立体环绕展示" if asset["kind"] == "model" else "细节定格"][index],
+                duration_frames=48,
+                camera=["dolly_in", "side_track", "hero_orbit" if asset["kind"] == "model" else "static"][index],
+                focal_length_mm=35,
+            )
+            for index in range(3)
+        ]
+        payload = {
+            "schema_version": "1.0",
+            "product_asset_id": request.product_asset_id,
+            "intent": request.intent,
+            "output": request.output.model_dump(),
+            "fidelity_mode": "STRICT_REQUESTED",
+            "shots": [shot.model_dump() for shot in shots],
+        }
+        _, payload_sha256 = plan_contract_payload_hash(payload)
+        product_version_id = create_product_version(request.product_asset_id, owner_id, project_id, payload_sha256, db)
+        db.execute(
+            "INSERT INTO plans VALUES (?, ?, ?, ?, 0, ?)",
+            (plan_id, request.product_asset_id, request.intent, json.dumps(payload, ensure_ascii=False), created),
+        )
+        contract = upsert_plan_contract(plan_id, product_version_id, payload, db=db)
+    return {
+        "id": plan_id,
+        "approved": False,
+        "created_at": created,
+        "contract_id": contract["contract_id"],
+        "contract_version": contract["contract_version"],
+        "snapshot_sha256": contract["snapshot_sha256"],
         "schema_version": "1.0",
         "product_asset_id": request.product_asset_id,
         "intent": request.intent,
         "output": request.output.model_dump(),
         "fidelity_mode": "STRICT_REQUESTED",
-        "shots": [shot.model_dump() for shot in shots],
+        "shots": payload["shots"],
     }
-    plan_id = str(uuid.uuid4())
-    created = utc_now()
-    with connect() as db:
-        db.execute(
-            "INSERT INTO plans VALUES (?, ?, ?, ?, 0, ?)",
-            (plan_id, request.product_asset_id, request.intent, json.dumps(payload, ensure_ascii=False), created),
-        )
-    return {"id": plan_id, "approved": False, "created_at": created, **payload}
 
 
 @app.post("/api/v1/plans/{plan_id}/approve")
 def approve_plan(plan_id: str, request: PlanApproval) -> dict:
+    owner_id, _, project_id = normalize_contract_context(request.owner_id, request.project_id)
     with connect() as db:
         current = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
         if not current:
             raise HTTPException(404, "计划不存在")
+        ensure_plan_contract(db, current, owner_id, project_id)
         db.execute("UPDATE plans SET approved = ? WHERE id = ?", (int(request.approved), plan_id))
     return {"id": plan_id, "approved": request.approved}
 
 
 @app.patch("/api/v1/plans/{plan_id}")
 def update_plan(plan_id: str, request: PlanUpdate) -> dict:
+    owner_id, _, project_id = normalize_contract_context(request.owner_id, request.project_id)
     with connect() as db:
         current = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
         if not current:
             raise HTTPException(404, "计划不存在")
+        ensure_plan_contract(db, current, owner_id, project_id)
         payload = json.loads(current["payload"])
         payload["intent"] = request.intent
         payload["shots"] = [shot.model_dump() for shot in request.shots]
-        db.execute(
-            "UPDATE plans SET intent = ?, payload = ?, approved = 0 WHERE id = ?",
-            (request.intent, json.dumps(payload, ensure_ascii=False), plan_id),
+        _, payload_sha256 = plan_contract_payload_hash(payload)
+        contract_version_id = create_product_version(
+            current["product_asset_id"],
+            owner_id,
+            project_id,
+            payload_sha256,
+            db,
         )
-    return {"id": plan_id, "approved": False, "created_at": current["created_at"], **payload}
+        contract = upsert_plan_contract(plan_id, contract_version_id, payload, db=db)
+        ensure_plan_contract(db, current, owner_id, project_id)
+        return_data = {
+            "id": plan_id,
+            "approved": False,
+            "created_at": current["created_at"],
+            "contract_id": contract["contract_id"],
+            "contract_version": contract["contract_version"],
+            "snapshot_sha256": contract["snapshot_sha256"],
+            **payload,
+        }
+    return return_data
 
 
 @app.post("/api/v1/runs", status_code=202)
 def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
+    owner_id, _, project_id = normalize_contract_context(request.owner_id, request.project_id)
     with connect() as db:
         plan = db.execute("SELECT * FROM plans WHERE id = ?", (request.plan_id,)).fetchone()
         if not plan:
             raise HTTPException(404, "计划不存在")
         if not plan["approved"]:
             raise HTTPException(409, "请先确认分镜计划")
-        asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan["product_asset_id"],)).fetchone()
-        if not asset:
-            raise HTTPException(409, "计划绑定的产品素材不存在")
+        plan_snapshot = json.loads(plan["payload"])
         try:
-            plan_snapshot = json.loads(plan["payload"])
             PlanUpdate.model_validate({"intent": plan_snapshot["intent"], "shots": plan_snapshot["shots"]})
         except (KeyError, json.JSONDecodeError, ValueError) as exc:
             raise HTTPException(409, f"计划快照无效，无法启动任务: {exc}") from exc
-        job_id = str(uuid.uuid4())
-        created = utc_now()
-        run_dir = RUNS / job_id
-        run_dir.mkdir(parents=True, exist_ok=False)
-        plan_path = run_dir / "director_plan.json"
-        plan_path.write_text(json.dumps(plan_snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        db.execute(
-            "INSERT INTO jobs VALUES (?, ?, ?, ?, 'QUEUED', 'PREPARE', 0, NULL, NULL, NULL, 0, ?, ?)",
-            (job_id, request.plan_id, asset["id"], asset["kind"], created, created),
+        asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan["product_asset_id"],)).fetchone()
+        if not asset:
+            raise HTTPException(409, "计划绑定的产品素材不存在")
+        run_hash = plan_contract_payload_hash(json.loads(plan["payload"]))[1]
+        run_id, job_id, created_new = create_run_record(
+            plan,
+            owner_id,
+            project_id,
+            request.idempotency_key,
+            run_hash,
         )
-    background.add_task(execute_job, job_id)
-    return {"job_id": job_id, "status": "QUEUED", "status_url": f"/api/v1/jobs/{job_id}"}
+        if created_new:
+            run_dir = RUNS / job_id
+            run_dir.mkdir(parents=True, exist_ok=False)
+            (run_dir / "director_plan.json").write_text(
+                json.dumps(plan_snapshot, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    if created_new:
+        background.add_task(execute_job, job_id)
+    return {
+        "job_id": job_id,
+        "run_id": run_id,
+        "status": "QUEUED",
+        "status_url": f"/api/v1/jobs/{job_id}",
+        "reused_idempotent": not created_new,
+        "created": created_new,
+    }
 
 
 @app.get("/api/v1/jobs")
@@ -799,6 +1626,67 @@ def cancel_job(job_id: str) -> dict:
     return get_job(job_id)
 
 
+@app.post("/internal/v1/workers/claim")
+def worker_claim(request: WorkerClaimRequest) -> dict:
+    return claim_job(request.worker_id, request.job_id)
+
+
+@app.post("/internal/v1/workers/reconcile")
+def worker_reconcile() -> dict:
+    return reconcile_stale_jobs()
+
+
+@app.post("/internal/v1/workers/jobs/{job_id}/heartbeat")
+def worker_heartbeat(job_id: str, request: WorkerLeaseRequest) -> dict:
+    return heartbeat_job(job_id, request.worker_id, request.lease_epoch)
+
+
+@app.post("/internal/v1/workers/jobs/{job_id}/complete")
+def worker_complete(job_id: str, request: WorkerCompleteRequest) -> dict:
+    return complete_leased_job(job_id, request)
+
+
+@app.post("/internal/v1/workers/jobs/{job_id}/fail")
+def worker_fail(job_id: str, request: WorkerFailRequest) -> dict:
+    return fail_leased_job(job_id, request)
+
+
+@app.get("/api/v1/jobs/{job_id}/events")
+def job_events(job_id: str, last_event_id: str | None = Header(default=None, alias="Last-Event-ID")):
+    get_job(job_id)
+    try:
+        after_sequence = int(last_event_id) if last_event_id else 0
+    except ValueError:
+        after_sequence = 0
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT *
+            FROM job_events
+            WHERE job_id = ? AND sequence > ?
+            ORDER BY sequence ASC
+            """,
+            (job_id, after_sequence),
+        ).fetchall()
+
+    def stream():
+        for row in rows:
+            payload = {
+                "event_id": row["sequence"],
+                "job_id": row["job_id"],
+                "sequence": row["sequence"],
+                "event_type": row["event_type"],
+                "state": row["status"],
+                "stage": row["stage"],
+                "progress": row["progress"],
+                "occurred_at": row["created_at"],
+                "payload": json.loads(row["payload"]),
+            }
+            yield f"id: {row['sequence']}\nevent: {row['event_type']}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
 @app.get("/api/v1/jobs/{job_id}/video")
 def job_video(job_id: str):
     job = get_job(job_id)
@@ -813,3 +1701,26 @@ def job_manifest(job_id: str):
     if job["status"] != "SUCCEEDED" or not job["manifest_path"]:
         raise HTTPException(409, "清单尚未准备完成")
     return FileResponse(job["manifest_path"], media_type="application/json", filename=f"metadata-{job_id}.json")
+
+
+def main_cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="productdirector-api")
+    subparsers = parser.add_subparsers(dest="command")
+    worker_parser = subparsers.add_parser("worker")
+    worker_parser.add_argument("--worker-id", default=f"worker-{os.getpid()}")
+    worker_parser.add_argument("--once", action="store_true")
+    worker_parser.add_argument("--poll-seconds", type=float, default=2.0)
+    args = parser.parse_args(argv)
+    if args.command != "worker":
+        parser.print_help()
+        return 2
+    while True:
+        result = run_worker_once(args.worker_id)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        if args.once:
+            return 0
+        time.sleep(max(0.1, args.poll_seconds))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main_cli(sys.argv[1:]))

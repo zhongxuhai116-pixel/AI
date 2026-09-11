@@ -2,6 +2,32 @@
 
 ## 2026-09-11
 
+- A04 第一段验收：新增 Worker 租约/事件恢复基线，并保持原有 BackgroundTasks 兼容入口。
+  - 数据库新增/迁移：`run_jobs.lease_owner`、`run_jobs.lease_expires_at`、`run_jobs.lease_epoch`、`job_events`。
+  - 内部接口新增：`/internal/v1/workers/claim`、`/heartbeat`、`/complete`、`/fail`；公开事件接口新增 `/api/v1/jobs/{job_id}/events`，支持 `Last-Event-ID`。
+  - 修复 Run 创建链路，确保 `jobs` 与 `runs/run_jobs/job_attempts` 同步创建，不只返回 job_id。
+  - 新增测试：旧租约 epoch 完成回报被 409 拒绝，租约过期后新 worker 可重新领取；事件流可续读。后端 `compileall` 通过，`unittest discover` 14/14 通过。
+  - 前端 build 与 Sites worker 测试仍因本机 `npm` 不存在而无法执行，未记为通过。
+- A04 完整验收补齐：新增独立 worker 命令入口、过期 RUNNING 租约对账和 worker-once 执行测试。
+  - 命令入口：`python -m productdirector_api.main worker --once --worker-id <id>`；本机冒烟输出 `{"claimed": false}`。
+  - 对账接口：`POST /internal/v1/workers/reconcile`，可将过期租约的 RUNNING 任务恢复为 QUEUED。
+  - 新增测试：`test_a04_reconcile_requeues_expired_running_job`、`test_a04_worker_once_executes_claimed_job`；后端 `compileall` 通过，`unittest discover` 16/16 通过。
+  - 当前阶段推进到 A05；真实 Blender/FFmpeg 长任务的“杀 worker 后自动重领并完成”仍需在具备工具链的云端实测。
+- A02/A03 完整验收：在本地 `.venv` 环境下执行 `python -m unittest discover -s tests -p 'test_*.py'`（12/12 通过）。重点回归结果：
+  - A02：更新计划会新建并返回新合同版本，历史版本不被覆盖；`test_a02_contract_version_is_immutable_on_plan_update` 通。
+  - A03：同一 `idempotency_key` 与相同请求哈希会复用同一 `run_id/job_id`；同键变更内容会返回 409；跨项目上下文越权请求返回 403。
+  - 修正 `update_job` 里的 `run_jobs` 状态同步列映射：`progress` 不再写入 `run_jobs`（该表无该列），保证 `runs/create_job` 统一状态更新链路稳定。
+- 新增验收记录：`docs/reports/A02_A03_ACCEPTANCE.md`（含三条核心用例结论与下一步入口）。
+- A01 完整验收补测（本轮）：在 `work/github-document-sync/ProductDirectorAI` 使用 `pwsh` 执行本机基线复核与 API 健康核验。
+  - `python` 依赖与 `compileall` 通过；
+  - `PYTHONPATH=apps/api` 下 `uvicorn productdirector_api.main:app --port 18080` 后，`/api/v1/health` 返回 `status=ok`，但返回中 `ffmpeg/ffprobe available=false`。
+  - `npm`、`npx` 均未检测到，前端 `npm run build` 与 `npm run test:sites` 未执行，A01-03 的前端复核仍 BLOCKED。
+  - 脚本 `scripts/check-a01-env.ps1` 已重建并可由 `pwsh` 正常执行（`powershell.exe`（WinPS 5.1）存在解析兼容问题，建议统一使用 `pwsh`）。
+
+- 规划交付：新增 `V6_ACCELERATION_PLAN.md` 并加入文档入口。用户再次确认云端已安装 MiniMax H3；按“已安装、待项目接入”规划 V2，保留原主规格中的其他必需 Provider 验收。V1 拆为 A01–A07 七个收尾工作包，V6 保持 A/B/C 三个门；本次不改代码、不改变阶段通过状态、不执行模型安装或真实数据迁移。
+- A01 基线启动：新增 `docs/reports/A01_ENVIRONMENT_BASELINE.md`（环境版本、构建复核、云端基线、记录约束），并将 `CURRENT_PHASE.md` 更新为“开始 A01”。本次仅进行文档层可复现基线，不启动代码/数据迁移；后续将以该文档作为 A01 的验收输入。
+- A01 基线复核：本地完成环境最小检查（`.\.venv\Scripts\python.exe --version`=Python 3.12.14、requirements 安装通过、`compileall` 成功），确认 `node` 可运行但 `npm` 不在 PATH，`blender`/`ffmpeg`/`ffprobe` 未找到，且未发现 `apps/web/package-lock.json`，`node_modules` 为空；已将阻塞项写入 `A01_ENVIRONMENT_BASELINE.md`，作为下一步修复输入。
+- A01 自动化：新增 `scripts/check-a01-env.ps1`，用于一键输出基线快照并回写 `docs/reports/A01_ENVIRONMENT_BASELINE.md`（含 Python 版本、依赖安装、compileall、工具可见性、npm 构建/测试状态）。本次仍未完成 A01-03 的 full build/test，因为本机缺少 `npm`、`blender`/`ffmpeg` 命令可见性。
 - V1-06 PASS：后端 `PlanRequest` 支持 `output` 规格（540×960 / 1080×1920）、执行期按快照输出规格校验宽高/帧率/帧数；前端导演台新增输出分辨率选择；`tests/test_director_plan.py` 增加 1080 兼容构建用例。已补齐云端回归与现网验收。
 - V1-06b PASS（本地验收）：补充 `OutputSpec` 与输出规格链路的单测覆盖，`python -m unittest tests/test_director_plan.py` 通过（9/9）；新增失败边界覆盖（`duration_seconds` 与 `output.duration_seconds` 不一致、非 9:16 输出会被拒绝、`ffprobe` 帧率字段非标准格式容错）；修复测试环境下 `ffmpeg.exe` 路径扫描权限导致的导入中断（WinGet 目录 OSError 兜底）。  
   - 本地限制：当前工作站未检测到 `npm` 命令，无法在本地完成前端 build 与 Sites worker 测试；需在具备 Node/NPM 的环境补跑 build（`apps/web`）与后续 worker 回归测试。

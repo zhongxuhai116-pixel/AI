@@ -14,6 +14,10 @@
 | 文件 | 用途与状态 |
 | --- | --- |
 | [完整 V1–V6 规划](../ProductDirectorAI_V1-V6_Codex_Development_Plan.md) | 唯一主规格；用户已授权逐阶段推进到 V6 |
+| [V1 → V6 加速执行计划](V6_ACCELERATION_PLAN.md) | 复用云端已安装 H3；七个 V1 收尾工作包、阶段依赖、验收和 GitHub 记录方式 |
+| [A01 环境与记录基线](reports/A01_ENVIRONMENT_BASELINE.md) | V1 收尾第一包：环境版本、构建复核、云端基线记录与变更约束 |
+| [A02 / A03 验收](reports/A02_A03_ACCEPTANCE.md) | 合同不可变与幂等/重入访问验收记录 |
+| [A04 验收](reports/A04_ACCEPTANCE.md) | Worker 租约、事件恢复与旧 epoch 拒绝的第一段验收记录 |
 | [执行指令](../CODEX_SOL56_START_HERE.md) | 给下一台电脑上的 Codex/SOL 5.6；先审计、复验、保留已有代码 |
 | [工程约束](../AGENTS.md) | 版本、安全、测试与用户工作保护 |
 | [项目 README](../README.md) | 当前项目和本机启动入口 |
