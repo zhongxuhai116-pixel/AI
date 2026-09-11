@@ -38,7 +38,7 @@
 - V1 是单机单用户原型，不提供账号、权限、云同步和多人协作。
 - 任务执行器为本机后台任务，不是跨进程可靠队列；服务重启时正在运行的任务需要重新提交。
 - 图片预演为二维推近/平移；真实 3D 运动要求 GLB。
-- Blender V1 使用统一工作室灯光和固定三段镜头，尚未让 MiniMax 参与 DirectorPlan，也未接入 ComfyUI。
+- 历史本机验收时 Blender V1 使用统一工作室灯光和固定三段镜头；2026-09-11 云端已补充相机/焦距/时长语义验收，见 `V1_DIRECTORPLAN_ACCEPTANCE.md`。MiniMax 尚未参与 DirectorPlan，ComfyUI 尚未接入 ProductDirectorAI。
 - MiniMax 当前 Token Plan 需要补充额度后才能通过文本生成测试。
 - 大型复杂 GLB 的材质兼容性和渲染耗时需用用户真实模型继续验证。
 

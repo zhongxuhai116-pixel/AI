@@ -6,7 +6,7 @@
 
 > 执行原则：一次只实施一个已授权版本。每期完成代码、迁移、测试、真实链路验证和验收报告后停止。下一期由产品负责人明确解锁。不能把模拟输出、静态界面、被跳过的测试或降级预览当作完整验收通过。
 
-> 当前状态提示：V1 本机核心已有原型实现和历史技术证据，但完整 V1 仍为 PARTIAL；用户真实素材和新电脑尚未复验，目标合同与当前 JSX + SQLite + FastAPI BackgroundTasks 原型存在差距。V2–V6 未授权。先读 `docs/HANDOFF_NEW_COMPUTER.md`、`docs/CURRENT_PHASE.md`、`docs/V1_IMPLEMENTATION_GAPS.md` 和 `docs/CLOUD_SERVER_HANDOFF.md`。
+> 当前状态提示：V1 新云节点安装、GPU 渲染和通用 GLB 全链路已 PASS，但完整 V1 仍为 PARTIAL；目标合同与当前 JSX + SQLite + FastAPI BackgroundTasks 原型存在差距。用户已授权逐阶段继续到 V6，但每期必须先验收。先读 `docs/HANDOFF_NEW_COMPUTER.md`、`docs/CURRENT_PHASE.md`、`docs/V1_IMPLEMENTATION_GAPS.md` 和 `docs/CLOUD_SERVER_HANDOFF.md`。
 
 ## 目录
 
@@ -507,7 +507,7 @@ MiniMax 的生成视频不自动拥有 Blender 的深度、产品 Mask 或精确
 
 ### 6.9 云 GPU 基准选型（2026-09-10）
 
-最新已购事实覆盖下方购买前候选：实际节点为优云智算华北二 A、RTX 4090 24GB、16 核/94GB、Ubuntu 22.04.4；300G 磁盘的根分区已扩容，云端 Blender/FFmpeg/ProductDirectorAI 尚未部署。RTX 5090 只是购买前候选，不能写成真实已购配置。详见云交接记录。
+最新新节点事实覆盖下方购买前候选与旧节点记录：实际节点为优云智算华北二 A、RTX 4090 24GB、16 核/94GB、Ubuntu 22.04.4、约 97GB 根分区；Blender 5.2.1、FFmpeg 4.4.2、Node 22.23.2 与 ProductDirectorAI 已部署并通过 V1 通用 GLB 全链路。旧节点 300G/291G 扩容记录不适用于当前节点。RTX 5090 只是购买前候选，不能写成真实已购配置。详见云交接记录。
 
 ProductDirectorAI 当前采用“优云智算主平台、AutoDL 开发/备用”的多 Provider 策略，详见 [`docs/GPU_CLOUD_SELECTION.md`](docs/GPU_CLOUD_SELECTION.md)。这是一份可复核的选型快照，不是自动购买授权，也不把任何价格永久写死在领域逻辑中。
 

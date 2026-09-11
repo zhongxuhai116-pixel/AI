@@ -1,84 +1,63 @@
-# 云服务器交接与连接排查
+# 云服务器交接
 
-记录日期：2026-09-10。此文只保存脱敏事实，不包含公网/内网地址、实例 ID、账号、密码、访问令牌或客户端公网 IP。新电脑从用户登录的优云控制台重新取得当前 SSH 地址。
+更新日期：2026-09-11。本文只保存脱敏事实，不包含公网/内网地址、实例 ID、账号、密码、访问令牌、客户端公网 IP 或私钥。
 
-## 1. 范围与状态
+## 当前新节点
 
-用户已购买优云智算 GPU 实例，并授权把 Blender 部署到该节点。
-本轮最新请求为“先整理文档上传 GitHub，换一台电脑”，因此部署暂停在交接点；不是取消既有授权，也不是已完成部署。
-仍禁止自动购买、充值、扩容、开放额外公网服务或自动启停收费资源。
-
-| 项目 | 最新证据 | 状态 |
+| 项目 | 已验证事实 | 状态 |
 | --- | --- | --- |
-| 供应商/地域 | 用户控制台截图：优云智算，华北二 A，Ubuntu-nvidia 22.04 虚机 | 已观察 |
-| GPU | 网页终端 nvidia-smi：GeForce RTX 4090，24564 MiB | 已观察；不是购买前候选 5090/48GB 改装卡 |
-| 驱动 | 570.153.02；nvidia-smi 显示 CUDA 12.8 | 驱动能力上限显示，不证明 CUDA Toolkit/PyTorch 已安装 |
-| CPU/内存 | 控制台：16 核、94GB | 截图快照 |
-| 系统 | Ubuntu 22.04.4 LTS，内核 5.15.0-113-generic | 登录提示快照 |
-| 磁盘 | vda 300G，根分区 vda1 ext4；df 显示 291G，总可用 277G、已用 14G | 扩容完成，不再重复扩容 |
-| 网页 SSH | 用户进入 Ubuntu 提示符 | 成功；不是执行代理已接管 |
-| 公网 SSH | 本电脑多次连接端口 22 超时，未进入凭证验证 | BLOCKED |
-| 浏览器控制 | 多轮请求失败，无法读取真实标签页 | BLOCKED，与网页登录成功不是同一能力 |
-| Blender/FFmpeg | command -v 均无输出 | 当前 PATH 未找到；尚不能声称云端安装完成 |
-| ProductDirectorAI/ComfyUI 云部署 | 未完成上传安装、服务部署和真实任务验证 | NOT_DEPLOYED |
-| 计算/磁盘费用 | 截图分别为 2.35 元/小时与 0.10 元/小时 | 历史快照，账单以控制台为准；未替用户关机 |
+| 平台/地域 | 优云智算，华北二 A，Ubuntu-nvidia 22.04 | PASS |
+| 计算 | 16 核、94GB、GeForce RTX 4090 24564 MiB | PASS |
+| 驱动 | 570.153.02；nvidia-smi 显示 CUDA 12.8 驱动能力 | PASS；不等同于 Toolkit/PyTorch |
+| 系统盘 | ext4 根分区约 97GB；最近检查可用约 19GB | 注意：现有 H3/ComfyUI 模型约 46GB，不再下载额外模型 |
+| 公网 SSH | 专用 ED25519 密钥直连；服务器指纹先由网页终端核对 | PASS |
+| Blender | 官方 Blender 5.2.1 LTS，`/usr/local/bin/blender` | PASS |
+| FFmpeg | Ubuntu FFmpeg/ffprobe 4.4.2，`/usr/bin` | PASS |
+| Node | 官方 Node.js 22.23.2，`/opt/productdirector/node` | PASS |
+| 项目 | GitHub commit `68532ec554c9f952907bc004bd4da176e65ceed3` | PASS |
+| 服务 | API `localhost:8000`；Web `localhost:4173`；systemd enabled/active | PASS；未公网暴露 |
 
-图中的余额和价格会变。换电脑不会自动停止云实例计费。关机、快照、回收规则及额外费用由用户在控制台确认；此文不授权自动关机或创建收费快照。
+旧节点曾完成约 291GB 根分区扩容，但该事实不得套用到当前新节点。当前节点禁止重复执行旧 growpart/resize2fs 记录，也不要在未核对云盘配置前格式化、重分区或假设已有 300GB。
 
-## 2. 已执行的磁盘操作（历史记录，禁止当作安装脚本重跑）
+## V1 云验收
 
-1. 原 vda 300G，但 vda1 约 99.9G，df 根文件系统约 97G。
-2. 确认 ext4，growpart 位于 /usr/bin/growpart。
-3. growpart dry-run 显示 vda1 起始扇区保持不变、仅尾部扩大；vda14/vda15 不变。
-4. 用户在网页终端完成 growpart 和 resize2fs 在线扩容。
-5. df -h / 显示 /dev/vda1 为 291G、可用 277G。终端结果显示文件系统为 78614779 个 4K 块。
-
-新执行者只读复核 df/lsblk 即可。不要格式化、删除分区、重新分区或重复猜测容量不足。
-
-## 3. SSH 排查证据链
-
-- SSH 服务监听 0.0.0.0:22 与 [::]:22；不是仅监听 localhost。
-- UFW 命令不存在；没有为排查安装或启用 UFW。
-- iptables -S 的 filter 表只有 INPUT/FORWARD/OUTPUT 默认 ACCEPT。
-- 以上没有排除所有 nftables、其他表、出口网络或平台层限制。
-- 用户确认实例选择的是 Ubuntu-22.04-nvidia 防火墙；与展示的规则对应。
-- TCP 22 已允许当时客户端直连公网地址 /32；客户端后来复核该地址未变。
-- 其他历史规则为 TCP 23、21、3389、80、443 和 ICMP，均来源 0.0.0.0/0。它们不是 Blender 的必需开放项；未擅自删除。用户应确认业务用途后收敛，不能为了 SSH 再开放全部端口。
-- 服务器运行最长 120 秒的 tcpdump，只显示 TCP 22 SYN 握手摘要；执行代理在用户报告 listening 后发起 SSH，仍超时；随后截图未显示匹配握手行。
-- 结论限定：观察窗口内未观察到本次请求；优先排查客户端出口/链路/云端公网入口，不能据此断言云平台故障或密码错误。未保存完整计时抓包文件，也没有平台侧日志。
-- 本机启用了 Clash 系统代理，曾在全局/规则模式间调整；直接 SSH 未配置 ProxyCommand。HTTP 查询的出口 IP 不必然等于所有 TCP 流量的出口；新电脑必须重新验证，不照抄旧 /32。
-- 曾经通过本地 HTTP 代理建立 CONNECT 通道，但没有收到 SSH banner；HTTP 200 不等于 SSH 已连接。
-
-## 4. 新电脑恢复连接顺序
-
-1. 用户自己登录官方控制台，确认实例运行、当前公网 IP/SSH 用户/端口。不要把含密码的截图或登录 URL 查询令牌提交 Git。
-2. 先用常规 SSH 做一次短连接测试；首次连接从可信控制台核验主机指纹，禁止关闭 host key 校验。
-3. 新电脑公网出口可能变化。核对云防火墙来源 /32 是否匹配实际 SSH 出口；新增或更改访问权限前说明具体影响并取得用户确认。
-4. 如果仍超时，不重装系统、不禁用防火墙、不猜密码；保留网页终端作为用户可用路径。
-5. 如需再次 tcpdump，将监听窗口与客户端试连时间对齐；记录脱敏时间、结果、SYN 是否出现及是否返回 SYN-ACK。
-6. 将下面模板交给平台支持，并由用户在私密工单中补充地址/ID。不要自动提交工单或在公开 GitHub issue 中放网络信息。
-7. 连接成功后再做只读环境核验和云端最小渲染，不把 SSH 成功当作部署完成。
-
-## 5. 给平台支持的脱敏模板
-
-请协助排查实例 <INSTANCE_ID> 公网 SSH 超时。目标 <CLOUD_HOST>:<SSH_PORT>，客户端实际出口 <CLIENT_PUBLIC_IP>。实例绑定的云防火墙允许该来源 /32 访问 TCP 22；sshd 监听所有 IPv4/IPv6 地址的 22 端口；iptables filter 表为默认 ACCEPT。平台网页 SSH 正常，但公网 SSH 在认证前超时。配合试连时，服务器 tcpdump 未观察到对应握手。请核查公网映射、防火墙实际下发状态、额外 ACL/安全策略，并告知是否存在平台特定接入限制。请不要重装或释放实例。
-
-## 6. 恢复后部署任务（待执行）
-
-| 任务 | 内容 | 退出证据 |
+| 门 | 退出证据 | 结果 |
 | --- | --- | --- |
-| CLOUD-01 | 确认实际 GPU、磁盘、OS、权限、程序路径 | 脱敏环境报告 |
-| CLOUD-02 | 从官方源安装并锁定实际可用 Blender/FFmpeg/ffprobe | 版本与依赖检查，不根据旧文档虚构版本 |
-| CLOUD-03 | 先上传许可明确的通用 GLB 与渲染脚本，完成最小帧测试 | 可解码图片；失败返回码、日志 |
-| CLOUD-04 | 处理当前脚本的 EEVEE/headless 驱动和版本兼容 | GPU 真实渲染证据；不是 nvidia-smi 识别即通过 |
-| CLOUD-05 | 按一致规格完成 144 帧、24fps、6 秒 MP4 | ffprobe、实际播放、Manifest 和素材哈希 |
-| CLOUD-06 | 设计并实现受限远程 Renderer/Worker 接口与持久存储 | 不引用旧电脑绝对路径，鉴权/取消/失败恢复测试 |
-| CLOUD-07 | 新旧节点对照及 3 次真实任务 | CLOUD_GPU_ACCEPTANCE 报告、费用/时长、回滚办法 |
+| CLOUD-01 环境 | OS、GPU、驱动、CPU/内存、磁盘、sudo | PASS |
+| CLOUD-02 运行时 | Blender/Node 官方校验；FFmpeg/ffprobe 版本 | PASS |
+| CLOUD-03 最小渲染 | 通用 GLB 可解码 PNG | PASS |
+| CLOUD-04 GPU 证据 | 12 帧期间 21 次采样；峰值 GPU 61%、显存 1114 MiB | PASS |
+| CLOUD-05 全链路 | API 上传→计划→批准→运行→H.264/Manifest | PASS |
+| CLOUD-05b 计划语义 | 冻结 DirectorPlan → Blender 关键帧 → 成片/Manifest/scene.blend 复核 | PASS |
+| CLOUD-06 受限远程 Worker | 当前仅 localhost 服务，无远程鉴权/调度 | NOT_STARTED |
+| CLOUD-07 生产级对照 | 3 次真实任务、成本/恢复/回滚 | NOT_STARTED |
 
-当前渲染脚本固定使用 BLENDER_EEVEE，并没有 Cycles CUDA/OptiX 设备配置。不得在文档里把未实测的 RTX 4090 GPU 加速宣称已启用。
-不要直接公开当前无登录鉴权的 FastAPI 或 Vite 服务；使用已授权的受限隧道或先实现鉴权，ComfyUI 不属于本次 V1 部署前置条件。
+完整全链路产物：540×960、24fps、144 帧、6.000 秒、H.264。视频 SHA-256：`fadc6f3b41579289c1a81089554bd47df6d7b13d12a3d76fbf4ac026515baef7`。该结果证明 V1 通用 GLB 基础链路，不证明 1080×1920、用户真实素材、可靠远程 Worker 或完整 V1 产品验收。
 
-## 7. 凭证与隐私
+计划语义复验使用同一通用 GLB：24 帧 85mm 定格、72 帧 24mm 侧向移动、48 帧 55mm 环绕。导出视频仍为 540×960、24fps、144 帧、6 秒；Manifest 保存冻结计划与 SHA-256。该作业的具体标识、地址和运行目录不进入 Git；可复验步骤见 `docs/reports/V1_DIRECTORPLAN_ACCEPTANCE.md`。
 
-用户曾在聊天中提供密钥和服务器密码。本仓库/交付包不复制它们。建议用户在平台内轮换；轮换时由用户操作，执行者不得从截图/聊天搬运秘密到文档、命令历史或 Git。旧 Windows DPAPI 数据库不能直接当作 Linux 凭证存储。
+## 服务与恢复
 
+- API：`productdirector-v1-api.service`
+- Web：`productdirector-v1-web.service`
+- 项目：`/home/ubuntu/AI/ProductDirectorAI`
+- Python 环境：`/home/ubuntu/AI/ProductDirectorAI/.venv`
+- 运行数据：`/home/ubuntu/AI/ProductDirectorAI/var`
+
+只读检查：`systemctl status productdirector-v1-api productdirector-v1-web`、`curl http://localhost:8000/api/v1/health`、`curl -I http://localhost:4173`。服务当前没有完整身份/权限层，不得直接改为所有网卡监听或开放云防火墙。需要远程访问时先实现鉴权或经用户明确授权配置受限隧道。
+
+## MiniMax H3 决策
+
+V2 首选 MiniMax H3 开放权重路线。它采用 [MiniMax H3 Community License](https://github.com/MiniMax-AI/MiniMax-H3)，准确说是开放权重而非默认等同 OSI 开源。官方完整 BF16 FL2VA 权重目录约 144GB，官方 SGLang 同时提供四卡基线和单张 RTX 4090 的量化/卸载路径。当前节点已经存在一套独立的 ComfyUI 单卡量化环境，含 Ref2VA、量化文本编码器、VAE 与 Turbo LoRA，并有可解码 H.264 试验产物；该环境尚未接入 ProductDirectorAI，也不作为 V2 通过证据。当前根盘只剩约 19GB，因此：
+
+1. 不在当前节点下载官方完整 BF16 权重或重复下载现有单卡模型。
+2. V2 先实现 Provider、任务合同、状态/失败处理与可替换适配器。
+3. 真实集成优先复用现有单卡量化环境，先完成最小输入/输出、失败与成本证据；更高画质/完整 BF16 再评估多卡大盘节点。
+4. 不把 H3 Context-IR、Regenerate-2K、未接入的量化工作流或独立 ComfyUI 试验标成 ProductDirectorAI 已支持。
+
+## 安全边界
+
+- 不自动购买、充值、扩容、开放公网服务、关机或删除实例。
+- SSH 私钥只保存在本地隔离目录，不提交 Git；仓库只记录脱敏指纹核验流程，不记录指纹值、地址或用户名。
+- 不将 API key、token、cookie、密码或旧 Windows DPAPI 数据写入 Linux 明文文件、日志、Manifest 或 Git。
+- 真实用户产品、第三方模型权重和运行目录 `var/` 不提交仓库。

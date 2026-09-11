@@ -21,7 +21,7 @@ from typing import Literal
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -155,6 +155,12 @@ class PlanApproval(BaseModel):
 class PlanUpdate(BaseModel):
     intent: str = Field(min_length=1, max_length=4000)
     shots: list[Shot] = Field(min_length=3, max_length=3)
+
+    @model_validator(mode="after")
+    def validate_total_duration(self):
+        if sum(shot.duration_frames for shot in self.shots) != 144:
+            raise ValueError("三个镜头的总时长必须恰好为 144 帧（6 秒）")
+        return self
 
 
 class RunRequest(BaseModel):
@@ -297,7 +303,7 @@ def render_image_job(job_id: str, asset: dict, output: Path) -> None:
         raise RuntimeError(stderr.decode("utf-8", errors="replace")[-2000:])
 
 
-def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path) -> None:
+def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_path: Path) -> None:
     if not BLENDER:
         raise RuntimeError("Blender 未安装或未找到")
     if not FFMPEG:
@@ -314,6 +320,7 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path) -> Non
         "--width", "540",
         "--height", "960",
         "--frames", "144",
+        "--plan", str(plan_path),
     ]
     update_job(job_id, status="RUNNING", stage="RENDER", progress=12)
     with process_lock:
@@ -363,12 +370,16 @@ def execute_job(job_id: str) -> None:
         if not asset_row or not plan_row:
             raise RuntimeError("任务输入不存在")
         asset = row_to_dict(asset_row)
-        plan = row_to_dict(plan_row)
         run_dir = RUNS / job_id
-        run_dir.mkdir(parents=True, exist_ok=True)
+        plan_path = run_dir / "director_plan.json"
+        try:
+            plan_snapshot_bytes = plan_path.read_bytes()
+            plan_snapshot = json.loads(plan_snapshot_bytes)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"任务缺少有效的 DirectorPlan 快照: {exc}") from exc
         output = run_dir / "preview.mp4"
         if asset["kind"] == "model":
-            render_glb_job(job_id, asset, run_dir, output)
+            render_glb_job(job_id, asset, run_dir, output, plan_path)
         else:
             render_image_job(job_id, asset, output)
         if get_job(job_id)["status"] == "CANCELLED":
@@ -397,7 +408,7 @@ def execute_job(job_id: str) -> None:
         manifest = {
             "schema_version": "1.0",
             "job_id": job_id,
-            "plan_id": plan["id"],
+            "plan_id": job["plan_id"],
             "asset_id": asset["id"],
             "asset_sha256": asset["sha256"],
             "preview_kind": "BLENDER_3D" if asset["kind"] == "model" else "IMAGE_2D",
@@ -407,7 +418,8 @@ def execute_job(job_id: str) -> None:
             "frame_count": 144,
             "duration_seconds": 6,
             "ffprobe": {"duration": duration, "video_stream": stream},
-            "director_plan": json.loads(plan["payload"]),
+            "director_plan": plan_snapshot,
+            "director_plan_snapshot_sha256": hashlib.sha256(plan_snapshot_bytes).hexdigest(),
             "blender": BLENDER,
             "ffmpeg": FFMPEG,
             "created_at": utc_now(),
@@ -627,8 +639,17 @@ def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
         asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan["product_asset_id"],)).fetchone()
         if not asset:
             raise HTTPException(409, "计划绑定的产品素材不存在")
+        try:
+            plan_snapshot = json.loads(plan["payload"])
+            PlanUpdate.model_validate({"intent": plan_snapshot["intent"], "shots": plan_snapshot["shots"]})
+        except (KeyError, json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(409, f"计划快照无效，无法启动任务: {exc}") from exc
         job_id = str(uuid.uuid4())
         created = utc_now()
+        run_dir = RUNS / job_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        plan_path = run_dir / "director_plan.json"
+        plan_path.write_text(json.dumps(plan_snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         db.execute(
             "INSERT INTO jobs VALUES (?, ?, ?, ?, 'QUEUED', 'PREPARE', 0, NULL, NULL, NULL, 0, ?, ?)",
             (job_id, request.plan_id, asset["id"], asset["kind"], created, created),

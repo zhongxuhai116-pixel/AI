@@ -1,5 +1,19 @@
 # V1 执行记录
 
+## 2026-09-11
+
+- 新优云智算节点公网 SSH 已通过专用 ED25519 密钥连接；首次连接前从网页终端核对服务器 ED25519 指纹。仓库和文档不保存地址、实例 ID、密码或私钥。
+- CLOUD-01 PASS：Ubuntu 22.04.4、RTX 4090 24564 MiB、驱动 570.153.02、16 核/94GB；新节点根分区约 97GB，不能沿用旧节点“291GB 已扩容”的结论。
+- CLOUD-02 PASS：安装官方 Blender 5.2.1 LTS、官方 Node.js 22.23.2、Ubuntu FFmpeg/ffprobe 4.4.2；Blender 与 Node 下载均完成官方 SHA-256 校验。
+- CLOUD-03/04 PASS：Blender 5.2.1 headless 生成 12 帧，独立 nvidia-smi 采样记录 GPU 峰值 61%、显存 1114 MiB；不再仅凭“能看到 4090”宣称 GPU 生效。
+- CLOUD-05 PASS：通过真实 API 上传通用 GLB、创建/批准计划、启动任务并完成 Blender + FFmpeg 全链路。产物为 H.264、540×960、24fps、144 帧、6.000 秒；视频 SHA-256 为 `fadc6f3b41579289c1a81089554bd47df6d7b13d12a3d76fbf4ac026515baef7`。
+- API 与 Vite Preview 通过 systemd 启用，仅监听 `localhost` 的 8000/4173 端口；未新增公网端口，也没有把无鉴权服务直接暴露到互联网。
+- 云端复验：Python compileall、Vite build、Sites worker 测试 4/4 通过。`npm ci` 因仓库 lockfile 与 package.json 不同步失败，临时使用 `npm install --no-package-lock --no-save` 完成验收；锁文件差距仍须后续修复。
+- 阶段判定：V1 云基础设施与通用 GLB 端到端门 PASS；V1 产品总状态仍为 PARTIAL，剩余差距见 `V1_IMPLEMENTATION_GAPS.md`。
+- CLOUD-05b PASS：DirectorPlan 编辑现在影响真实 GLB 成片。云端作业以 85mm 定格 24 帧、24mm 侧移 72 帧、55mm 环绕 48 帧完成 6 秒视频；独立打开 scene.blend 验证相机关键帧，Manifest 记录冻结计划 SHA-256。Python 合同测试 3/3、前端 build 与 Sites worker 测试 4/4 通过。
+- 服务器状态复核：当前根盘可用约 19GB。发现独立 ComfyUI H3 单卡量化环境和可解码试验产物；它没有接入 ProductDirectorAI，不计入 V2 验收，也不重复下载模型。
+- 用户明确授权按阶段继续到 V6，并要求每一步验收后前进。V2 首选 MiniMax H3 开放权重路线；官方完整 BF16 FL2VA 目录约 144GB，官方 SGLang 还提供单卡 RTX 4090 量化/卸载路径。后续 V2 优先复用现有受控环境完成集成证据。
+
 ## 2026-09-10
 
 > 本节多数为旧电脑同日历史记录，不等于新电脑复验或完整 V1 负责人验收；当前总状态见 `CURRENT_PHASE.md`。

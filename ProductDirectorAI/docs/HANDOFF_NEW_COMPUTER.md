@@ -1,6 +1,6 @@
 # ProductDirectorAI 换电脑接手手册（Windows）
 
-更新日期：2026-09-10。当前任务是把源码与文档同步到 GitHub 后，在新 Windows 电脑继续；V1 本机核心已有历史实现与测试证据，但完整 V1 仍为 **PARTIAL**，V2–V6 未授权。
+更新日期：2026-09-11。源码与文档已在新 Windows 电脑恢复；V1 云基础设施与通用 GLB 全链路已通过，但完整 V1 仍为 **PARTIAL**。用户已授权逐阶段继续到 V6，必须每期验收后再前进。
 
 ## 1. Git 会带走什么
 
@@ -100,7 +100,7 @@ npm run test:sites
 
 ## 6. 云服务器接续
 
-已购事实和 SSH 排查边界以 `docs/CLOUD_SERVER_HANDOFF.md` 为准：实际节点是华北二 A 的 RTX 4090 24GB；磁盘扩容已完成；网页 SSH 可用；旧电脑公网 SSH 在认证前超时；云端 Blender/FFmpeg/ProductDirectorAI 尚未部署。
+当前新节点事实以 `docs/CLOUD_SERVER_HANDOFF.md` 为准：华北二 A、RTX 4090 24GB、约 97GB 根分区；公网 SSH、Blender 5.2.1、FFmpeg、Node 与 ProductDirectorAI 已验证，V1 通用 GLB 全链路已通过。旧节点扩容和 SSH 超时仅是历史记录，不得套用。
 
 换电脑后从用户登录的控制台重新取得当前地址和账号，并重新验证新电脑出口与云防火墙 `/32`，不要照抄旧 IP。当前请求是暂停服务器排查/部署，先完成文档 GitHub 同步；恢复部署仍需用户明确继续，且 ComfyUI 验证属于 V2 或单独授权，不是 V1 云 Blender 的退出门。
 

@@ -1,7 +1,7 @@
 # ProductDirectorAI 云 GPU 选型与部署规范
 
 > 选型日期：2026-09-10  
-> 最新事实覆盖：用户实际已购优云智算华北二 A 的 RTX 4090 24GB、16 核/94GB、Ubuntu 22.04.4 节点；根分区扩容完成，Blender/FFmpeg/ProductDirectorAI 尚未部署。下文 5090、4090 48GB、3090 与价格均是购买前历史选型快照，不是当前资源或实时报价。完整事实见 [云服务器交接](CLOUD_SERVER_HANDOFF.md)。
+> 最新事实覆盖：当前新节点为优云智算华北二 A 的 RTX 4090 24GB、16 核/94GB、Ubuntu 22.04.4、约 97GB 根分区；Blender 5.2.1、FFmpeg 4.4.2、Node 22.23.2 与 ProductDirectorAI 已部署并通过 V1 通用 GLB 全链路。旧节点扩容记录不适用于当前节点。下文 5090、4090 48GB、3090 与价格均是购买前历史选型快照，不是当前资源或实时报价。完整事实见 [云服务器交接](CLOUD_SERVER_HANDOFF.md)。
 >
 > 当前边界：最新请求暂停服务器排查/部署，先完成 GitHub 与新电脑交接。已授权的单节点 Blender 部署不等于授权采购/自动启停 API；ComfyUI 验证属于 V2 或单独授权，不是 V1 退出门。
 
