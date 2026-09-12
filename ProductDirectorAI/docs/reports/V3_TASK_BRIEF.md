@@ -29,8 +29,8 @@
 | V3-03 | FidelityPolicy 合同：mode（STRICT/CONTROLLED/CREATIVE）、保护区域、允许操作，带版本 | — | `POST /product-versions/{id}/fidelity-policies` 返回策略版本；非法与越权拒绝 |
 | V3-04 | 审核与约束绑定：产品版本扩展 `verified_dimensions` / `view_coverage` / `unverified_regions` / `logo_regions` / `camera_visibility_constraints` | 现有版本模型 | `POST /product-versions/{id}/reviews` 冻结审核记录；单图重建的未观测面标 `unverified` 并限制镜头 |
 | V3-05 | Strict 合成：`C = product_alpha × trusted_product + (1 − product_alpha) × generated_background`，线性空间；背景掩码向外扩张保护产品边缘；阴影/反射/人物遮挡作为独立层 | V3-01/03 | 合成产物与手工核对一致；**禁止用完整生成视频重绘可见产品主体** |
-| V3-06 | 双产品检测：背景出现多余产品影像必须被检出并拒绝 | V3-05 | 构造含双产品的样例被阻断并给出热图与问题帧 |
-| V3-07 | Strict QA：Logo 缺失、轮廓异常、尺寸变化、Mask/ID 错误、缺帧均须被发现并阻断 | V3-05 | 每类故障至少有一个人工构造的负例被阻断，并记录问题帧与 Shot/frame 定位 |
+| V3-06 | 双产品检测：背景出现多余产品影像必须被检出并拒绝（**已完成**，证据见 §12） | V3-05 | 构造含双产品的样例被阻断并给出热图与问题帧 |
+| V3-07 | Strict QA：Logo 缺失、轮廓异常、尺寸变化、Mask/ID 错误、缺帧均须被发现并阻断（**已完成**，证据见 §12） | V3-05 | 每类故障至少有一个人工构造的负例被阻断，并记录问题帧与 Shot/frame 定位 |
 | V3-08 | 版本失效联动：产品版本变化使旧计划的保真审批失效，新 Run 必须绑定新版 | V3-03/04 | 改版本后旧批准失效；新 Run 绑定新版 |
 | V3-09 | 审核界面：版本审核页、通道查看器（Beauty/Alpha/Depth/Normal/ID）、质检页（Blender 参考、Master、最终视频、热图与问题帧跳转） | V3-03/07 | 真实浏览器走查；审核按钮注明批准的是哪个 Manifest hash |
 | V3-10 | V3 验收报告：多通道、保护区域、问题帧、审批绑定逐项结清 | V3-01…09 | `V3_ACCEPTANCE.md`，含真实产物与负例 |
@@ -273,3 +273,46 @@ INPUTS_BEFORE ['']                                  # 新建时只有一个空�
 1. 本次"生成背景"用的是**程序化合成图案**（可复现），不是真实 AI 生成背景；H3 背景帧接入后可直接复用同一合成器；
 2. 阴影/反射/人物遮挡仍**未作为独立层**实现（规格要求它们是单独层）；
 3. **双产品检测（V3-06）未做**——背景里若出现多余产品影像，目前不会自动阻断。
+
+---
+
+## 12. V3-06 / V3-07 云端真实证据（2026-09-12）
+
+云端节点（117.50.44.60）真实执行，全部产物在 `/home/ubuntu/pd-v306-v307-evidence/`（不入 git）。执行前云端 `git pull --ff-only` 到 `ac90193`，回归 `python -m unittest discover -s tests` = **167 tests OK**（20.65s）。渲染用 CC0 带材质相机 `Camera_01_textured.glb`，Blender 5.2.1，540×960、72 帧、3 镜头 ×24 帧（口径同 V3-01）。全程未动 systemd 服务与防火墙。
+
+### 12.1 真实渲染（两套序列）
+
+| 序列 | 镜头 | 耗时（wall） | 产物 |
+| --- | --- | ---: | --- |
+| `render/`（运动镜头：dolly_in / side_track / hero_orbit） | `director-plan-72.json` | 39.23 s | beauty/alpha/depth/normal EXR 各 72 + mask PNG 72 + 主帧 PNG 72 |
+| `render_static/`（固定构图 ×3，供 Logo 区域校验） | `director-plan-static-72.json` | 36.14 s | 同上，72/72 |
+
+渲染命令：`blender -b -P blender/scripts/render_product.py -- --input /home/ubuntu/pd-cc0/Camera_01_textured.glb --output <dir> --width 540 --height 960 --frames 72 --plan <plan.json> --passes`。
+
+### 12.2 V3-06 双产品检测（PASS）
+
+检测命令：`scripts/dual_product_check.py --frames <合成帧> --product render/passes/beauty --mask render/passes/mask --dilate 2`（NCC 阈值 0.75、直方图 0.60，模板尺度 0.5/0.75/1.0，参考帧 0 与 36 共 6 个模板）。
+
+- **正例**：`strict_composite.py`（真实 beauty+mask × 程序化干净背景，`--dilate 2`，72/72 帧 pixel_lock_ok=true）→ 检测 **PASS，exit 0**，72 帧零误报。报告 `v306_positive/report.json`。
+- **负例**：把 beauty 帧产品外观（掩码包围盒 218×139）缩到 0.5 倍（109×70）粘贴进背景帧（0 基序号 10/36/60，位置 x=40,y=700，与外扩掩码重叠 0）再合成 → 检测 **BLOCKED，exit 1**。report.json 精确给出 3 个问题帧与检出框 `[40,700,109,70]`（与粘贴真值完全一致），NCC 得分 1.0 / 0.9571 / 0.9258；热图 `v306_negative/heatmap_0010|0036|0060.png` 已目检：红色高亮与红框准确标出多余产品位置，原产品位置不误报。
+
+### 12.3 V3-07 Strict QA（PASS）
+
+命令：`scripts/strict_qa.py --beauty <beauty> --mask <mask> --depth <depth> --normal <normal> --plan <plan> --frames 72 [--logo-region 0.444,0.540,0.278,0.042 --reference <frame_0036>]`（默认阈值：size-tol 0.35、iou-min 0.5、centroid-shift 0.25、binariness-min 0.98、coverage-tol 0.05、logo-threshold 0.8）。Logo 区域取相机金色顶盖纹理区（画面归一化 0.444,0.540,0.278,0.042 ≈ 150×41 px），参考帧 36。
+
+| 运行 | 输入 | exit | 结果与问题帧定位 |
+| --- | --- | ---: | --- |
+| 正例 | `render_static/` 未篡改全套（beauty+mask+depth+normal，各 72） | 0 | **五项全 PASS**；Logo SSIM 全 72 帧 = 1.0 |
+| 负例·缺帧 | 副本删 `mask/frame_0036.png` | 1 | 仅 missing_frames FAIL：帧 36（shot_02 镜内帧 11），通道 ['mask'] |
+| 负例·Mask 错误 | 副本 frame_0020 掩码 alpha 高斯模糊 | 1 | 仅 mask_integrity FAIL：帧 20，二值度 0.9464 < 0.98 |
+| 负例·尺寸变化 | 副本 frame_0030–0034 掩码产品区放大 1.5 倍 | 1 | size_stability FAIL：帧 30（59276→133152，+124.6%）与帧 35（回落 −55.5%）；伴随覆盖率不一致（0.1174 vs 0.0522）与轮廓 IoU 0.3176，均正确定位 30–35 |
+| 负例·轮廓异常 | 副本 frame_0050 掩码换成左上角异形椭圆 | 1 | 仅 contour_anomaly FAIL：帧 50/51，IoU 0.0000、质心位移 0.3942 > 0.25 |
+| 负例·Logo 缺失 | 副本（beauty EXR→RGBA PNG 重编码）frame_0040–0044 Logo 区抹纯色 | 1 | 仅 logo_presence FAIL：帧 40–44，SSIM 0.0134 < 0.8 |
+
+负例报告：`v307_sneg_{missing,blur,size,contour,logo}/report.json`；叠图已目检——Logo 差异热图 `logo_presence_heatmap_frame_0040.png` 整区红色（差异大），轮廓对比叠图 `contour_anomaly_frame_0050.png` 红=原轮廓、绿=异形掩码、零重叠。
+
+### 12.4 范围说明（如实记录）
+
+1. **Logo 检查语义**：`logo_regions` 是画面归一化区域，只在**固定构图**下可比对。运动镜头序列上同一画面区域对单参考帧的全局 SSIM 最低 −0.08（实测探测），无法与"抹纯色 ≈0.01"区分，故 Logo 正/负例在固定构图序列（`render_static/`）上验收。运动镜头下的 Logo 跟踪需要位姿感知的区域映射，列为后续工作。
+2. **切换敏感性**：尺寸/轮廓检查比较相邻帧，**不识别镜头切换**。运动镜头序列（未篡改）在切换处如实报出：帧 25（shot_01→02，面积 86779→43380，IoU 0.3541）与帧 49（shot_02→03，IoU 0.2585）。报告已给出 Shot 定位，按镜头分段的豁免策略列为后续工作。
+3. 负例 5 的 beauty 为 EXR→sRGB RGBA PNG 重编码（alpha 取自真实掩码），SSIM 比较在同一编码空间内进行，与脚本约定一致。
