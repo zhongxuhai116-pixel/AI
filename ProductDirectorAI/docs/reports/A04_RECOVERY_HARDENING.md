@@ -81,3 +81,25 @@
 3. 编码失败后的自动重试与退避尚无入口；失败任务目前只能靠人工重建作业。
 4. 事件流是 `Last-Event-ID` 轮询续读，不是长连接 SSE 推送。
 5. SQLite 原型仍不是主规划要求的 PostgreSQL/租约实现，不得据此宣布 A04 整包通过。
+
+---
+
+## 6. 真实杀 Worker 恢复演练（2026-09-12）
+
+上面第 1 条已闭环。新增 `scripts/kill_worker_drill.py` 与 `PRODUCTDIRECTOR_DISABLE_INLINE_EXECUTOR`（让 API 不进程内执行作业，任务必须由独立 Worker 领取），在云节点上跑真实 Blender 作业：
+
+| 时刻（秒） | 事件 | 细节 |
+| ---: | --- | --- |
+| 2.2 | 任务被 Worker-1 领取 | `RUNNING` / `RENDER` |
+| 17.3 | **SIGKILL 杀掉 Worker-1** | 渲染进行中，进度 31%，进程无任何收尾机会 |
+| 17.3–92.4 | 等待租约过期 | 任务仍是 `RUNNING/RENDER`（过期租约未被自动改写的窗口） |
+| 92.4 | 租约过期后 | 状态未变，等待新 Worker |
+| ~152 | **Worker-2 重新领取** | `claimed: true, lease_epoch: 2`（epoch 由 1 升到 2） |
+| 152.1 | 任务完成 | `SUCCEEDED` / `ARTIFACT`，产物 385,153 字节 |
+
+结论：**渲染途中杀掉 Worker 后，任务确实能被另一个 Worker 重新领取并完成到出片**，且租约代次正确递增（旧 Worker 即使复活也会因 epoch 过期被拒绝，另有专门用例覆盖）。
+
+补充说明：
+
+- 本次重领是由**领取路径**（发现租约过期）完成的，没有显式调用 `/internal/v1/workers/reconcile`；两者都在测试覆盖范围内。
+- 从杀掉到重领之间存在约 75 秒的空窗（租约 60 秒 + 轮询间隔）。这是设计取舍：宁可多等，也不让两个 Worker 同时渲染同一任务。
