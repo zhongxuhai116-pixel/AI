@@ -46,7 +46,11 @@ def read_exr(path: Path) -> dict:
     channels = part.channels
     names = list(channels.keys()) if hasattr(channels, "keys") else [c.name for c in channels]
     window = part.header.get("dataWindow")
-    width, height = window.max.x + 1, window.max.y + 1
+    try:
+        width, height = window.max.x + 1, window.max.y + 1
+    except AttributeError:  # 该版本的 OpenEXR 用元组表示 dataWindow
+        width = int(window[2]) - int(window[0]) + 1
+        height = int(window[3]) - int(window[1]) + 1
     planes = {}
     for name in names:
         entry = channels[name]
