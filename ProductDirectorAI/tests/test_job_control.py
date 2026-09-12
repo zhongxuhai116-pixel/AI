@@ -666,6 +666,67 @@ class JobControlAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(rejected.status_code, 422)
 
+    # --- A03 出口门：10 次同键复用与“事务失败不留半任务” ---
+
+    def _table_counts(self) -> dict:
+        with main.connect() as db:
+            return {
+                table: db.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
+                for table in ("jobs", "runs", "run_jobs", "job_attempts", "job_events")
+            }
+
+    def test_a03_same_key_ten_times_reuses_one_run(self) -> None:
+        plan = self._create_plan()
+        self.client.post(f"/api/v1/plans/{plan['id']}/approve", json={"approved": True})
+        before = self._table_counts()
+        run_ids, job_ids = set(), set()
+        with patch("productdirector_api.main.execute_job"):
+            for index in range(10):
+                response = self.client.post(
+                    "/api/v1/runs",
+                    json={"plan_id": plan["id"], "idempotency_key": "a03-ten-times"},
+                )
+                self.assertEqual(response.status_code, 202)
+                if index == 0:
+                    self.assertTrue(response.json()["created"])
+                else:
+                    self.assertFalse(response.json()["created"])
+                    self.assertTrue(response.json()["reused_idempotent"])
+                run_ids.add(response.json()["run_id"])
+                job_ids.add(response.json()["job_id"])
+        self.assertEqual(len(run_ids), 1)
+        self.assertEqual(len(job_ids), 1)
+        after = self._table_counts()
+        self.assertEqual(after["runs"] - before["runs"], 1)
+        self.assertEqual(after["jobs"] - before["jobs"], 1)
+        self.assertEqual(after["run_jobs"] - before["run_jobs"], 1)
+        self.assertEqual(after["job_attempts"] - before["job_attempts"], 1)
+
+    def test_a03_failed_run_creation_leaves_no_partial_task(self) -> None:
+        plan = self._create_plan()
+        self.client.post(f"/api/v1/plans/{plan['id']}/approve", json={"approved": True})
+        before = self._table_counts()
+
+        # 未批准的计划与不存在的计划都必须在写入任何任务行之前失败。
+        unapproved = self._create_plan()
+        rejected = self.client.post("/api/v1/runs", json={"plan_id": unapproved["id"]})
+        self.assertEqual(rejected.status_code, 409)
+        missing = self.client.post("/api/v1/runs", json={"plan_id": "does-not-exist"})
+        self.assertEqual(missing.status_code, 404)
+
+        self.assertEqual(self._table_counts(), before)
+
+    def test_a03_transaction_rollback_leaves_no_partial_rows(self) -> None:
+        plan = self._create_plan()
+        before = self._table_counts()
+        # 在 create_run_record 自己的事务末尾注入异常，验证回滚后不残留 jobs/runs/run_jobs。
+        with patch("productdirector_api.main.append_job_event", side_effect=RuntimeError("forced failure")):
+            with self.assertRaises(RuntimeError):
+                main.create_run_record(
+                    plan, main.DEFAULT_OWNER_ID, main.DEFAULT_PROJECT_ID, "a03-rollback", "hash"
+                )
+        self.assertEqual(self._table_counts(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
