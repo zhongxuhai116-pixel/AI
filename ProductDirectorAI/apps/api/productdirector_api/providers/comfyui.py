@@ -188,3 +188,78 @@ def build_hunyuan3d_graph(
         "9": {"class_type": "VoxelToMesh", "inputs": {"voxel": ["8", 0], "algorithm": "surface net", "threshold": threshold}},
         "10": {"class_type": "SaveGLB", "inputs": {"mesh": ["9", 0], "filename_prefix": prefix}},
     }
+
+
+def build_h3_video_graph(
+    reference_video: str,
+    product_image: str,
+    prompt: str,
+    prefix: str,
+    crop: tuple[int, int, int, int] = (0, 0, 512, 512),
+    width: int = 576,
+    height: int = 1024,
+    length: int = 124,
+    steps: int = 4,
+    seed: int = 20260912,
+    fps: int = 24,
+) -> dict:
+    """H3 参考视频 → 视频生成图（产品图作为 ref_image，参考视频作为 ref_video）。
+
+    接线照抄现场已验证工作流的视频子图；与现场版本的差别是**不含**
+    `ProductBlenderRender` 的多视图渲染（那属于 V3 产品保真链路），
+    因此这里只声明"参考视频 + 产品图"这条已实现的能力。
+    """
+    x, y, crop_width, crop_height = crop
+    video_name = os.getenv("PD_H3_VIDEO_MODEL", "minimax_h3_ref2va_pruned_int8_convrot.safetensors")
+    clip_name = os.getenv("PD_H3_CLIP_MODEL", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors")
+    video_vae = os.getenv("PD_H3_VIDEO_VAE", "minimax_h3_video_vae_fp16.safetensors")
+    audio_vae = os.getenv("PD_H3_AUDIO_VAE", "minimax_h3_audio_vae_fp32.safetensors")
+    lora_name = os.getenv("PD_H3_LORA", "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors")
+    return {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": video_name, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip_name, "type": "minimax", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": video_vae}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": audio_vae}},
+        "5": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": lora_name, "strength_model": 1.0}},
+        "6": {"class_type": "MiniMaxH3SigmaShift", "inputs": {"model": ["5", 0], "shift_video": 12.0, "shift_audio": 3.0}},
+        "10": {"class_type": "LoadVideo", "inputs": {"file": reference_video}},
+        "11": {"class_type": "GetVideoComponents", "inputs": {"video": ["10", 0]}},
+        "12": {"class_type": "LoadImage", "inputs": {"image": product_image}},
+        "13": {"class_type": "ImageCrop", "inputs": {"image": ["12", 0], "width": crop_width, "height": crop_height, "x": x, "y": y}},
+        "7": {
+            "class_type": "MiniMaxH3ReferenceToVideo",
+            "inputs": {
+                "clip": ["2", 0],
+                "vae": ["3", 0],
+                "audio_vae": ["4", 0],
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "length": length,
+                "ref_image_size": "match",
+                "ref_images.ref_image_0": ["13", 0],
+                "ref_videos.ref_video_0": ["11", 0],
+            },
+        },
+        "8": {"class_type": "BasicGuider", "inputs": {"model": ["6", 0], "conditioning": ["7", 0]}},
+        "9": {"class_type": "BasicScheduler", "inputs": {"model": ["6", 0], "scheduler": "simple", "steps": steps, "denoise": 1.0}},
+        "14": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "15": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "16": {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["15", 0],
+                "guider": ["8", 0],
+                "sampler": ["14", 0],
+                "sigmas": ["9", 0],
+                "latent_image": ["7", 1],
+            },
+        },
+        "17": {"class_type": "VAEDecode", "inputs": {"samples": ["16", 0], "vae": ["3", 0]}},
+        "18": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["16", 0], "vae": ["4", 0]}},
+        "19": {"class_type": "CreateVideo", "inputs": {"images": ["17", 0], "fps": float(fps), "audio": ["18", 0]}},
+        "20": {
+            "class_type": "SaveVideo",
+            "inputs": {"video": ["19", 0], "filename_prefix": prefix, "format": "mp4", "codec": "h264"},
+        },
+    }

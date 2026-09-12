@@ -170,6 +170,8 @@ CREATE TABLE IF NOT EXISTS provider_jobs (
   stage TEXT NOT NULL,
   request_payload TEXT NOT NULL,
   artifact_asset_id TEXT,
+  artifact_path TEXT,
+  artifact_sha256 TEXT,
   error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL

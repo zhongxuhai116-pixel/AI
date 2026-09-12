@@ -366,6 +366,8 @@ def initialize_db() -> None:
         ensure_column(db, "run_jobs", "lease_expires_at", "TEXT")
         ensure_column(db, "run_jobs", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(db, "assets", "owner_id", "TEXT NOT NULL DEFAULT 'owner-default'")
+        ensure_column(db, "provider_jobs", "artifact_path", "TEXT")
+        ensure_column(db, "provider_jobs", "artifact_sha256", "TEXT")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
         if not storage.is_postgres():
             legacy_index = db.execute(
@@ -505,6 +507,22 @@ class H3ReconstructRequest(BaseModel):
     crop: tuple[int, int, int, int] = (0, 0, 512, 512)
     steps: int = Field(default=50, ge=1, le=200)
     cfg: float = Field(default=5.0, ge=0.0, le=100.0)
+    seed: int = Field(default=20260912, ge=0)
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
+
+
+class H3VideoRequest(BaseModel):
+    """V2：用现有 H3 环境生成视频（参考视频 + 产品图 → 成片）。"""
+
+    product_asset_id: str
+    reference_video: str
+    prompt: str = Field(min_length=1, max_length=8000)
+    crop: tuple[int, int, int, int] = (0, 0, 512, 512)
+    width: int = Field(default=576, ge=32, le=4096)
+    height: int = Field(default=1024, ge=32, le=4096)
+    length: int = Field(default=124, ge=5, le=362)
+    steps: int = Field(default=4, ge=1, le=100)
     seed: int = Field(default=20260912, ge=0)
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
@@ -1922,6 +1940,8 @@ def provider_job_public(row) -> dict:
         "status": row["status"],
         "stage": row["stage"],
         "artifact_asset_id": row["artifact_asset_id"],
+        "artifact_sha256": row["artifact_sha256"] if "artifact_sha256" in row.keys() else None,
+        "artifact_ready": bool(row["artifact_asset_id"] or (row["artifact_path"] if "artifact_path" in row.keys() else None)),
         "error": row["error"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -1938,15 +1958,16 @@ def load_provider_job(provider_job_id: str) -> dict:
 
 def insert_provider_job(
     provider_job_id: str, external_id: str | None, status: str, stage: str,
-    payload: dict, error: str | None = None, artifact_asset_id: str | None = None,
+    payload: dict, operation: str = "RECONSTRUCT_3D",
+    error: str | None = None, artifact_asset_id: str | None = None,
 ) -> None:
     now = utc_now()
     with connect() as db:
         db.execute(
             "INSERT INTO provider_jobs (id, provider, operation, external_id, status, stage, request_payload, "
             "artifact_asset_id, error, created_at, updated_at) "
-            "VALUES (?, 'h3-comfyui', 'RECONSTRUCT_3D', ?, ?, ?, ?, ?, ?, ?, ?)",
-            (provider_job_id, external_id, status, stage, json.dumps(payload, ensure_ascii=False),
+            "VALUES (?, 'h3-comfyui', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (provider_job_id, operation, external_id, status, stage, json.dumps(payload, ensure_ascii=False),
              artifact_asset_id, error, now, now),
         )
 
@@ -2015,6 +2036,168 @@ def h3_reconstruct(request: H3ReconstructRequest) -> dict:
     }
 
 
+def provider_artifact_dir(provider_job_id: str) -> Path:
+    folder = VAR / "providers" / provider_job_id
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def mark_provider_failed(provider_job_id: str, stage: str, message: str) -> dict:
+    update_provider_job(provider_job_id, status="FAILED", stage=stage, error=str(message)[-2000:])
+    return provider_job_public(load_provider_job(provider_job_id))
+
+
+def collect_mesh_artifact(row: dict, record: dict, owner_id: str) -> dict:
+    provider_job_id = row["id"]
+    item = next((entry for entry in comfyui.outputs(record) if entry["filename"].lower().endswith(".glb")), None)
+    if not item:
+        return mark_provider_failed(provider_job_id, "COLLECT", "Provider 完成但没有 GLB 产物")
+    try:
+        data = comfyui.download(item)
+        info = inspect_glb(data)
+    except (comfyui.ComfyUIError, HTTPException) as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        return mark_provider_failed(provider_job_id, "COLLECT", detail)
+
+    asset_id = str(uuid.uuid4())
+    stored = UPLOADS / f"{asset_id}.glb"
+    stored.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    source_asset_id = (json.loads(row["request_payload"]) or {}).get("asset_id")
+    with connect() as db:
+        source = db.execute("SELECT name FROM assets WHERE id = ?", (source_asset_id,)).fetchone()
+    display = f"H3 重建 · {Path(source['name']).stem if source else 'product'}.glb"
+    with connect() as db:
+        db.execute(
+            "INSERT INTO assets (id, name, kind, mime, size_bytes, sha256, path, created_at, owner_id) "
+            "VALUES (?, ?, 'model', 'model/gltf-binary', ?, ?, ?, ?, ?)",
+            (asset_id, display, len(data), digest, stored.name, utc_now(), owner_id),
+        )
+    update_provider_job(
+        provider_job_id, status="SUCCEEDED", stage="ARTIFACT",
+        artifact_asset_id=asset_id, artifact_sha256=digest, error=None,
+    )
+    result = provider_job_public(load_provider_job(provider_job_id))
+    result["artifact"] = {"kind": "model", "asset_id": asset_id, "sha256": digest, "bytes": len(data), "glb": info}
+    return result
+
+
+def collect_video_artifact(row: dict, record: dict, owner_id: str) -> dict:
+    provider_job_id = row["id"]
+    item = next(
+        (entry for entry in comfyui.outputs(record)
+         if entry["filename"].lower().endswith((".mp4", ".webm", ".mov"))),
+        None,
+    )
+    if not item:
+        return mark_provider_failed(provider_job_id, "COLLECT", "Provider 完成但没有视频产物")
+    try:
+        data = comfyui.download(item)
+    except comfyui.ComfyUIError as exc:
+        return mark_provider_failed(provider_job_id, "COLLECT", exc)
+
+    target = provider_artifact_dir(provider_job_id) / Path(item["filename"]).name
+    target.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    probe: dict = {}
+    if FFPROBE:
+        try:
+            result = subprocess.run(
+                [FFPROBE, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,nb_frames,codec_name:format=duration",
+                 "-of", "json", str(target)],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                payload = json.loads(result.stdout)
+                stream = (payload.get("streams") or [{}])[0]
+                probe = {
+                    "codec": stream.get("codec_name"),
+                    "width": stream.get("width"),
+                    "height": stream.get("height"),
+                    "frames": int(stream.get("nb_frames") or 0),
+                    "duration": float(payload.get("format", {}).get("duration") or 0),
+                }
+        except (OSError, ValueError, json.JSONDecodeError):
+            probe = {}
+    update_provider_job(
+        provider_job_id, status="SUCCEEDED", stage="ARTIFACT",
+        artifact_path=str(target), artifact_sha256=digest, error=None,
+    )
+    result = provider_job_public(load_provider_job(provider_job_id))
+    result["artifact"] = {
+        "kind": "video",
+        "filename": target.name,
+        "sha256": digest,
+        "bytes": len(data),
+        "probe": probe,
+        "download_url": f"/api/v1/providers/h3/jobs/{provider_job_id}/artifact",
+    }
+    return result
+
+
+@app.post("/api/v1/providers/h3/video", status_code=202)
+def h3_video(request: H3VideoRequest) -> dict:
+    """用现有 H3 环境生成视频：参考视频 + 产品图 → 成片。"""
+    owner_id, _, _project_id = normalize_contract_context(request.owner_id, request.project_id)
+    with connect() as db:
+        asset = db.execute("SELECT * FROM assets WHERE id = ?", (request.product_asset_id,)).fetchone()
+    if not asset:
+        raise HTTPException(404, "产品素材不存在")
+    if asset["owner_id"] != owner_id:
+        raise HTTPException(403, "越权使用素材")
+    if asset["kind"] != "image":
+        raise HTTPException(422, "参考视频生成目前只接受图片素材作为产品输入")
+    if not request.reference_video.strip():
+        raise HTTPException(422, "参考视频不能为空")
+    x, y, width, height = request.crop
+    if x < 0 or y < 0 or width < 64 or height < 64:
+        raise HTTPException(422, "裁切区域无效")
+
+    path = resolve_asset_path(asset)
+    provider_job_id = str(uuid.uuid4())
+    payload = {
+        "asset_id": asset["id"],
+        "asset_sha256": asset["sha256"],
+        "reference_video": request.reference_video,
+        "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
+        "crop": [x, y, width, height],
+        "width": request.width,
+        "height": request.height,
+        "length": request.length,
+        "steps": request.steps,
+        "seed": request.seed,
+    }
+    try:
+        image_name = comfyui.upload_image(f"{provider_job_id}{path.suffix}", path.read_bytes())
+        graph = comfyui.build_h3_video_graph(
+            reference_video=request.reference_video,
+            product_image=image_name,
+            prompt=request.prompt,
+            prefix=f"productdirector/{provider_job_id}",
+            crop=(x, y, width, height),
+            width=request.width,
+            height=request.height,
+            length=request.length,
+            steps=request.steps,
+            seed=request.seed,
+        )
+        external_id = comfyui.submit(graph, client_id=provider_job_id)
+    except comfyui.ComfyUIError as exc:
+        insert_provider_job(provider_job_id, None, "FAILED", "SUBMIT", payload,
+                            operation="GENERATE_VIDEO", error=str(exc)[-2000:])
+        raise HTTPException(503, f"H3 Provider 提交失败: {exc}") from exc
+
+    insert_provider_job(provider_job_id, external_id, "RUNNING", "GENERATE", payload, operation="GENERATE_VIDEO")
+    return {
+        "provider_job_id": provider_job_id,
+        "external_id": external_id,
+        "operation": "GENERATE_VIDEO",
+        "status": "RUNNING",
+        "status_url": f"/api/v1/providers/h3/jobs/{provider_job_id}",
+    }
+
+
 @app.get("/api/v1/providers/h3/jobs/{provider_job_id}")
 def h3_job_status(
     provider_job_id: str,
@@ -2040,40 +2223,27 @@ def h3_job_status(
         update_provider_job(provider_job_id, status="FAILED", stage="GENERATE", error="Provider 报告执行失败")
         return provider_job_public(load_provider_job(provider_job_id))
 
-    item = next((entry for entry in comfyui.outputs(record) if entry["filename"].lower().endswith(".glb")), None)
-    if not item:
-        update_provider_job(provider_job_id, status="FAILED", stage="COLLECT", error="Provider 完成但没有 GLB 产物")
-        return provider_job_public(load_provider_job(provider_job_id))
+    if row["operation"] == "GENERATE_VIDEO":
+        return collect_video_artifact(row, record, owner_id)
+    return collect_mesh_artifact(row, record, owner_id)
 
-    try:
-        data = comfyui.download(item)
-        info = inspect_glb(data)
-    except (comfyui.ComfyUIError, HTTPException) as exc:
-        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        update_provider_job(provider_job_id, status="FAILED", stage="COLLECT", error=str(detail)[-2000:])
-        return provider_job_public(load_provider_job(provider_job_id))
 
-    asset_id = str(uuid.uuid4())
-    stored = UPLOADS / f"{asset_id}.glb"
-    stored.write_bytes(data)
-    digest = hashlib.sha256(data).hexdigest()
-    source_asset_id = (json.loads(row["request_payload"]) or {}).get("asset_id")
-    with connect() as db:
-        source = db.execute("SELECT name FROM assets WHERE id = ?", (source_asset_id,)).fetchone()
-    display = f"H3 重建 · {Path(source['name']).stem if source else 'product'}.glb"
-    with connect() as db:
-        db.execute(
-            "INSERT INTO assets (id, name, kind, mime, size_bytes, sha256, path, created_at, owner_id) "
-            "VALUES (?, ?, 'model', 'model/gltf-binary', ?, ?, ?, ?, ?)",
-            (asset_id, display, len(data), digest, stored.name, utc_now(), owner_id),
-        )
-    update_provider_job(
-        provider_job_id, status="SUCCEEDED", stage="ARTIFACT",
-        artifact_asset_id=asset_id, error=None,
-    )
-    result = provider_job_public(load_provider_job(provider_job_id))
-    result["artifact"] = {"asset_id": asset_id, "sha256": digest, "bytes": len(data), "glb": info}
-    return result
+@app.get("/api/v1/providers/h3/jobs/{provider_job_id}/artifact")
+def h3_job_artifact(
+    provider_job_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+):
+    """下载 Provider 任务产出的视频产物。"""
+    normalize_contract_context(owner_id, project_id)
+    row = load_provider_job(provider_job_id)
+    path = row.get("artifact_path")
+    if not path:
+        raise HTTPException(409, "该任务还没有可下载的产物")
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise HTTPException(410, "产物文件已不存在")
+    return FileResponse(file_path, media_type="video/mp4", filename=file_path.name)
 
 
 @app.post("/api/v1/assets", status_code=201)

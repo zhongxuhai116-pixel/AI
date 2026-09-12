@@ -184,6 +184,100 @@ class H3ProviderTests(unittest.TestCase):
     def test_unknown_provider_job_returns_404(self) -> None:
         self.assertEqual(self.client.get("/api/v1/providers/h3/jobs/nope").status_code, 404)
 
+    # --- 视频生成 ---
+
+    def _submit_video(self, **overrides):
+        body = {
+            "product_asset_id": self.image_asset["id"],
+            "reference_video": "拳击靶-人物击打参考.mp4",
+            "prompt": "replace the target with the product shown in <Picture 1>",
+            "crop": [0, 0, 256, 256],
+            **overrides,
+        }
+        return self.client.post("/api/v1/providers/h3/video", json=body)
+
+    def test_video_submission_builds_the_h3_graph_and_tracks_the_job(self) -> None:
+        with patch.object(comfyui, "upload_image", return_value="remote.png"), patch.object(
+            comfyui, "submit", return_value="prompt-video"
+        ) as submit:
+            response = self._submit_video()
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["operation"], "GENERATE_VIDEO")
+        graph = submit.call_args.args[0]
+        self.assertEqual(graph["1"]["class_type"], "UNETLoader")
+        self.assertEqual(graph["7"]["class_type"], "MiniMaxH3ReferenceToVideo")
+        self.assertEqual(graph["7"]["inputs"]["ref_images.ref_image_0"], ["13", 0])
+        self.assertEqual(graph["7"]["inputs"]["ref_videos.ref_video_0"], ["11", 0])
+        self.assertEqual(graph["11"]["class_type"], "GetVideoComponents")
+        self.assertEqual(graph["16"]["class_type"], "SamplerCustomAdvanced")
+        self.assertEqual(graph["20"]["class_type"], "SaveVideo")
+        self.assertEqual(graph["7"]["inputs"]["length"], 124)
+        self.assertEqual(graph["9"]["inputs"]["steps"], 4)
+
+        rows = self._provider_rows()
+        self.assertEqual(rows[0]["operation"], "GENERATE_VIDEO")
+        self.assertEqual(rows[0]["external_id"], "prompt-video")
+        payload = json.loads(rows[0]["request_payload"])
+        self.assertEqual(payload["reference_video"], "拳击靶-人物击打参考.mp4")
+        self.assertIn("prompt_sha256", payload)
+        self.assertNotIn("replace the target", rows[0]["request_payload"])
+
+    def test_video_submission_rejects_missing_reference_video(self) -> None:
+        self.assertEqual(self._submit_video(reference_video="   ").status_code, 422)
+
+    def test_video_records_provider_failure(self) -> None:
+        with patch.object(comfyui, "upload_image", return_value="remote.png"), patch.object(
+            comfyui, "submit", side_effect=comfyui.ComfyUIError("node error")
+        ):
+            response = self._submit_video()
+        self.assertEqual(response.status_code, 503)
+        rows = self._provider_rows()
+        self.assertEqual(rows[0]["operation"], "GENERATE_VIDEO")
+        self.assertEqual(rows[0]["status"], "FAILED")
+
+    def _submitted_video_job(self) -> str:
+        with patch.object(comfyui, "upload_image", return_value="remote.png"), patch.object(
+            comfyui, "submit", return_value="prompt-video"
+        ):
+            return self._submit_video().json()["provider_job_id"]
+
+    def test_video_status_collects_the_artifact_and_serves_it(self) -> None:
+        provider_job_id = self._submitted_video_job()
+        record = {
+            "status": {"completed": True, "status_str": "success"},
+            "outputs": {"20": {"video": [{"filename": "clip_00001_.mp4", "subfolder": "productdirector/x", "type": "output"}]}},
+        }
+        payload = b"\x00\x00\x00\x18ftypmp42" + b"0" * 2048
+        with patch.object(comfyui, "history", return_value=record), patch.object(
+            comfyui, "download", return_value=payload
+        ) as download:
+            body = self.client.get(f"/api/v1/providers/h3/jobs/{provider_job_id}").json()
+        self.assertEqual(body["status"], "SUCCEEDED")
+        self.assertEqual(body["artifact"]["kind"], "video")
+        self.assertEqual(body["artifact"]["bytes"], len(payload))
+        self.assertIsNone(body["artifact_asset_id"])
+        download.assert_called_once()
+
+        served = self.client.get(f"/api/v1/providers/h3/jobs/{provider_job_id}/artifact")
+        self.assertEqual(served.status_code, 200)
+        self.assertEqual(served.content, payload)
+
+    def test_video_status_fails_when_no_video_output(self) -> None:
+        provider_job_id = self._submitted_video_job()
+        record = {"status": {"completed": True, "status_str": "success"}, "outputs": {"20": {"text": ["nope"]}}}
+        with patch.object(comfyui, "history", return_value=record):
+            body = self.client.get(f"/api/v1/providers/h3/jobs/{provider_job_id}").json()
+        self.assertEqual(body["status"], "FAILED")
+        self.assertIn("视频", body["error"])
+
+    def test_artifact_endpoint_conflicts_before_the_job_finishes(self) -> None:
+        provider_job_id = self._submitted_video_job()
+        with patch.object(comfyui, "history", return_value=None):
+            self.client.get(f"/api/v1/providers/h3/jobs/{provider_job_id}")
+        self.assertEqual(
+            self.client.get(f"/api/v1/providers/h3/jobs/{provider_job_id}/artifact").status_code, 409
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
