@@ -55,3 +55,33 @@
 1. V1 / V2 是否 ACCEPTED（决定能否按规划顺序进入 V3）。
 2. 是否提供**带材质的模型或纹理**：V3-07 要求"Logo 缺失能被检出"，而当前官方 GLB 无材质，Logo 保护无法用现有资产验证。
 3. V3 是否按上表开工，或先做前几项（例如先打通 V3-01/02 多通道，再决定合成与 QA 的深度）。
+
+---
+
+## 6. V3-01/02 实施进展与**未解决阻塞**（2026-09-12）
+
+状态：**IN_PROGRESS / 未通过**。已提交 `--passes` 开关与校验器，但**通道文件尚未真正写出**，因此 V3-01 不能记为完成。
+
+### 已确认可用
+
+- `--passes` 在渲染时启用多通道配置；**主帧产物仍正常**（72 帧全部写出），说明开关没有破坏既有渲染路径；
+- 关闭该开关时行为与历史完全一致（记录过的验收哈希不受影响）。
+
+### 遇到的真实阻塞：Blender 5.2 合成器 API 与 4.x 完全不同
+
+| 项目 | Blender 4 | Blender 5.2 实测 |
+| --- | --- | --- |
+| 节点树入口 | `scene.node_tree` | **`scene.compositing_node_group`**（`node_tree` 已不存在） |
+| 合成输出节点 | `CompositorNodeComposite` | **该类型不存在** |
+| File Output 路径 | `base_path` + `file_slots[0].path` | **`directory` + `file_name`** |
+| File Output 格式 | PNG / OPEN_EXR 任选 | **只接受 `OPEN_EXR_MULTILAYER`** |
+
+按上述差异改成"每帧一个多层 EXR"后：渲染成功（72 主帧）、日志显示 `layout=multilayer-exr`，但 `passes/` 目录**没有任何 .exr 落盘**，全盘搜索也未找到输出文件。说明该节点的落盘行为还需要进一步确认（文件名/扩展名、是否需要 `file_output_items` 配置、或需要显式启用节点）。
+
+### 下一步（按顺序）
+
+1. 解决多层 EXR 的落盘问题（或改用"分通道多次渲染"的替代方案：每个 pass 设一次 `view_layer` 并各渲染一遍，代价是渲染时间线性增加）；
+2. 把 `validate_passes.py` 从"每通道目录"改为读多层 EXR 的 `render_slots`；
+3. 通过 V3-02 后，再进入 V3-03（FidelityPolicy）与后续任务。
+
+在这些未解决前，V3-03…V3-10 不应开工——它们都依赖可信通道。
