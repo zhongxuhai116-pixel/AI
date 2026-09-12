@@ -71,6 +71,7 @@
 - **V1 已进入 READY_FOR_REVIEW**：A01–A07 出口门与三道业务门（两个真实品类图片 + AI 重建 3D + **官方模型 3D**）全部有证据，整理成 [负责人验收确认单](reports/V1_READY_FOR_REVIEW.md)，等待用户判定 ACCEPTED。明确排除项：外观/材质保真（属 V3）、多 Owner/多租户、前端相机轨迹编辑、并发压测与公网暴露
 - V2 继续推进：H3 生成视频已**回收到素材库**（kind=video 的受管素材 + 鉴权内容接口 + 工作台与素材库的视频预览），补上"真实 H3 任务回收到素材库"这一条。后端 139/139，前端构建与 Sites 4/4 通过，云端已部署
 - V2 产能已实测（`scripts/capacity_probe.py`）：连投 3 个重建任务，队列深度 1→2→3（单卡串行），稳态约 **31–36 秒/条**（含排队平均 63.8 秒，脚本的"日产能"按后者算会低估约一半），峰值 GPU **100%**、峰值显存 **5,834 MiB**（24GB 卡的 ~24%，显存不是瓶颈），每条磁盘增量约 8.6 MiB。按实测折算：重建约 2,500 条/天，H3 视频（576×1024/124 帧）约 190 条/天，产品替换视频约 170 条/天。未做长时压测与费用换算，见 [V2 H3 Provider 接入](reports/V2_H3_PROVIDER_INTEGRATION.md) 第 11 节
+- V3 已产出任务书（尚未实施）：按主规划第 9 章列出 V3-01…V3-10（多通道渲染、通道校验、FidelityPolicy、审核与约束绑定、Strict 合成、双产品检测、Strict QA、版本失效联动、审核界面、验收报告），并记录风险——官方 STEP 转出的 GLB **无材质**，因此 Logo 保护验收需要带纹理/材质的模型。见 [V3 任务书](reports/V3_TASK_BRIEF.md)
 - A06 已完成：媒体质量门（黑帧/可见性）、失败/取消重试、构图锚点与实时预览、真实 Chrome 端到端走查（桌面/窄屏/失败态）、GLB 上传校验（损坏/外部资源/无网格）与渲染前磁盘空间保护。后端本地与云端均 62/62 通过，见 [A06 用户流程与质量](reports/A06_USER_FLOW_QUALITY.md)
 - A02 进行中：补齐了缺失的 ImagePreviewSpec 合同（新增 `contracts/image-preview.v1.*`）并加了一致性守卫测试（Schema/示例/运行时三方同步、同一批正负例双方判定一致）。仍未实现目标 3D 合同的运行时模型、产品版本审核工作流与非 6 秒时长，见 [A02/A03 验收](reports/A02_A03_ACCEPTANCE.md)
 - A02 目标 3D 合同已落地：`Shot` 支持 `camera_target_m` / `camera_path`（环绕、推近、横移、定格）/`sensor_width_mm`，计划支持 `product_pose` 与 `scene`，Blender 脚本按合同取景而非硬编码；Manifest 写入经根 Schema 校验的 `director_plan_3d`。云端两次真实渲染验证：默认计划哈希与历史完全一致（无回归），显式轨迹产出不同成片。仍缺产品版本审核工作流、非 6 秒时长与前端轨迹编辑，见 [A02/A03 验收](reports/A02_A03_ACCEPTANCE.md)
