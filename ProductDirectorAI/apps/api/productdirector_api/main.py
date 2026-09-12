@@ -2029,7 +2029,7 @@ def build_director_llm():
 
 
 @app.post("/api/v1/director/plan")
-def director_plan(request: DirectorPlanRequest) -> dict:
+def generate_director_plan(request: DirectorPlanRequest) -> dict:
     """描述 → 合法可编辑计划草稿。
 
     服务端校验是必经步骤：候选计划不合法会被修复（最多两次），
