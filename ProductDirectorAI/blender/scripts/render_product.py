@@ -18,6 +18,8 @@ def parse_args():
     parser.add_argument("--height", type=int, default=960)
     parser.add_argument("--frames", type=int, default=144)
     parser.add_argument("--plan", required=True, help="Frozen DirectorPlan JSON created for this render job")
+    parser.add_argument("--passes", action="store_true",
+                        help="V3：额外输出 Beauty/Alpha/Depth/Normal/Index 多通道（不改动既有单帧产物）")
     return parser.parse_args(sys.argv[sys.argv.index("--") + 1 :])
 
 
@@ -109,6 +111,50 @@ def add_lighting(scene_spec: dict | None = None):
 
 
 ALLOWED_CAMERAS = {"dolly_in", "side_track", "hero_orbit", "static"}
+
+
+def configure_passes(product_meshes, pass_root: Path) -> None:
+    """V3-01：为每帧额外输出 Beauty / Alpha / Depth / Normal / ProductIndex。
+
+    - 产品网格获得稳定 pass_index（1 起），不用随导入顺序变化的数字 ID；
+    - Depth 以 EXR 32 位保存，单位是相机空间米（Blender Z pass 语义）；
+    - Normal 以 EXR 16 位保存，坐标空间为相机空间（Blender Normal pass 语义）；
+    - Beauty/Alpha 用 PNG；Alpha 来自 film_transparent 的透明产品层。
+    打开该开关会启用 film_transparent，因此**默认不开启**，既有单帧产物与验收哈希不受影响。
+    """
+    scene = bpy.context.scene
+    scene.render.film_transparent = True
+    view_layer = bpy.context.view_layer
+    view_layer.use_pass_combined = True
+    view_layer.use_pass_z = True
+    view_layer.use_pass_normal = True
+    view_layer.use_pass_object_index = True
+    for index, obj in enumerate(product_meshes, start=1):
+        obj.pass_index = index
+    pass_root.mkdir(parents=True, exist_ok=True)
+    scene.use_nodes = True
+    tree = scene.node_tree
+    tree.nodes.clear()
+    layers = tree.nodes.new("CompositorNodeRLayers")
+    composite = tree.nodes.new("CompositorNodeComposite")
+    tree.links.new(layers.outputs["Image"], composite.inputs["Image"])
+    channels = {
+        "beauty": ("Image", "PNG", "8"),
+        "alpha": ("Alpha", "PNG", "8"),
+        "depth": ("Depth", "OPEN_EXR", "32"),
+        "normal": ("Normal", "OPEN_EXR", "16"),
+        "index": ("IndexOB", "OPEN_EXR", "16"),
+    }
+    for name, (socket, file_format, depth) in channels.items():
+        node = tree.nodes.new("CompositorNodeOutputFile")
+        node.base_path = str(pass_root / name)
+        node.file_slots[0].path = "frame_"
+        node.format.file_format = file_format
+        node.format.color_depth = depth
+        if file_format == "OPEN_EXR":
+            node.format.color_mode = "RGBA" if name == "normal" else "BW"
+        tree.links.new(layers.outputs[socket], node.inputs[0])
+    print(f"DIRECTOR_PASSES root={pass_root} channels={','.join(channels)}", flush=True)
 
 
 def load_plan(path: str, total_frames: int) -> list[dict]:
@@ -226,6 +272,8 @@ def main():
     meshes = import_product(args.input)
     normalize(meshes, plan_payload.get("product_pose"))
     add_lighting(plan_payload.get("scene"))
+    if args.passes:
+        configure_passes(meshes, output / "passes")
     camera_data = bpy.data.cameras.new("Director Camera")
     camera = bpy.data.objects.new("Director Camera", camera_data)
     bpy.context.collection.objects.link(camera)
