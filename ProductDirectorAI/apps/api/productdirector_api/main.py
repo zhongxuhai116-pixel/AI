@@ -36,6 +36,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image, ImageStat
 from . import director_plan, security, storage
 from .director_plan import CameraPath, ProductPose, SceneSpec, Vector3
+from .providers import comfyui
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -345,6 +346,19 @@ def initialize_db() -> None:
               expires_at REAL NOT NULL,
               key_fingerprint TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS provider_jobs (
+              id TEXT PRIMARY KEY,
+              provider TEXT NOT NULL,
+              operation TEXT NOT NULL,
+              external_id TEXT,
+              status TEXT NOT NULL,
+              stage TEXT NOT NULL,
+              request_payload TEXT NOT NULL,
+              artifact_asset_id TEXT,
+              error TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             """
     with connect() as db:
         db.executescript(schema_sql)
@@ -480,6 +494,18 @@ class PlanUpdate(BaseModel):
 class RunRequest(BaseModel):
     plan_id: str
     idempotency_key: str | None = None
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
+
+
+class H3ReconstructRequest(BaseModel):
+    """V2：用现有 H3/ComfyUI 环境从产品图重建 3D 模型。"""
+
+    product_asset_id: str
+    crop: tuple[int, int, int, int] = (0, 0, 512, 512)
+    steps: int = Field(default=50, ge=1, le=200)
+    cfg: float = Field(default=5.0, ge=0.0, le=100.0)
+    seed: int = Field(default=20260912, ge=0)
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
@@ -1884,6 +1910,169 @@ def test_minimax_generation() -> dict:
         )
     result = provider_public_status()
     result["http_status"] = status
+    return result
+
+
+def provider_job_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "provider": row["provider"],
+        "operation": row["operation"],
+        "external_id": row["external_id"],
+        "status": row["status"],
+        "stage": row["stage"],
+        "artifact_asset_id": row["artifact_asset_id"],
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def load_provider_job(provider_job_id: str) -> dict:
+    with connect() as db:
+        row = db.execute("SELECT * FROM provider_jobs WHERE id = ?", (provider_job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Provider 任务不存在")
+    return dict(row)
+
+
+def insert_provider_job(
+    provider_job_id: str, external_id: str | None, status: str, stage: str,
+    payload: dict, error: str | None = None, artifact_asset_id: str | None = None,
+) -> None:
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO provider_jobs (id, provider, operation, external_id, status, stage, request_payload, "
+            "artifact_asset_id, error, created_at, updated_at) "
+            "VALUES (?, 'h3-comfyui', 'RECONSTRUCT_3D', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (provider_job_id, external_id, status, stage, json.dumps(payload, ensure_ascii=False),
+             artifact_asset_id, error, now, now),
+        )
+
+
+def update_provider_job(provider_job_id: str, **values) -> None:
+    if not values:
+        return
+    values["updated_at"] = utc_now()
+    with connect() as db:
+        db.execute(
+            "UPDATE provider_jobs SET " + ", ".join(f"{key} = ?" for key in values) + " WHERE id = ?",
+            [*values.values(), provider_job_id],
+        )
+
+
+@app.get("/api/v1/providers/h3/status")
+def h3_provider_status() -> dict:
+    """H3/ComfyUI 可用性与队列概览（不含凭证与文件内容）。"""
+    return comfyui.health()
+
+
+@app.post("/api/v1/providers/h3/reconstruct", status_code=202)
+def h3_reconstruct(request: H3ReconstructRequest) -> dict:
+    """把一个产品图素材提交给现有 H3/ComfyUI 环境做 3D 重建。"""
+    owner_id, _, _project_id = normalize_contract_context(request.owner_id, request.project_id)
+    with connect() as db:
+        asset = db.execute("SELECT * FROM assets WHERE id = ?", (request.product_asset_id,)).fetchone()
+    if not asset:
+        raise HTTPException(404, "产品素材不存在")
+    if asset["owner_id"] != owner_id:
+        raise HTTPException(403, "越权使用素材")
+    if asset["kind"] != "image":
+        raise HTTPException(422, "H3 重建目前只接受图片素材")
+    x, y, width, height = request.crop
+    if x < 0 or y < 0 or width < 64 or height < 64:
+        raise HTTPException(422, "裁切区域无效")
+
+    path = resolve_asset_path(asset)
+    provider_job_id = str(uuid.uuid4())
+    payload = {
+        "asset_id": asset["id"],
+        "asset_sha256": asset["sha256"],
+        "crop": [x, y, width, height],
+        "steps": request.steps,
+        "cfg": request.cfg,
+        "seed": request.seed,
+    }
+    try:
+        remote_name = comfyui.upload_image(f"{provider_job_id}{path.suffix}", path.read_bytes())
+        graph = comfyui.build_hunyuan3d_graph(
+            remote_name, (x, y, width, height), f"productdirector/{provider_job_id}",
+            seed=request.seed, steps=request.steps, cfg=request.cfg,
+        )
+        external_id = comfyui.submit(graph, client_id=provider_job_id)
+    except comfyui.ComfyUIError as exc:
+        # 在独立事务里记录失败，避免异常回滚掉这条记录。
+        insert_provider_job(provider_job_id, None, "FAILED", "SUBMIT", payload, error=str(exc)[-2000:])
+        raise HTTPException(503, f"H3 Provider 提交失败: {exc}") from exc
+
+    insert_provider_job(provider_job_id, external_id, "RUNNING", "GENERATE", payload)
+    return {
+        "provider_job_id": provider_job_id,
+        "external_id": external_id,
+        "status": "RUNNING",
+        "status_url": f"/api/v1/providers/h3/jobs/{provider_job_id}",
+    }
+
+
+@app.get("/api/v1/providers/h3/jobs/{provider_job_id}")
+def h3_job_status(
+    provider_job_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> dict:
+    """查询重建进度；完成时下载 GLB、校验并登记为素材库资产。"""
+    normalize_contract_context(owner_id, project_id)
+    row = load_provider_job(provider_job_id)
+    if row["status"] in TERMINAL_JOB_STATUSES or not row["external_id"]:
+        return provider_job_public(row)
+
+    try:
+        record = comfyui.history(row["external_id"])
+    except comfyui.ComfyUIError as exc:
+        update_provider_job(provider_job_id, error=str(exc)[-2000:])
+        raise HTTPException(503, f"无法查询 H3 Provider: {exc}") from exc
+
+    status = comfyui.status_text(record)
+    if status == "RUNNING":
+        return provider_job_public(load_provider_job(provider_job_id))
+    if status == "FAILED":
+        update_provider_job(provider_job_id, status="FAILED", stage="GENERATE", error="Provider 报告执行失败")
+        return provider_job_public(load_provider_job(provider_job_id))
+
+    item = next((entry for entry in comfyui.outputs(record) if entry["filename"].lower().endswith(".glb")), None)
+    if not item:
+        update_provider_job(provider_job_id, status="FAILED", stage="COLLECT", error="Provider 完成但没有 GLB 产物")
+        return provider_job_public(load_provider_job(provider_job_id))
+
+    try:
+        data = comfyui.download(item)
+        info = inspect_glb(data)
+    except (comfyui.ComfyUIError, HTTPException) as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        update_provider_job(provider_job_id, status="FAILED", stage="COLLECT", error=str(detail)[-2000:])
+        return provider_job_public(load_provider_job(provider_job_id))
+
+    asset_id = str(uuid.uuid4())
+    stored = UPLOADS / f"{asset_id}.glb"
+    stored.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    source_asset_id = (json.loads(row["request_payload"]) or {}).get("asset_id")
+    with connect() as db:
+        source = db.execute("SELECT name FROM assets WHERE id = ?", (source_asset_id,)).fetchone()
+    display = f"H3 重建 · {Path(source['name']).stem if source else 'product'}.glb"
+    with connect() as db:
+        db.execute(
+            "INSERT INTO assets (id, name, kind, mime, size_bytes, sha256, path, created_at, owner_id) "
+            "VALUES (?, ?, 'model', 'model/gltf-binary', ?, ?, ?, ?, ?)",
+            (asset_id, display, len(data), digest, stored.name, utc_now(), owner_id),
+        )
+    update_provider_job(
+        provider_job_id, status="SUCCEEDED", stage="ARTIFACT",
+        artifact_asset_id=asset_id, error=None,
+    )
+    result = provider_job_public(load_provider_job(provider_job_id))
+    result["artifact"] = {"asset_id": asset_id, "sha256": digest, "bytes": len(data), "glb": info}
     return result
 
 

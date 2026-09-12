@@ -161,5 +161,19 @@ CREATE TABLE IF NOT EXISTS provider_credentials (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS provider_jobs (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  external_id TEXT,
+  status TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  request_payload TEXT NOT NULL,
+  artifact_asset_id TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_contracts_plan_version ON plan_contracts (plan_id, version);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_plan_id_idempotency ON runs (plan_id, idempotency_key);
