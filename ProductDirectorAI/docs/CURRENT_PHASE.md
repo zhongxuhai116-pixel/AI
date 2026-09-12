@@ -57,6 +57,7 @@
 - A06 已完成：媒体质量门（黑帧/可见性）、失败/取消重试、构图锚点与实时预览、真实 Chrome 端到端走查（桌面/窄屏/失败态）、GLB 上传校验（损坏/外部资源/无网格）与渲染前磁盘空间保护。后端本地与云端均 62/62 通过，见 [A06 用户流程与质量](reports/A06_USER_FLOW_QUALITY.md)
 - A02 进行中：补齐了缺失的 ImagePreviewSpec 合同（新增 `contracts/image-preview.v1.*`）并加了一致性守卫测试（Schema/示例/运行时三方同步、同一批正负例双方判定一致）。仍未实现目标 3D 合同的运行时模型、产品版本审核工作流与非 6 秒时长，见 [A02/A03 验收](reports/A02_A03_ACCEPTANCE.md)
 - A03 关键门已达标（仍未切换）：云节点安装仅回环的 PostgreSQL 14.24，用线上库只读快照完成迁移、幂等复跑、`pg_dump` 备份与恢复，并逐表核对行数与内容摘要全部一致；新增 10 次幂等、失败不留半任务与事务回滚用例。API 仍运行 SQLite，切换需单独授权与维护窗口，见 [A03 PostgreSQL 演练](reports/A03_POSTGRES_DRILL.md)
+- A03 数据库层已可切换：新增 `productdirector_api/storage.py`，`PRODUCTDIRECTOR_DATABASE_URL` 决定后端；SQLite 行为保持不变（既有测试未改仍通过），PostgreSQL 路径以适配器改写方言。真实 API 已在 PostgreSQL 上完成一次真实 FFmpeg 出片（1080×1920 / 144 帧 / 质量门通过 / 幂等复用），后端回归本地与云端均 79/79。线上服务仍未切换，见 [A03 PostgreSQL 演练](reports/A03_POSTGRES_DRILL.md) 第 7 节
 - 深色侧栏、浅色卡片、橙色主动作的 V1 工作台
 
 ## 暂不实现

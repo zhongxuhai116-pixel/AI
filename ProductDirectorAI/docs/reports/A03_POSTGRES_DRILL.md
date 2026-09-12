@@ -94,3 +94,52 @@ sudo ./scripts/pg_restore_drill.sh /home/ubuntu/AI/ProductDirectorAI/var/product
 3. **类型未重新建模**：本次是 1:1 翻译（时间仍是 TEXT、布尔仍是 INTEGER），没有把时间改成 `timestamptz`、没有加约束/索引优化。
 4. **数据库运维**：单机本地实例，没有备份计划、保留策略、复制或高可用。
 5. **应用层未适配**：`main.py` 仍直接使用 `sqlite3`（含 `PRAGMA`、`BEGIN IMMEDIATE`、`executescript`），尚未抽象出可切换的数据库层。
+
+---
+
+## 7. 应用层跑在 PostgreSQL 上（2026-09-12 追加）
+
+上面第 6.5 条已经处理：新增 `apps/api/productdirector_api/storage.py`，`main.connect()` 改为委托给它。
+
+### 7.1 抽象方式
+
+- 后端由环境变量 `PRODUCTDIRECTOR_DATABASE_URL` 决定：未设置或 `sqlite:///…` 走 SQLite，`postgresql://…` 走 PostgreSQL。
+- **SQLite 路径原样返回 `sqlite3` 连接**，行为与历史实现完全一致（既有 65 项测试未改动仍全部通过）。
+- PostgreSQL 路径用 `PostgresConnection` 适配 `sqlite3` 的连接形状：`execute/executemany/executescript`、`fetchone/fetchall/rowcount`、以及 `with connect() as db:` 的"成功提交、异常回滚"语义。
+- SQL 方言改写在适配器内完成：`?` → `%s`（并转义字面量 `%`）、`INSERT OR IGNORE` → `INSERT … ON CONFLICT DO NOTHING`、`BEGIN IMMEDIATE` → `BEGIN`；列名读取走 `information_schema`；建表使用 `db/schema.postgres.sql`。
+
+`main.py` 的改动只有 5 处（`connect`/`begin_immediate`/`ensure_column`/`initialize_db`/导入），其余数百处 `with connect() as db:` 与 `db.execute(...)` 无需改动。
+
+### 7.2 单元测试
+
+`tests/test_storage_translation.py`（14 项，不需要真实 PostgreSQL）：占位符与 `%` 转义、`INSERT OR IGNORE` 改写、`BEGIN IMMEDIATE` 改写、脚本切分、URL 解析、适配器调用形状、成功提交/异常回滚、`information_schema` 列读取。
+
+后端回归：本地 **79/79**、云端 **79/79** 通过。
+
+### 7.3 真实 PostgreSQL 上的应用层冒烟
+
+`scripts/pg_app_smoke.py` 把 `PRODUCTDIRECTOR_DATABASE_URL` 指向 PostgreSQL 后启动真实 FastAPI（TestClient 走完整中间件），并用**真实 FFmpeg**出片（素材与成片写入临时目录，不污染线上 `var/`）：
+
+| 检查 | 结果 |
+| --- | --- |
+| `/api/v1/health` | ok（blender / ffmpeg / ffprobe 均 available） |
+| 素材上传 + 模板计划 + 分镜编辑 + 批准 + 启动任务 | 通过 |
+| 作业终态 | `SUCCEEDED` / `ARTIFACT`，`error=null` |
+| 产物 | H.264、1080×1920、144 帧、6.000 秒、146,100 字节 |
+| 质量门 | `qa.passed = true` |
+| 幂等 | 同 `idempotency_key` 第二次请求 `created=false` 且复用同一 `run_id` |
+| 应用自建表 | 14 张表全部由应用在 PostgreSQL 中创建 |
+
+随后直接查 PostgreSQL 核对，行数与"一次逻辑运行"完全一致：
+
+```
+jobs=1  runs=1  run_jobs=1  job_attempts=1  job_events=6  plan_contracts=2  product_versions=2
+```
+
+### 7.4 仍未完成
+
+1. **线上服务仍跑 SQLite**：切换需要维护窗口、写入冻结（或增量对账）与回滚方案，属于单独授权的动作。
+2. **测试仍以 SQLite 为主**：PostgreSQL 路径由冒烟脚本覆盖，尚未把整套测试参数化到两种后端。
+3. **性能未评估**：适配器对每条语句做一次字符串改写，未做基准对比。
+4. **数据库运维空白**：单机本地实例，没有备份计划、保留策略或高可用。
+5. **类型未重新建模**：列类型仍是 1:1 翻译（时间为 TEXT、布尔为 INTEGER）。

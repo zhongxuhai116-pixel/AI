@@ -25,7 +25,7 @@
 | [云端部署与双链路出片验收](reports/CLOUD_DEPLOY_A05_ACCEPTANCE.md) | 本轮代码部署到云节点；图片与 GLB 双链路真实出片、A05 鉴权生效、GPU 采样与产物哈希 |
 | [A06 用户流程与质量](reports/A06_USER_FLOW_QUALITY.md) | 媒体质量门（黑帧/可见性）实现与本地/云端验证；其余 A06 任务进行中 |
 | [A07 V1 阶段验收](reports/A07_V1_ACCEPTANCE.md) | 用户真实产品图（非拳击品类）端到端出片、视觉复核与门状态清单；含待处理构图问题 |
-| [A03 PostgreSQL 迁移与恢复演练](reports/A03_POSTGRES_DRILL.md) | 隔离库迁移 + pg_dump 恢复 + 逐表内容摘要核对 PASS；API 仍未切换 |
+| [A03 PostgreSQL 迁移与恢复演练](reports/A03_POSTGRES_DRILL.md) | 隔离库迁移 + pg_dump 恢复 + 逐表内容摘要核对 PASS；数据库层可切换，真实 API 已在 PostgreSQL 上出片；线上仍未切换 |
 | [执行指令](../CODEX_SOL56_START_HERE.md) | 给下一台电脑上的 Codex/SOL 5.6；先审计、复验、保留已有代码 |
 | [工程约束](../AGENTS.md) | 版本、安全、测试与用户工作保护 |
 | [项目 README](../README.md) | 当前项目和本机启动入口 |
