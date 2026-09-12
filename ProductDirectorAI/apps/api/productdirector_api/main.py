@@ -372,6 +372,17 @@ def initialize_db() -> None:
               UNIQUE(product_version_id, version),
               FOREIGN KEY(product_version_id) REFERENCES product_versions(id)
             );
+            CREATE TABLE IF NOT EXISTS product_reviews (
+              id TEXT PRIMARY KEY,
+              product_version_id TEXT NOT NULL,
+              decision TEXT NOT NULL,
+              source_kind TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              reviewer TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(product_version_id) REFERENCES product_versions(id)
+            );
             """
     with connect() as db:
         db.executescript(schema_sql)
@@ -383,6 +394,8 @@ def initialize_db() -> None:
         ensure_column(db, "provider_jobs", "artifact_sha256", "TEXT")
         ensure_column(db, "provider_jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(db, "product_versions", "approved_at", "TEXT")
+        for column in ("verified_dimensions", "view_coverage", "unverified_regions", "logo_regions", "camera_visibility_constraints"):
+            ensure_column(db, "product_versions", column, "TEXT")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
         if not storage.is_postgres():
             legacy_index = db.execute(
@@ -600,6 +613,33 @@ class FidelityPolicyRequest(BaseModel):
             forbidden = [item for item in self.allowed_operations if item == "background_generation"]
             if forbidden:
                 raise ValueError("STRICT 模式不允许背景生成直接覆盖产品像素")
+        return self
+
+
+class ProductReviewRequest(BaseModel):
+    """V3-04：冻结一次产品版本审核，并把核实结果绑定到版本上。"""
+
+    decision: Literal["APPROVED", "REJECTED"]
+    verified_dimensions: dict[str, float] = Field(default_factory=dict)
+    view_coverage: list[str] = Field(default_factory=list, max_length=24)
+    unverified_regions: list[str] = Field(default_factory=list, max_length=24)
+    logo_regions: list[ProtectedRegion] = Field(default_factory=list, max_length=32)
+    camera_visibility_constraints: list[str] = Field(default_factory=list, max_length=24)
+    evidence_asset_ids: list[str] = Field(default_factory=list, max_length=24)
+    source_kind: Literal["multi_view", "single_image", "cad"] = "cad"
+    notes: str = Field(default="", max_length=2000)
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
+
+    @model_validator(mode="after")
+    def enforce_single_image_rule(self):
+        # 单图重建：未观测面必须显式声明未核实，并给出相机可见性限制；
+        # 不允许用生成图把未核实区域变成"已核实事实"。
+        if self.source_kind == "single_image" and self.decision == "APPROVED":
+            if not self.unverified_regions:
+                raise ValueError("单图来源的版本必须列出未核实区域（unverified_regions）")
+            if not self.camera_visibility_constraints:
+                raise ValueError("单图来源的版本必须给出相机可见性限制")
         return self
 
 
@@ -2802,6 +2842,88 @@ def list_product_versions(
                 (owner_id, project_id),
             ).fetchall()
     return [product_version_public(row) for row in rows]
+
+
+def product_review_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "product_version_id": row["product_version_id"],
+        "decision": row["decision"],
+        "source_kind": row["source_kind"],
+        "reviewer": row["reviewer"],
+        "payload_sha256": row["payload_sha256"],
+        "created_at": row["created_at"],
+        "review": json.loads(row["payload"]),
+    }
+
+
+@app.post("/api/v1/product-versions/{product_version_id}/reviews", status_code=201)
+def create_product_review(product_version_id: str, request: ProductReviewRequest) -> dict:
+    """冻结产品版本审核，并把核实结果绑定到该版本。"""
+    owner_id, _, project_id = normalize_contract_context(request.owner_id, request.project_id)
+    load_product_version_for_owner(product_version_id, owner_id, project_id)
+    # 证据素材必须存在且属于同一 owner，避免引用他人的素材当证据。
+    with connect() as db:
+        for asset_id in request.evidence_asset_ids:
+            asset = db.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
+            if not asset:
+                raise HTTPException(404, f"证据素材不存在: {asset_id}")
+            if asset["owner_id"] != owner_id:
+                raise HTTPException(403, f"证据素材不属于当前 Owner: {asset_id}")
+    payload = {
+        "decision": request.decision,
+        "verified_dimensions": request.verified_dimensions,
+        "view_coverage": list(request.view_coverage),
+        "unverified_regions": list(request.unverified_regions),
+        "logo_regions": [region.model_dump() for region in request.logo_regions],
+        "camera_visibility_constraints": list(request.camera_visibility_constraints),
+        "evidence_asset_ids": list(request.evidence_asset_ids),
+        "source_kind": request.source_kind,
+        "notes": request.notes,
+    }
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    review_id = str(uuid.uuid4())
+    with connect() as db:
+        begin_immediate(db)
+        db.execute(
+            "INSERT INTO product_reviews (id, product_version_id, decision, source_kind, payload, payload_sha256, reviewer, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (review_id, product_version_id, request.decision, request.source_kind,
+             payload_text, digest, owner_id, utc_now()),
+        )
+        # 审核结果绑定到版本：核实信息随版本可查，供合成与 QA 使用。
+        db.execute(
+            "UPDATE product_versions SET verified_dimensions = ?, view_coverage = ?, unverified_regions = ?, "
+            "logo_regions = ?, camera_visibility_constraints = ? WHERE id = ?",
+            (
+                json.dumps(request.verified_dimensions, ensure_ascii=False),
+                json.dumps(list(request.view_coverage), ensure_ascii=False),
+                json.dumps(list(request.unverified_regions), ensure_ascii=False),
+                json.dumps([region.model_dump() for region in request.logo_regions], ensure_ascii=False),
+                json.dumps(list(request.camera_visibility_constraints), ensure_ascii=False),
+                product_version_id,
+            ),
+        )
+    with connect() as db:
+        row = db.execute("SELECT * FROM product_reviews WHERE id = ?", (review_id,)).fetchone()
+    return product_review_public(row)
+
+
+@app.get("/api/v1/product-versions/{product_version_id}/reviews")
+def list_product_reviews(
+    product_version_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    load_product_version_for_owner(product_version_id, owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM product_reviews WHERE product_version_id = ? ORDER BY created_at DESC",
+            (product_version_id,),
+        ).fetchall()
+    return [product_review_public(row) for row in rows]
 
 
 def fidelity_policy_public(row) -> dict:

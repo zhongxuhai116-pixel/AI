@@ -76,6 +76,9 @@
 - V3 材质素材决定：用户**不能提供**带材质/纹理的模型，要求执行者**在网上查找**可用素材。V3 需登记该素材的来源与许可，并与用户资产分开标注
 - V3 材质素材已落地：从 Polyhaven（**CC0**）取得 `Camera_01`，按其官方 gltf 包清单下载 11 个文件（2.43MB，含 9 张贴图），用 Blender 转为自包含 GLB（2.45MB / 2 网格 / 4 材质 / 9 图像），并经本项目 `inspect_glb` 校验 `has_textures=true`。该素材与用户资产分开标注、不进 Git；几何/尺寸保真仍用官方 STEP 模型，材质/Logo 保真改用本 CC0 资产
 - V3-01/02 进展：多通道已能落盘（Blender 5 必须显式创建 `file_output_items`；72 帧 → 72 个多层 EXR，含 beauty/alpha/depth/normal），但 `index`（对象索引）在 Blender 5.2 无对应 RenderLayers 输出、且多层 EXR 的读取方式未定，**V3-02 仍未通过**，V3-03 之后未开工
+- V3-01 / V3-02 **已通过**（2026-09-12）：每通道一个输出节点后，官方模型 72 帧产出 beauty/alpha/depth/normal（EXR）与产品遮罩（PNG）全部 72/72；校验 `passed: true`——遮罩与 Beauty Alpha 覆盖率逐帧完全一致、遮罩二值度 0.994–0.996、法线模长≈1、产品区最近深度 2.58–3.06 米。校验器已改为不依赖 Blender（venv 的 Pillow + OpenEXR）
+- V3-03 **已完成**：FidelityPolicy 版本化合同（mode / 保护区域 / 允许操作），STRICT 拒绝背景生成、保护区域必须落在画面内、未知操作 422；不可改写 + 内容哈希，越权 403
+- V3-04 **已完成**：`POST /product-versions/{id}/reviews` 冻结审核并把核实结果绑定到版本（verified_dimensions / view_coverage / unverified_regions / logo_regions / camera_visibility_constraints）；证据素材必须属于同一 Owner；**单图来源批准时必须声明未核实区域与相机可见性限制**。后端本地与云端 152/152
 - A06 已完成：媒体质量门（黑帧/可见性）、失败/取消重试、构图锚点与实时预览、真实 Chrome 端到端走查（桌面/窄屏/失败态）、GLB 上传校验（损坏/外部资源/无网格）与渲染前磁盘空间保护。后端本地与云端均 62/62 通过，见 [A06 用户流程与质量](reports/A06_USER_FLOW_QUALITY.md)
 - A02 进行中：补齐了缺失的 ImagePreviewSpec 合同（新增 `contracts/image-preview.v1.*`）并加了一致性守卫测试（Schema/示例/运行时三方同步、同一批正负例双方判定一致）。仍未实现目标 3D 合同的运行时模型、产品版本审核工作流与非 6 秒时长，见 [A02/A03 验收](reports/A02_A03_ACCEPTANCE.md)
 - A02 目标 3D 合同已落地：`Shot` 支持 `camera_target_m` / `camera_path`（环绕、推近、横移、定格）/`sensor_width_mm`，计划支持 `product_pose` 与 `scene`，Blender 脚本按合同取景而非硬编码；Manifest 写入经根 Schema 校验的 `director_plan_3d`。云端两次真实渲染验证：默认计划哈希与历史完全一致（无回归），显式轨迹产出不同成片。仍缺产品版本审核工作流、非 6 秒时长与前端轨迹编辑，见 [A02/A03 验收](reports/A02_A03_ACCEPTANCE.md)

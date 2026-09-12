@@ -192,3 +192,14 @@ CREATE TABLE IF NOT EXISTS fidelity_policies (
   created_at TEXT NOT NULL,
   UNIQUE (product_version_id, version)
 );
+
+CREATE TABLE IF NOT EXISTS product_reviews (
+  id TEXT PRIMARY KEY,
+  product_version_id TEXT NOT NULL REFERENCES product_versions(id),
+  decision TEXT NOT NULL,
+  source_kind TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  reviewer TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
