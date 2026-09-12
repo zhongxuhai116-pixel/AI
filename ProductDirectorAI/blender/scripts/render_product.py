@@ -177,10 +177,10 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
         node.format.file_format = "OPEN_EXR_MULTILAYER"
         for index, (name, socket, socket_type) in enumerate([
             ("beauty", "Image", "RGBA"),
-            ("alpha", "Alpha", "Alpha"),
-            ("depth", "Depth", "Float"),
-            ("normal", "Normal", "Vector"),
-            ("index", "IndexOB", "Float"),
+            ("alpha", "Alpha", "FLOAT"),
+            ("depth", "Depth", "FLOAT"),
+            ("normal", "Normal", "VECTOR"),
+            ("index", "IndexOB", "INT"),
         ]):
             node.file_output_items.new(socket_type, name)
             tree.links.new(layers.outputs[socket], node.inputs[index])
