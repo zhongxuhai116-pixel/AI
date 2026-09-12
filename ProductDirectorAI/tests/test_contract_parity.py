@@ -127,7 +127,10 @@ class ImagePreviewContractTests(unittest.TestCase):
         self.assertEqual(schema_output, runtime_output, "OutputSpec 字段在 Schema 与运行时之间漂移")
 
         schema_top = set(self.schema["properties"])
-        snapshot_keys = {"schema_version", "product_asset_id", "intent", "output", "fidelity_mode", "crop_anchor", "shots"}
+        snapshot_keys = {
+            "schema_version", "product_asset_id", "intent", "output",
+            "fidelity_mode", "crop_anchor", "product_pose", "scene", "shots",
+        }
         self.assertEqual(schema_top, snapshot_keys, "快照顶层字段与冻结快照不一致")
 
     def test_target_3d_plan_contract_is_still_structurally_valid(self) -> None:

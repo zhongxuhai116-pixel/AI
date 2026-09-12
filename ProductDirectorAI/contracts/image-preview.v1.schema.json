@@ -5,7 +5,7 @@
   "description": "图片素材的冻结计划快照形状。该文件描述当前运行时真实写入作业目录并驱动 FFmpeg 的字段；镜头总帧数必须为 144、产品授权与可见性属于语义校验，不由本 Schema 证明。",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "product_asset_id", "intent", "output", "fidelity_mode", "crop_anchor", "shots"],
+  "required": ["schema_version", "product_asset_id", "intent", "output", "fidelity_mode", "crop_anchor", "product_pose", "scene", "shots"],
   "properties": {
     "schema_version": {"const": "1.0"},
     "product_asset_id": {"$ref": "#/$defs/uuid"},
@@ -13,6 +13,8 @@
     "output": {"$ref": "#/$defs/output"},
     "fidelity_mode": {"const": "STRICT_REQUESTED"},
     "crop_anchor": {"$ref": "#/$defs/cropAnchor"},
+    "product_pose": {"$ref": "#/$defs/productPose"},
+    "scene": {"$ref": "#/$defs/scene"},
     "shots": {
       "type": "array",
       "minItems": 3,
@@ -28,6 +30,26 @@
     "cropAnchor": {
       "description": "横/竖素材裁进 9:16 时保留哪一侧；图片预演专有字段，GLB 路径由真实机位决定构图。",
       "enum": ["center", "top", "bottom", "left", "right"]
+    },
+    "productPose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position_m", "rotation_xyz_deg", "scale"],
+      "properties": {
+        "position_m": {"$ref": "#/$defs/vector3"},
+        "rotation_xyz_deg": {"$ref": "#/$defs/vector3"},
+        "scale": {"type": "number", "exclusiveMinimum": 0, "maximum": 100}
+      }
+    },
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["template", "background_color", "lighting_preset"],
+      "properties": {
+        "template": {"const": "studio_product"},
+        "background_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+        "lighting_preset": {"enum": ["softbox", "three_point"]}
+      }
     },
     "output": {
       "type": "object",
@@ -53,8 +75,62 @@
         "name": {"type": "string", "minLength": 1, "maxLength": 120},
         "duration_frames": {"type": "integer", "minimum": 24, "maximum": 144},
         "camera": {"enum": ["dolly_in", "side_track", "hero_orbit", "static"]},
-        "focal_length_mm": {"type": "integer", "minimum": 15, "maximum": 120}
+        "focal_length_mm": {"type": "integer", "minimum": 15, "maximum": 120},
+        "sensor_width_mm": {"type": "number", "description": "相机传感器宽度；目标 3D 合同当前固定为 36", "exclusiveMinimum": 0, "maximum": 200},
+        "camera_target_m": {"$ref": "#/$defs/vector3", "description": "相机注视点；缺省时渲染器使用默认取景"},
+        "camera_path": {"$ref": "#/$defs/cameraPath", "description": "目标 3D 合同的相机轨迹；缺省时按 camera 枚举生成默认轨迹"}
       }
+    },
+    "vector3": {
+      "type": "array",
+      "prefixItems": [{"type": "number"}, {"type": "number"}, {"type": "number"}],
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "cameraPath": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "radius_m", "height_m", "start_angle_deg", "end_angle_deg"],
+          "properties": {
+            "type": {"const": "hero_orbit"},
+            "radius_m": {"type": "number", "exclusiveMinimum": 0, "maximum": 1000},
+            "height_m": {"type": "number", "minimum": 0, "maximum": 1000},
+            "start_angle_deg": {"type": "number", "minimum": -360, "maximum": 360},
+            "end_angle_deg": {"type": "number", "minimum": -360, "maximum": 360}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "start_m", "end_m"],
+          "properties": {
+            "type": {"const": "dolly_in"},
+            "start_m": {"$ref": "#/$defs/vector3"},
+            "end_m": {"$ref": "#/$defs/vector3"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "start_m", "end_m"],
+          "properties": {
+            "type": {"const": "side_track"},
+            "start_m": {"$ref": "#/$defs/vector3"},
+            "end_m": {"$ref": "#/$defs/vector3"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "position_m"],
+          "properties": {
+            "type": {"const": "static"},
+            "position_m": {"$ref": "#/$defs/vector3"}
+          }
+        }
+      ]
     }
   }
 }

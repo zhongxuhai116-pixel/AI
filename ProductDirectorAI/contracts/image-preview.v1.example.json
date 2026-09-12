@@ -10,6 +10,16 @@
   },
   "fidelity_mode": "STRICT_REQUESTED",
   "crop_anchor": "left",
+  "product_pose": {
+    "position_m": [0, 0, 0],
+    "rotation_xyz_deg": [0, 0, 0],
+    "scale": 1
+  },
+  "scene": {
+    "template": "studio_product",
+    "background_color": "#0A0A0C",
+    "lighting_preset": "softbox"
+  },
   "shots": [
     {
       "id": "shot_01",

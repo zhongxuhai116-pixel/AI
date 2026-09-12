@@ -34,7 +34,7 @@ def import_product(path: str):
     return meshes
 
 
-def normalize(meshes):
+def normalize(meshes, pose: dict | None = None):
     corners = []
     for obj in meshes:
         corners.extend(obj.matrix_world @ Vector(corner) for corner in obj.bound_box)
@@ -50,6 +50,15 @@ def normalize(meshes):
         obj.scale *= scale
         obj.location = (obj.location - center) * scale
         obj.location.z += size.z * scale / 2
+    if pose:
+        # 目标 3D 合同的 product_pose：在归一化底座上再叠加位置/旋转/缩放。
+        offset = Vector(pose.get("position_m") or (0, 0, 0))
+        rotation = pose.get("rotation_xyz_deg") or (0, 0, 0)
+        extra_scale = float(pose.get("scale", 1) or 1)
+        for obj in meshes:
+            obj.location = Vector(obj.location) + offset
+            obj.rotation_euler = tuple(math.radians(value) for value in rotation)
+            obj.scale *= extra_scale
     bpy.context.view_layer.update()
 
 
@@ -58,15 +67,30 @@ def track(camera, target):
     camera.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
 
-def add_lighting():
+def hex_to_rgb(value: str) -> tuple[float, float, float]:
+    text = str(value).lstrip("#")
+    return tuple(int(text[index:index + 2], 16) / 255 for index in (0, 2, 4))
+
+
+def add_lighting(scene_spec: dict | None = None):
+    spec = scene_spec or {}
     world = bpy.context.scene.world or bpy.data.worlds.new("World")
     bpy.context.scene.world = world
-    world.color = (0.035, 0.035, 0.045)
-    lights = [
-        ((-3.2, -4.0, 5.0), 950, 4.0),
-        ((3.5, -1.0, 3.0), 700, 3.0),
-        ((0.0, 3.0, 4.5), 850, 3.0),
-    ]
+    world.color = hex_to_rgb(spec.get("background_color") or "#0A0A0C")
+    preset = spec.get("lighting_preset") or "softbox"
+    if preset == "three_point":
+        # 经典三点布光：主光更硬、补光更低、轮廓光在背后。
+        lights = [
+            ((-4.0, -4.5, 5.5), 1200, 3.0),
+            ((4.5, -2.0, 2.6), 520, 2.5),
+            ((0.5, 4.2, 4.8), 900, 2.0),
+        ]
+    else:
+        lights = [
+            ((-3.2, -4.0, 5.0), 950, 4.0),
+            ((3.5, -1.0, 3.0), 700, 3.0),
+            ((0.0, 3.0, 4.5), 850, 3.0),
+        ]
     for index, (location, energy, size) in enumerate(lights):
         data = bpy.data.lights.new(f"Softbox {index + 1}", "AREA")
         data.energy = energy
@@ -109,11 +133,20 @@ def load_plan(path: str, total_frames: int) -> list[dict]:
             raise RuntimeError(f"第 {index} 个镜头时长必须至少为 24 帧")
         if not isinstance(focal, int) or not 15 <= focal <= 120:
             raise RuntimeError(f"第 {index} 个镜头焦距必须在 15–120mm")
+        path = shot.get("camera_path")
+        if path is not None and not isinstance(path, dict):
+            raise RuntimeError(f"第 {index} 个镜头的 camera_path 格式无效")
+        target = shot.get("camera_target_m")
+        if target is not None and (not isinstance(target, (list, tuple)) or len(target) != 3):
+            raise RuntimeError(f"第 {index} 个镜头的 camera_target_m 必须是三个数字")
         normalized.append({
             "id": str(shot.get("id") or f"shot_{index:02d}"),
             "camera": camera,
             "duration_frames": duration,
             "focal_length_mm": focal,
+            "sensor_width_mm": float(shot.get("sensor_width_mm", 36) or 36),
+            "camera_target_m": tuple(target) if target is not None else None,
+            "camera_path": path,
         })
     if sum(shot["duration_frames"] for shot in normalized) != total_frames:
         raise RuntimeError(f"DirectorPlan 镜头总帧数必须等于 {total_frames}")
@@ -129,46 +162,50 @@ def insert_pose(camera, target, frame: int, location, focal_length_mm: int):
     camera.data.keyframe_insert(data_path="lens", frame=frame)
 
 
-def shot_positions(camera_type: str, start_frame: int, end_frame: int):
+def shot_positions(camera_type: str, start_frame: int, end_frame: int, path: dict | None = None):
+    """把镜头编译成关键帧位置；给了 camera_path 就用合同里的数值。"""
+    spec = path if isinstance(path, dict) and path.get("type") == camera_type else {}
     if camera_type == "dolly_in":
         return [
-            (start_frame, (0.0, -4.8, 1.35)),
-            (end_frame, (0.0, -3.0, 1.12)),
+            (start_frame, tuple(spec.get("start_m") or (0.0, -4.8, 1.35))),
+            (end_frame, tuple(spec.get("end_m") or (0.0, -3.0, 1.12))),
         ]
     if camera_type == "side_track":
         return [
-            (start_frame, (-1.35, -3.65, 1.15)),
-            (end_frame, (1.35, -3.65, 1.15)),
+            (start_frame, tuple(spec.get("start_m") or (-1.35, -3.65, 1.15))),
+            (end_frame, tuple(spec.get("end_m") or (1.35, -3.65, 1.15))),
         ]
     if camera_type == "static":
-        return [
-            (start_frame, (0.0, -3.55, 1.2)),
-            (end_frame, (0.0, -3.55, 1.2)),
-        ]
-    radius = 3.45
+        position = tuple(spec.get("position_m") or (0.0, -3.55, 1.2))
+        return [(start_frame, position), (end_frame, position)]
+    radius = float(spec.get("radius_m") or 3.45)
+    height = float(spec.get("height_m") or 1.28)
+    start_angle = float(spec.get("start_angle_deg", -34))
+    end_angle = float(spec.get("end_angle_deg", 40))
     steps = max(2, min(8, end_frame - start_frame + 1))
     positions = []
     for index in range(steps):
         t = index / (steps - 1)
         frame = round(start_frame + (end_frame - start_frame) * t)
-        angle = math.radians(-34 + 74 * (t * t * (3 - 2 * t)))
-        positions.append((frame, (radius * math.sin(angle), -radius * math.cos(angle), 1.28)))
+        angle = math.radians(start_angle + (end_angle - start_angle) * (t * t * (3 - 2 * t)))
+        positions.append((frame, (radius * math.sin(angle), -radius * math.cos(angle), height)))
     return positions
 
 
 def animate_camera(camera, shots: list[dict]):
     """Compile every editable V1 shot field into the Blender action."""
-    camera.data.sensor_width = 36
-    target = (0, 0, 0.7)
     frame = 1
     for shot in shots:
         end_frame = frame + shot["duration_frames"] - 1
-        for keyframe, location in shot_positions(shot["camera"], frame, end_frame):
+        camera.data.sensor_width = shot.get("sensor_width_mm") or 36
+        target = tuple(shot.get("camera_target_m") or (0, 0, 0.7))
+        for keyframe, location in shot_positions(shot["camera"], frame, end_frame, shot.get("camera_path")):
             insert_pose(camera, target, keyframe, location, shot["focal_length_mm"])
         print(
             "DIRECTOR_SHOT "
             f"id={shot['id']} camera={shot['camera']} "
             f"focal_length_mm={shot['focal_length_mm']} "
+            f"sensor_width_mm={camera.data.sensor_width} target={target} "
             f"frames={frame}-{end_frame}",
             flush=True,
         )
@@ -184,10 +221,11 @@ def main():
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     shots = load_plan(args.plan, args.frames)
+    plan_payload = json.loads(Path(args.plan).read_text(encoding="utf-8"))
     clear_scene()
     meshes = import_product(args.input)
-    normalize(meshes)
-    add_lighting()
+    normalize(meshes, plan_payload.get("product_pose"))
+    add_lighting(plan_payload.get("scene"))
     camera_data = bpy.data.cameras.new("Director Camera")
     camera = bpy.data.objects.new("Director Camera", camera_data)
     bpy.context.collection.objects.link(camera)

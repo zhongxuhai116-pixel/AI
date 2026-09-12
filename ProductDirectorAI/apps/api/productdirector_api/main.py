@@ -34,7 +34,8 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image, ImageStat
-from . import security, storage
+from . import director_plan, security, storage
+from .director_plan import CameraPath, ProductPose, SceneSpec, Vector3
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -392,6 +393,10 @@ class Shot(BaseModel):
     duration_frames: int = Field(ge=24, le=144)
     camera: Literal["dolly_in", "side_track", "hero_orbit", "static"]
     focal_length_mm: int = Field(ge=15, le=120)
+    # 目标 3D 合同的显式字段；不填时渲染器沿用历史默认取景。
+    sensor_width_mm: float = Field(default=36, gt=0, le=200)
+    camera_target_m: Vector3 | None = None
+    camera_path: CameraPath | None = None
 
 
 class CropAnchor(str, Enum):
@@ -438,6 +443,8 @@ class PlanRequest(BaseModel):
     duration_seconds: Literal[6] = 6
     output: OutputSpec = Field(default_factory=OutputSpec)
     crop_anchor: CropAnchor = CropAnchor.center
+    product_pose: ProductPose = Field(default_factory=ProductPose)
+    scene: SceneSpec = Field(default_factory=SceneSpec)
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
@@ -458,6 +465,8 @@ class PlanUpdate(BaseModel):
     intent: str = Field(min_length=1, max_length=4000)
     shots: list[Shot] = Field(min_length=3, max_length=3)
     crop_anchor: CropAnchor = CropAnchor.center
+    product_pose: ProductPose = Field(default_factory=ProductPose)
+    scene: SceneSpec = Field(default_factory=SceneSpec)
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
@@ -1673,6 +1682,13 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
         qa_report = media_quality_report(output, plan_snapshot, output_spec, run_dir / "qa")
         if not qa_report["passed"]:
             raise RuntimeError("媒体质量检查失败: " + "；".join(qa_report["failures"]))
+        try:
+            director_plan_3d = director_plan.to_target_document(plan_snapshot)
+            director_plan_3d_error = None
+        except director_plan.TargetContractError as exc:
+            # 运行时支持但目标合同尚未放开的值：如实记录，不输出不合规文档。
+            director_plan_3d = None
+            director_plan_3d_error = str(exc)
         manifest = {
             "schema_version": "1.0",
             "job_id": job_id,
@@ -1688,6 +1704,9 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             "ffprobe": {"duration": duration, "video_stream": stream},
             "qa": qa_report,
             "director_plan": plan_snapshot,
+            # 目标 3D 合同视图：把运行时快照映射成 contracts/director-plan.v1.schema.json 的形状
+            "director_plan_3d": director_plan_3d,
+            "director_plan_3d_error": director_plan_3d_error,
             "director_plan_snapshot_sha256": hashlib.sha256(plan_snapshot_bytes).hexdigest(),
             "blender": Path(BLENDER).name if BLENDER else None,
             "ffmpeg": Path(FFMPEG).name if FFMPEG else None,
@@ -2027,6 +2046,8 @@ def create_plan(request: PlanRequest) -> dict:
             "output": request.output.model_dump(),
             "fidelity_mode": "STRICT_REQUESTED",
             "crop_anchor": request.crop_anchor.value,
+            "product_pose": request.product_pose.model_dump(),
+            "scene": request.scene.model_dump(),
             "shots": [shot.model_dump() for shot in shots],
         }
         _, payload_sha256 = plan_contract_payload_hash(payload)
@@ -2077,6 +2098,8 @@ def update_plan(plan_id: str, request: PlanUpdate) -> dict:
         payload["intent"] = request.intent
         payload["shots"] = [shot.model_dump() for shot in request.shots]
         payload["crop_anchor"] = request.crop_anchor.value
+        payload["product_pose"] = request.product_pose.model_dump()
+        payload["scene"] = request.scene.model_dump()
         _, payload_sha256 = plan_contract_payload_hash(payload)
         contract_version_id = create_product_version(
             current["product_asset_id"],
