@@ -22,7 +22,29 @@ from pathlib import Path
 import bpy
 import numpy as np
 
-CHANNELS = ("beauty", "alpha", "depth", "normal", "index")
+CHANNELS = ("beauty", "alpha", "depth", "normal")
+
+
+def read_exr_layer(path) -> dict:
+    """用 OpenEXR 读取多层 EXR，返回 {通道名: numpy 数组}。
+
+    Blender 的背景模式无法用 bpy.data.images 读取多层 EXR（has_data=False），
+    因此这里直接走 OpenEXR 库。
+    """
+    import OpenEXR
+
+    handle = OpenEXR.File(str(path))
+    part = handle.parts[0]
+    channels = part.channels
+    names = list(channels.keys()) if hasattr(channels, "keys") else [c.name for c in channels]
+    width, height = part.header.get("dataWindow").max.x + 1, part.header.get("dataWindow").max.y + 1
+    planes = {}
+    for name in names:
+        data = channels[name].pixels if hasattr(channels[name], "pixels") else None
+        if data is None:
+            continue
+        planes[name] = np.array(data, dtype=np.float32).reshape(height, width)
+    return {"names": names, "planes": planes, "width": width, "height": height}
 
 
 def parse_args():
