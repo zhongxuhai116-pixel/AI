@@ -385,7 +385,14 @@ class H3ProviderTests(unittest.TestCase):
         self.assertEqual(body["status"], "SUCCEEDED")
         self.assertEqual(body["artifact"]["kind"], "video")
         self.assertEqual(body["artifact"]["bytes"], len(payload))
-        self.assertIsNone(body["artifact_asset_id"])
+        # 视频回收到素材库：登记为 kind=video 的受管素材
+        self.assertIsNotNone(body["artifact_asset_id"])
+        library = self.client.get(f"/api/v1/assets/{body['artifact_asset_id']}/content")
+        self.assertEqual(library.status_code, 200)
+        self.assertEqual(library.content, payload)
+        listed = [item for item in self.client.get("/api/v1/assets").json()
+                  if item["id"] == body["artifact_asset_id"]]
+        self.assertEqual(listed[0]["kind"], "video")
         download.assert_called_once()
 
         served = self.client.get(f"/api/v1/providers/h3/jobs/{provider_job_id}/artifact")

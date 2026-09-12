@@ -122,8 +122,12 @@ function AssetCard({ asset, assetUrl, onUpload, onDemo, busy }) {
   return <section className="card asset-card">
     <div className="card-head"><div><h2>产品素材</h2><i>?</i></div><button onClick={() => input.current?.click()}>管理素材 <CaretRight /></button></div>
     <div className="asset-stage">
-      {asset?.kind === "model" ? <ModelPreview url={assetUrl} /> : <img src={assetUrl || demoImage} alt={asset ? asset.name : "演示产品"} />}
-      <span>{asset ? (asset.kind === "model" ? "GLB · 3D" : "图片 · 2D") : "演示素材"}</span>
+      {asset?.kind === "model"
+        ? <ModelPreview url={assetUrl} />
+        : asset?.kind === "video"
+          ? <video src={assetUrl} controls muted playsInline />
+          : <img src={assetUrl || demoImage} alt={asset ? asset.name : "演示产品"} />}
+      <span>{asset ? (asset.kind === "model" ? "GLB · 3D" : asset.kind === "video" ? "视频 · MP4" : "图片 · 2D") : "演示素材"}</span>
     </div>
     <div className="asset-info"><p><strong>{asset?.name || "还没有上传你的产品"}</strong><small>{asset ? `${asset.kind === "model" ? "可执行三维环绕" : "图片平移 / 推近预演"} · ${formatBytes(asset.size_bytes)}` : "可上传任意品类；示例不会成为产品规则"}</small></p><button onClick={() => input.current?.click()}><UploadSimple />上传</button></div>
     <div className="asset-actions"><button disabled={busy} onClick={() => input.current?.click()}><Plus />上传图片或 GLB</button>{!asset && <button disabled={busy} onClick={onDemo}>先用演示素材</button>}</div>
@@ -223,7 +227,7 @@ function Jobs({ jobs, selected, onOpen }) {
 function Library({ assets, onSelect }) {
   return <section className="page">
     <div className="page-head"><div><b>V1 PRODUCT LIBRARY</b><h1>产品素材库</h1><p>每个上传文件都是独立产品素材。产品可以是任意品类，演示拳击机不会写入业务规则。</p></div><button className="primary"><UploadSimple />上传新产品</button></div>
-    <div className="library">{assets.length ? assets.map((asset) => <button key={asset.id} onClick={() => onSelect(asset)}><div>{asset.kind === "image" ? <img src={`${API}/assets/${asset.id}/content`} alt="" /> : <Cube />}</div><strong>{asset.name}</strong><span>{asset.kind === "model" ? "GLB 三维产品" : "产品图片"} · {formatBytes(asset.size_bytes)}</span></button>) : <div className="library-empty"><Package /><strong>等待你的第一个产品</strong><span>支持 PNG、JPEG、WebP 或 GLB。</span></div>}</div>
+    <div className="library">{assets.length ? assets.map((asset) => <button key={asset.id} onClick={() => onSelect(asset)}><div>{asset.kind === "image" ? <img src={`${API}/assets/${asset.id}/content`} alt="" /> : asset.kind === "video" ? <video src={`${API}/assets/${asset.id}/content`} muted playsInline /> : <Cube />}</div><strong>{asset.name}</strong><span>{asset.kind === "model" ? "GLB 三维产品" : asset.kind === "video" ? "H3 生成视频" : "产品图片"} · {formatBytes(asset.size_bytes)}</span></button>) : <div className="library-empty"><Package /><strong>等待你的第一个产品</strong><span>支持 PNG、JPEG、WebP 或 GLB。</span></div>}</div>
   </section>;
 }
 

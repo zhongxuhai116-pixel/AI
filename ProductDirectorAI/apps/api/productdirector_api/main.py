@@ -2222,9 +2222,20 @@ def collect_video_artifact(row: dict, record: dict, owner_id: str) -> dict:
                 }
         except (OSError, ValueError, json.JSONDecodeError):
             probe = {}
+    # 视频同样回收到素材库：先落成受管素材，再登记到任务记录。
+    asset_id = str(uuid.uuid4())
+    stored = UPLOADS / f"{asset_id}.mp4"
+    stored.write_bytes(data)
+    with connect() as db:
+        db.execute(
+            "INSERT INTO assets (id, name, kind, mime, size_bytes, sha256, path, created_at, owner_id) "
+            "VALUES (?, ?, 'video', 'video/mp4', ?, ?, ?, ?, ?)",
+            (asset_id, f"H3 视频 · {provider_job_id[:8]}.mp4", len(data), digest, stored.name, utc_now(), owner_id),
+        )
     update_provider_job(
         provider_job_id, status="SUCCEEDED", stage="ARTIFACT",
-        artifact_path=str(target), artifact_sha256=digest, error=None,
+        artifact_path=str(target), artifact_sha256=digest,
+        artifact_asset_id=asset_id, error=None,
     )
     result = provider_job_public(load_provider_job(provider_job_id))
     result["artifact"] = {
@@ -2233,6 +2244,8 @@ def collect_video_artifact(row: dict, record: dict, owner_id: str) -> dict:
         "sha256": digest,
         "bytes": len(data),
         "probe": probe,
+        "asset_id": asset_id,
+        "library_url": f"/api/v1/assets/{asset_id}/content",
         "download_url": f"/api/v1/providers/h3/jobs/{provider_job_id}/artifact",
     }
     return result
