@@ -174,3 +174,22 @@ plane  = np.array(part.channels[name].pixels, dtype=np.float32).reshape(height, 
 ```
 
 校验器 `blender/scripts/validate_fidelity_passes.py` 已按此实现，且**不再依赖 Blender**（venv 的 Pillow 读遮罩 PNG、OpenEXR 读多层 EXR），当前唯一阻塞就是 9.2。
+
+### 9.4 追加排查：item 与输入 socket 的对应关系已确认
+
+实测（不渲染，仅建节点）：
+
+```
+INPUTS_BEFORE ['']                                  # 新建时只有一个空名输入
+创建 item "beauty" → ['beauty', '']
+创建 item "alpha"  → ['beauty', 'alpha', '']
+创建 item "depth"  → ['beauty', 'alpha', 'depth', '']
+创建 item "normal" → ['beauty', 'alpha', 'depth', 'normal', '']
+```
+
+即 **每个 item 会生成同名输入 socket**，因此按索引连线（0..3）本来就是正确的，之前的"索引错位"猜想可以排除。剩余怀疑方向：
+
+1. 每个 item 是否需要额外的启用/生效标志（`file_output_items` 项上的属性）；
+2. EEVEE Next 在后台渲染时是否真的把 Z / Normal 送进合成器（需要用单帧 + 逐通道单独输出做最小验证）。
+
+下一步就用**单帧最小验证**（只渲 1 帧、逐通道分别输出 PNG）来区分这两种原因，再回到 72 帧整片验证。
