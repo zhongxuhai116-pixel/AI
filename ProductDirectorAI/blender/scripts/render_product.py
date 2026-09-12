@@ -141,8 +141,11 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
         scene.compositing_node_group = tree
     tree.nodes.clear()
     layers = tree.nodes.new("CompositorNodeRLayers")
-    composite = tree.nodes.new("CompositorNodeComposite")
-    tree.links.new(layers.outputs["Image"], composite.inputs["Image"])
+    # Blender 5 移除了 CompositorNodeComposite（只有 OutputFile/RLayers 等），
+    # 因此仅在旧版本上连接 Composite；主帧输出仍由渲染管线写出。
+    if hasattr(bpy.types, "CompositorNodeComposite"):
+        composite = tree.nodes.new("CompositorNodeComposite")
+        tree.links.new(layers.outputs["Image"], composite.inputs["Image"])
     channels = {
         "beauty": ("Image", "PNG", "8"),
         "alpha": ("Alpha", "PNG", "8"),
