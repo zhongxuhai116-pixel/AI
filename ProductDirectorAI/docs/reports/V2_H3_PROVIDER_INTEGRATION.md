@@ -123,3 +123,45 @@ download: GET …/artifact → 200，1,070,456 字节
 3. **取消语义**：ComfyUI 全局中断不能当单任务取消。
 4. **成本与并发**：单次 124 帧生成约 7.5 分钟；未测并发排队、显存占用与批量产能。
 5. **官方接口**：主规格要求的 MiniMax 官方视频接口真实测试未做。
+
+---
+
+## 8. 产品替换升级为多视图参考（2026-09-12 追加）
+
+### 8.1 实现
+
+`comfyui.build_product_video_graph()` 把现场工作流的完整链路搬进项目：
+
+```
+LoadImage → ImageCrop ─┬→ CLIPVisionEncode → Hunyuan3Dv2Conditioning → KSampler(50 步)
+                       │        → VAEDecodeHunyuan3D → VoxelToMesh → MESH
+                       └→ ProductBlenderRender(mesh, reference_image, scene, motion, size_cm, ...)
+                                                       ├→ 正面 ┐
+                                                       └→ 45°  ┤
+                                                               └→ MiniMaxH3ReferenceToVideo 的
+                                                                  ref_images.ref_image_1 / _2
+```
+
+即 H3 的参考图从"单张平面裁切"变成 **原图裁切 + Blender 渲染的正面与 45° 视图**，与现场验证过的工作流一致。
+
+接口 `POST /api/v1/providers/h3/video` 新增 `with_product_views`（默认 false，保持快速路径）以及 `mesh_steps`、`scene`、`motion`、`size_cm`、`blender_seconds`、`quality`、`photo_texture`、`framing` 参数。
+
+### 8.2 真实云端验证
+
+```
+asset   : a43f9333-…（用户机器人产品图，裁切 340×430 并排除底座）
+submit  : 202 with_product_views=true scene=living motion=pan
+state   : RUNNING → SUCCEEDED / ARTIFACT（约 8.5 分钟：重建 + Blender + H3）
+artifact: mp4 1,068,806 字节  h264 576×1024 124 帧 5.167 秒
+          sha256 08a57bd56cac30b4ee30a2efac10119f1eba70b0b9c353db6af169976a880dc9
+```
+
+### 8.3 人工视觉复核（与上一节的单图版本对比）
+
+- **重复底座问题消失**：上一版画面里底座同时出现在墙面产品和地板上；这一版把裁切区域收紧到不含底座，并让 Blender 视图提供几何参考，地板上不再出现多余底座。
+- 产品被放在木墙上原靶位，镜头穹顶、扬声器栅格、耳状结构在运动中保持一致；人物动作、房间、木墙与光影保留。
+- 新增一个可接受的细节：`ProductBlenderRender` 的取景把产品底座一起渲染出来，因此墙面上产品下方出现一块白色托盘状结构。这属于 Blender 渲染取景参数（`framing` / `size_cm`）可调范围，不是缺陷。
+
+### 8.4 成本
+
+完整链路（重建 + Blender + H3 124 帧）单次约 **8.5 分钟**，比单图版本（约 7.5 分钟）多约一分钟，换来更稳定的产品一致性。
