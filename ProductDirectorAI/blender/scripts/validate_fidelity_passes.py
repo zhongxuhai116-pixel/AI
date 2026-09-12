@@ -62,14 +62,17 @@ def read_exr(path: Path) -> dict:
         data = getattr(entry, "pixels", None)
         if data is None:
             continue
-        planes[name] = np.array(data, dtype=np.float32).reshape(height, width)
+        array = np.array(data, dtype=np.float32)
+        components = max(1, array.size // (width * height))
+        planes[name] = array.reshape(height, width, components)
     return {"names": names, "planes": planes, "width": width, "height": height}
 
 
 def pick(planes: dict, needle: str):
     for name, plane in planes.items():
         if needle.lower() in name.lower():
-            return plane
+            # 通道可能以 RGBA 存储，取第一分量作为标量通道。
+            return plane[:, :, 0] if plane.ndim == 3 else plane
     return None
 
 
