@@ -15,6 +15,7 @@ ENV_FILE="${PD_PG_ENV:-/etc/productdirector/pg-drill.env}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_PY="${PD_VENV_PY:-$REPO_DIR/.venv/bin/python}"
 WORK_DIR="${PD_DRILL_DIR:-/home/ubuntu/pd-pg-drill}"
+SRC_DB="${PD_SRC_DB:-productdirector_drill}"
 DST_DB="productdirector_drill_restore"
 
 TABLES=(owners workspaces projects assets product_versions plans plan_contracts jobs runs run_jobs job_attempts job_events auth_sessions provider_credentials)
@@ -60,8 +61,15 @@ sha256sum "$SNAPSHOT"
 
 echo
 echo "== 1. 迁移到 PostgreSQL =="
+psql "$PG_DSN_ADMIN" -v ON_ERROR_STOP=1 -q -c "DROP DATABASE IF EXISTS $SRC_DB"
+psql "$PG_DSN_ADMIN" -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $SRC_DB"
 "$VENV_PY" "$REPO_DIR/scripts/pg_migrate.py" --sqlite "$SNAPSHOT" --dsn "$PG_DSN_SRC" \
   | tee "$WORK_DIR/migrate-$STAMP.json"
+
+echo
+echo "== 1b. 重复迁移一次（幂等性：不应产生重复行） =="
+"$VENV_PY" "$REPO_DIR/scripts/pg_migrate.py" --sqlite "$SNAPSHOT" --dsn "$PG_DSN_SRC" \
+  | tee "$WORK_DIR/migrate-second-pass-$STAMP.json" | grep -E '"ok"|"copied"|"target_rows"' | head -8
 
 echo
 echo "== 2. 备份（pg_dump） =="
