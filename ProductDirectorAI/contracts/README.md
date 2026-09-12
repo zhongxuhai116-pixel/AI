@@ -4,6 +4,13 @@
 
 `director-plan.v1.schema.json` 是 JSON Schema Draft 2020-12 的 V1 3D 计划合同；`director-plan.v1.example.json` 是对应的有效结构示例。
 
+`image-preview.v1.schema.json` 与 `image-preview.v1.example.json` 是**图片素材的 ImagePreviewSpec**：它描述当前运行时真实写入作业目录、并驱动 FFmpeg 出片的冻结快照字段（含 `crop_anchor` 裁切锚点）。这份 Schema 与运行时 Pydantic 模型逐字段对应，由 `tests/test_contract_parity.py` 守卫：任何一方单独改动都会让测试失败，防止合同文档与实现漂移。
+
+| 文件 | 性质 | 与运行时关系 |
+| --- | --- | --- |
+| `director-plan.v1.schema.json` | 目标 3D 合同（含相机轨迹、产品位姿、场景） | **尚未实现**；当前运行时只有简化字段，差异见 `../docs/V1_IMPLEMENTATION_GAPS.md` |
+| `image-preview.v1.schema.json` | 已实现的图片预演合同 | 与 `PlanRequest`/`PlanUpdate`/`OutputSpec`/`Shot` 字段一一对应 |
+
 本例是 3 个 48 帧镜头，总共 144 帧、24fps、6 秒。UUID 是格式合法的占位值，实际生产需替换成可访问、已批准、尺寸已规范化的产品版本。相机示例针对约 1.2 米高的测试产品，执行前仍需按包围盒校验构图。
 
 结构校验不会证明下面的领域条件，SOL 5.6 施工时必须额外实现并测试：
