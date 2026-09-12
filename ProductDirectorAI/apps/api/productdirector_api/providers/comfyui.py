@@ -263,3 +263,90 @@ def build_h3_video_graph(
             "inputs": {"video": ["19", 0], "filename_prefix": prefix, "format": "mp4", "codec": "h264"},
         },
     }
+
+
+def build_product_video_graph(
+    reference_video: str,
+    product_image: str,
+    prompt: str,
+    prefix: str,
+    crop: tuple[int, int, int, int] = (0, 0, 512, 512),
+    width: int = 576,
+    height: int = 1024,
+    length: int = 124,
+    steps: int = 4,
+    seed: int = 20260912,
+    fps: int = 24,
+    mesh_resolution: int = 3072,
+    mesh_octree: int = 256,
+    mesh_steps: int = 50,
+    mesh_cfg: float = 5.0,
+    scene: str = "studio",
+    motion: str = "pan",
+    size_cm: float = 35.0,
+    seconds: int = 4,
+    quality: str = "preview",
+    photo_texture: str = "sheet",
+    framing: str = "product",
+) -> dict:
+    """产品替换视频图：先在 H3 环境里重建产品网格，再用 Blender 出多视图，最后交给 H3 生成视频。
+
+    与 `build_h3_video_graph()` 的差别（也是与现场工作流对齐的部分）：
+    H3 的参考图不再只有原图裁切，而是 **原图裁切 + Blender 渲染的正面/45° 视图**，
+    这正是现场"原视频产品替换"工作流的做法；
+    产物由 `ProductBlenderRender` 提供，避免只用单张平面图导致的产品漂移。
+    """
+    graph = build_h3_video_graph(
+        reference_video=reference_video,
+        product_image=product_image,
+        prompt=prompt,
+        prefix=prefix,
+        crop=crop,
+        width=width,
+        height=height,
+        length=length,
+        steps=steps,
+        seed=seed,
+        fps=fps,
+    )
+    checkpoint = os.getenv("PD_H3_MESH_CHECKPOINT", "hunyuan3d-dit-v2_fp16.safetensors")
+    graph.update({
+        # 重建子图：与现场工作流一致（50 步 / cfg 5.0，4 步会产出碎片几何）
+        "29": {"class_type": "ImageOnlyCheckpointLoader", "inputs": {"ckpt_name": checkpoint}},
+        "30": {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": ["29", 1], "image": ["13", 0], "crop": "none"}},
+        "31": {"class_type": "Hunyuan3Dv2Conditioning", "inputs": {"clip_vision_output": ["30", 0]}},
+        "32": {"class_type": "EmptyLatentHunyuan3Dv2", "inputs": {"resolution": mesh_resolution, "batch_size": 1}},
+        "33": {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": ["29", 0], "seed": seed, "steps": mesh_steps, "cfg": mesh_cfg,
+                "sampler_name": "euler", "scheduler": "simple",
+                "positive": ["31", 0], "negative": ["31", 1],
+                "latent_image": ["32", 0], "denoise": 1.0,
+            },
+        },
+        "34": {
+            "class_type": "VAEDecodeHunyuan3D",
+            "inputs": {"samples": ["33", 0], "vae": ["29", 2], "num_chunks": 8000, "octree_resolution": mesh_octree},
+        },
+        "35": {"class_type": "VoxelToMesh", "inputs": {"voxel": ["34", 0], "algorithm": "surface net", "threshold": 0.6}},
+        "36": {
+            "class_type": "ProductBlenderRender",
+            "inputs": {
+                "mesh": ["35", 0],
+                "reference_image": ["13", 0],
+                "scene": scene,
+                "motion": motion,
+                "size_cm": size_cm,
+                "seconds": seconds,
+                "quality": quality,
+                "photo_texture": photo_texture,
+                "framing": framing,
+                "render_preview_video": False,
+            },
+        },
+    })
+    # H3 参考图：0 = 原图裁切，1/2 = Blender 正面与 45° 视图（现场工作流即此接线）
+    graph["7"]["inputs"]["ref_images.ref_image_1"] = ["36", 1]
+    graph["7"]["inputs"]["ref_images.ref_image_2"] = ["36", 3]
+    return graph

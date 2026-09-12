@@ -524,6 +524,17 @@ class H3VideoRequest(BaseModel):
     length: int = Field(default=124, ge=5, le=362)
     steps: int = Field(default=4, ge=1, le=100)
     seed: int = Field(default=20260912, ge=0)
+    # 先重建产品网格、再用 Blender 出正/45° 视图作为 H3 参考图（现场工作流做法）。
+    with_product_views: bool = False
+    mesh_steps: int = Field(default=50, ge=1, le=200)
+    mesh_octree: int = Field(default=256, ge=16, le=512)
+    scene: Literal["studio", "living", "bedroom"] = "studio"
+    motion: Literal["pan", "push", "orbit"] = "pan"
+    size_cm: float = Field(default=35.0, gt=0, le=300)
+    blender_seconds: int = Field(default=4, ge=1, le=15)
+    quality: Literal["preview", "720", "1080"] = "preview"
+    photo_texture: Literal["sheet", "none"] = "sheet"
+    framing: Literal["product", "room"] = "product"
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
@@ -2243,21 +2254,37 @@ def h3_video(request: H3VideoRequest) -> dict:
         "length": request.length,
         "steps": request.steps,
         "seed": request.seed,
+        "with_product_views": request.with_product_views,
     }
     try:
         image_name = comfyui.upload_image(f"{provider_job_id}{path.suffix}", path.read_bytes())
-        graph = comfyui.build_h3_video_graph(
-            reference_video=request.reference_video,
-            product_image=image_name,
-            prompt=request.prompt,
-            prefix=f"productdirector/{provider_job_id}",
-            crop=(x, y, width, height),
-            width=request.width,
-            height=request.height,
-            length=request.length,
-            steps=request.steps,
-            seed=request.seed,
-        )
+        common = {
+            "reference_video": request.reference_video,
+            "product_image": image_name,
+            "prompt": request.prompt,
+            "prefix": f"productdirector/{provider_job_id}",
+            "crop": (x, y, width, height),
+            "width": request.width,
+            "height": request.height,
+            "length": request.length,
+            "steps": request.steps,
+            "seed": request.seed,
+        }
+        if request.with_product_views:
+            graph = comfyui.build_product_video_graph(
+                **common,
+                mesh_steps=request.mesh_steps,
+                mesh_octree=request.mesh_octree,
+                scene=request.scene,
+                motion=request.motion,
+                size_cm=request.size_cm,
+                seconds=request.blender_seconds,
+                quality=request.quality,
+                photo_texture=request.photo_texture,
+                framing=request.framing,
+            )
+        else:
+            graph = comfyui.build_h3_video_graph(**common)
         external_id = comfyui.submit(graph, client_id=provider_job_id)
     except comfyui.ComfyUIError as exc:
         insert_provider_job(provider_job_id, None, "FAILED", "SUBMIT", payload,

@@ -225,6 +225,38 @@ class H3ProviderTests(unittest.TestCase):
     def test_video_submission_rejects_missing_reference_video(self) -> None:
         self.assertEqual(self._submit_video(reference_video="   ").status_code, 422)
 
+    def test_product_view_video_graph_wires_mesh_and_blender_views(self) -> None:
+        with patch.object(comfyui, "upload_image", return_value="remote.png"), patch.object(
+            comfyui, "submit", return_value="prompt-views"
+        ) as submit:
+            response = self._submit_video(with_product_views=True, scene="living", motion="orbit")
+        self.assertEqual(response.status_code, 202)
+        graph = submit.call_args.args[0]
+        # 重建子图 → 网格 → Blender 多视图
+        self.assertEqual(graph["29"]["class_type"], "ImageOnlyCheckpointLoader")
+        self.assertEqual(graph["33"]["class_type"], "KSampler")
+        self.assertEqual(graph["35"]["class_type"], "VoxelToMesh")
+        self.assertEqual(graph["36"]["class_type"], "ProductBlenderRender")
+        self.assertEqual(graph["36"]["inputs"]["mesh"], ["35", 0])
+        self.assertEqual(graph["36"]["inputs"]["scene"], "living")
+        self.assertEqual(graph["36"]["inputs"]["motion"], "orbit")
+        self.assertEqual(graph["33"]["inputs"]["steps"], 50)
+        # H3 参考图来自原图裁切 + Blender 正面/45°
+        self.assertEqual(graph["7"]["inputs"]["ref_images.ref_image_0"], ["13", 0])
+        self.assertEqual(graph["7"]["inputs"]["ref_images.ref_image_1"], ["36", 1])
+        self.assertEqual(graph["7"]["inputs"]["ref_images.ref_image_2"], ["36", 3])
+        rows = self._provider_rows()
+        self.assertTrue(json.loads(rows[0]["request_payload"])["with_product_views"])
+
+    def test_plain_video_graph_has_no_blender_nodes(self) -> None:
+        with patch.object(comfyui, "upload_image", return_value="remote.png"), patch.object(
+            comfyui, "submit", return_value="prompt-plain"
+        ) as submit:
+            self._submit_video()
+        graph = submit.call_args.args[0]
+        self.assertNotIn("36", graph)
+        self.assertNotIn("ref_images.ref_image_1", graph["7"]["inputs"])
+
     def test_video_records_provider_failure(self) -> None:
         with patch.object(comfyui, "upload_image", return_value="remote.png"), patch.object(
             comfyui, "submit", side_effect=comfyui.ComfyUIError("node error")
