@@ -21,6 +21,7 @@
 | [A02 / A03 验收](reports/A02_A03_ACCEPTANCE.md) | 合同不可变与幂等/重入访问验收记录 |
 | [A04 验收](reports/A04_ACCEPTANCE.md) | Worker 租约、事件恢复与旧 epoch 拒绝的第一段验收记录 |
 | [A04 恢复加固](reports/A04_RECOVERY_HARDENING.md) | 换电脑后复跑 28/28；事务内租约、长任务续租、取消竞争与租约时间缺陷修复 |
+| [本机真实 FFmpeg 图片链路验收](reports/V1_LOCAL_FFMPEG_E2E.md) | 新电脑上真实（非 mock）跑通图片链路并留存 1080×1920 产物哈希；GLB 未在本机复验 |
 | [执行指令](../CODEX_SOL56_START_HERE.md) | 给下一台电脑上的 Codex/SOL 5.6；先审计、复验、保留已有代码 |
 | [工程约束](../AGENTS.md) | 版本、安全、测试与用户工作保护 |
 | [项目 README](../README.md) | 当前项目和本机启动入口 |
