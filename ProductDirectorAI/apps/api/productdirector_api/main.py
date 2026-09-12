@@ -2078,6 +2078,79 @@ def cancel_job(
     return get_job(job_id)
 
 
+@app.post("/api/v1/jobs/{job_id}/retry", status_code=202)
+def retry_job(
+    job_id: str,
+    background: BackgroundTasks,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> dict:
+    """失败或已取消的任务重新入队为新 attempt。
+
+    保留原 run 与历史 attempt，只新增一次尝试并把任务退回 QUEUED；
+    不复用上一次的产物引用，避免把旧成片当成新结果。
+    """
+    resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
+    now = utc_now()
+    with connect() as db:
+        begin_immediate(db)
+        job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(404, "任务不存在")
+        if job["status"] not in {"FAILED", "CANCELLED", "CANCEL_REQUESTED"}:
+            raise HTTPException(409, "只有失败或已取消的任务可以重试")
+        run_job = latest_run_job(db, job_id)
+        if not run_job:
+            raise HTTPException(409, "任务缺少运行记录，无法重试")
+        attempt = int(run_job["attempt"]) + 1
+        db.execute(
+            "INSERT INTO job_attempts (id, run_job_id, attempt, status, started_at, completed_at, error, metadata) "
+            "VALUES (?, ?, ?, 'CREATED', ?, NULL, NULL, NULL)",
+            (str(uuid.uuid4()), run_job["id"], attempt, now),
+        )
+        db.execute(
+            """
+            UPDATE run_jobs
+            SET attempt = ?, status = 'QUEUED', stage = 'QUEUED', error = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (attempt, now, run_job["id"]),
+        )
+        db.execute(
+            """
+            UPDATE jobs
+            SET status = 'QUEUED', stage = 'QUEUED', progress = 0, error = NULL,
+                cancel_requested = 0, output_path = NULL, manifest_path = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (now, job_id),
+        )
+        db.execute(
+            """
+            UPDATE runs
+            SET status = 'QUEUED', stage = 'QUEUED', progress = 0,
+                attempt_count = COALESCE(attempt_count, 0) + 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (now, run_job["run_id"]),
+        )
+        append_job_event(
+            db,
+            job_id,
+            "job.retry_requested",
+            {"attempt": attempt, "previous_status": job["status"]},
+        )
+    background.add_task(execute_job, job_id)
+    return {
+        "job_id": job_id,
+        "run_id": run_job["run_id"],
+        "status": "QUEUED",
+        "attempt": attempt,
+        "status_url": f"/api/v1/jobs/{job_id}",
+    }
+
+
 @app.post("/internal/v1/workers/claim", dependencies=[Depends(_ensure_worker_token)])
 def worker_claim(request: WorkerClaimRequest) -> dict:
     security.check_worker_id(request.worker_id)

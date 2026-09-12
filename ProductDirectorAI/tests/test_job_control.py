@@ -559,6 +559,84 @@ class JobControlAcceptanceTests(unittest.TestCase):
         self.assertEqual(final["status"], "SUCCEEDED")
         self.assertIsNone(final["error"])
 
+    # --- A06 失败/取消后的重试入口 ---
+
+    def _attempt_rows(self, job_id: str) -> list[sqlite3.Row]:
+        with main.connect() as db:
+            return db.execute(
+                """
+                SELECT a.* FROM job_attempts a
+                JOIN run_jobs rj ON rj.id = a.run_job_id
+                WHERE rj.job_id = ?
+                ORDER BY a.attempt
+                """,
+                (job_id,),
+            ).fetchall()
+
+    def test_a06_retry_failed_job_requeues_as_new_attempt(self) -> None:
+        job_id = self._create_queued_job("a06-retry")
+        claim = self.client.post("/internal/v1/workers/claim", json={"worker_id": "worker-a", "job_id": job_id}).json()
+        self.assertTrue(claim["claimed"])
+        failed = self.client.post(
+            f"/internal/v1/workers/jobs/{job_id}/fail",
+            json={"worker_id": "worker-a", "lease_epoch": claim["lease_epoch"], "error": "encode failed"},
+        )
+        self.assertEqual(failed.json()["status"], "FAILED")
+        self.assertEqual([row["attempt"] for row in self._attempt_rows(job_id)], [1])
+
+        with patch("productdirector_api.main.execute_job"):
+            retried = self.client.post(f"/api/v1/jobs/{job_id}/retry")
+        self.assertEqual(retried.status_code, 202)
+        self.assertEqual(retried.json()["status"], "QUEUED")
+        self.assertEqual(retried.json()["attempt"], 2)
+
+        job = self.client.get(f"/api/v1/jobs/{job_id}").json()
+        self.assertEqual(job["status"], "QUEUED")
+        self.assertEqual(job["progress"], 0)
+        self.assertIsNone(job["error"])
+        self.assertEqual(job["cancel_requested"], 0)
+        self.assertIsNone(job["output_path"])
+        self.assertEqual([row["attempt"] for row in self._attempt_rows(job_id)], [1, 2])
+        lease = self._lease_row(job_id)
+        self.assertEqual(lease["attempt"], 2)
+        self.assertIsNone(lease["lease_owner"])
+        events = self.client.get(f"/api/v1/jobs/{job_id}/events").text
+        self.assertIn("event: job.retry_requested", events)
+
+        # 重试后的任务能被 worker 正常领取并完成。
+        fake_render, fake_probe = self._fake_render_tools()
+        original_ffprobe = main.FFPROBE
+        main.FFPROBE = "ffprobe"
+        try:
+            with patch("productdirector_api.main.render_glb_job", side_effect=fake_render), patch(
+                "productdirector_api.main.subprocess.run", return_value=fake_probe
+            ), patch("productdirector_api.main.media_quality_report", return_value=dict(QA_PASS)):
+                result = main.run_worker_once("worker-b")
+        finally:
+            main.FFPROBE = original_ffprobe
+        self.assertTrue(result["claimed"])
+        self.assertEqual(result["status"], "SUCCEEDED")
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}").json()["status"], "SUCCEEDED")
+
+    def test_a06_retry_after_cancel_clears_cancel_flag(self) -> None:
+        job_id = self._create_queued_job("a06-retry-cancel")
+        self.client.post("/internal/v1/workers/claim", json={"worker_id": "worker-a", "job_id": job_id})
+        self.client.post(f"/api/v1/jobs/{job_id}/cancel")
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}").json()["status"], "CANCEL_REQUESTED")
+
+        with patch("productdirector_api.main.execute_job"):
+            retried = self.client.post(f"/api/v1/jobs/{job_id}/retry")
+        self.assertEqual(retried.status_code, 202)
+        job = self.client.get(f"/api/v1/jobs/{job_id}").json()
+        self.assertEqual(job["status"], "QUEUED")
+        self.assertEqual(job["cancel_requested"], 0)
+
+    def test_a06_retry_rejects_jobs_that_are_not_failed_or_cancelled(self) -> None:
+        job_id = self._create_queued_job("a06-retry-guard")
+        rejected = self.client.post(f"/api/v1/jobs/{job_id}/retry")
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}").json()["status"], "QUEUED")
+
 
 if __name__ == "__main__":
     unittest.main()

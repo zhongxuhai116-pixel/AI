@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Archive, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
+  Archive, ArrowClockwise, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
   Clock, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
   MagnifyingGlass, MonitorPlay, Package, PencilSimple, Play, Plus, Queue,
   SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, WarningCircle, X,
@@ -146,14 +146,16 @@ function DirectorCard({ intent, setIntent, plan, output, onOutputChange, onGener
   </section>;
 }
 
-function RenderCard({ health, plan, job, onRender, onCancel }) {
+function RenderCard({ health, plan, job, onRender, onCancel, onRetry }) {
   const active = ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(job?.status);
+  const retryable = ["FAILED", "CANCELLED", "CANCEL_REQUESTED"].includes(job?.status);
   return <section className="card render-card">
     <div className="card-head"><div><h2>执行与检查</h2><i>?</i></div>{job && <Pill status={job.status} />}</div>
     <div className="env">{[["Blender", health?.blender, Cube], ["FFmpeg", health?.ffmpeg, FilmSlate]].map(([name, value, Icon]) => <div key={name}><em className={value?.available ? "ok" : "off"}><Icon /></em><p><strong>{name}</strong><small>{value?.available ? "本机已就绪" : "未连接"}</small></p></div>)}</div>
     {job ? <div className="job-box"><div><span>{job.stage}</span><strong>{job.progress}%</strong></div><div className="progress"><i style={{ width: `${job.progress}%` }} /></div><small>{job.status === "FAILED" ? job.error : job.status === "SUCCEEDED" ? "视频与 metadata 已完成基础检查" : "任务在后台执行，刷新页面也不会丢失。"}</small></div> : <div className="empty-job"><Clock /><span>确认分镜后创建第一条预演任务</span></div>}
     <div className="render-actions">
       {active ? <button className="danger" onClick={onCancel}><StopCircle />取消任务</button> : <button className="primary" disabled={!plan} onClick={onRender}><Play weight="fill" />确认计划并生成预演</button>}
+      {retryable && <button onClick={onRetry}><ArrowClockwise />重试任务</button>}
       {job?.status === "SUCCEEDED" && <><a href={`${API}/jobs/${job.id}/video`} target="_blank"><DownloadSimple />下载 MP4</a><a className="icon-link" title="下载 metadata" href={`${API}/jobs/${job.id}/manifest`} target="_blank"><BoxArrowDown /></a></>}
     </div>
   </section>;
@@ -321,6 +323,7 @@ export function App() {
     setOutput(outputPresets.find((item) => item.width === width && item.height === height) || outputPresets[0]);
   }
   async function cancel() { if (job) { await apiRequest(`/jobs/${job.id}/cancel`, { method: "POST" }); refresh(); } }
+  async function retry() { if (job) { await apiRequest(`/jobs/${job.id}/retry`, { method: "POST" }); refresh(); } }
   async function saveProvider(apiKey) {
     setBusy(true);
     try {
@@ -386,7 +389,7 @@ export function App() {
             onGenerate={generatePlan}
             busy={busy}
           />
-          <RenderCard health={health} plan={plan} job={job} onRender={run} onCancel={cancel} />
+          <RenderCard health={health} plan={plan} job={job} onRender={run} onCancel={cancel} onRetry={retry} />
           <Shots plan={plan} setPlan={setPlan} assetUrl={asset?.kind === "image" ? assetUrl : ""} />
           <Jobs jobs={filtered} selected={job?.id} onOpen={setJob} />
         </div>
