@@ -74,6 +74,7 @@
 - V3 已产出任务书（尚未实施）：按主规划第 9 章列出 V3-01…V3-10（多通道渲染、通道校验、FidelityPolicy、审核与约束绑定、Strict 合成、双产品检测、Strict QA、版本失效联动、审核界面、验收报告），并记录风险——官方 STEP 转出的 GLB **无材质**，因此 Logo 保护验收需要带纹理/材质的模型。见 [V3 任务书](reports/V3_TASK_BRIEF.md)
 - **验收状态更新（2026-09-12）**：用户确认 **V1 与 V2 均为 ACCEPTED**；排除项（外观/材质留到 V3、不做多 Owner/多租户）获接受。[V1 确认单](reports/V1_READY_FOR_REVIEW.md) 已记录结论
 - V3 材质素材决定：用户**不能提供**带材质/纹理的模型，要求执行者**在网上查找**可用素材。V3 需登记该素材的来源与许可，并与用户资产分开标注
+- V3 材质素材已落地：从 Polyhaven（**CC0**）取得 `Camera_01`，按其官方 gltf 包清单下载 11 个文件（2.43MB，含 9 张贴图），用 Blender 转为自包含 GLB（2.45MB / 2 网格 / 4 材质 / 9 图像），并经本项目 `inspect_glb` 校验 `has_textures=true`。该素材与用户资产分开标注、不进 Git；几何/尺寸保真仍用官方 STEP 模型，材质/Logo 保真改用本 CC0 资产
 - V3-01/02 进展：多通道已能落盘（Blender 5 必须显式创建 `file_output_items`；72 帧 → 72 个多层 EXR，含 beauty/alpha/depth/normal），但 `index`（对象索引）在 Blender 5.2 无对应 RenderLayers 输出、且多层 EXR 的读取方式未定，**V3-02 仍未通过**，V3-03 之后未开工
 - A06 已完成：媒体质量门（黑帧/可见性）、失败/取消重试、构图锚点与实时预览、真实 Chrome 端到端走查（桌面/窄屏/失败态）、GLB 上传校验（损坏/外部资源/无网格）与渲染前磁盘空间保护。后端本地与云端均 62/62 通过，见 [A06 用户流程与质量](reports/A06_USER_FLOW_QUALITY.md)
 - A02 进行中：补齐了缺失的 ImagePreviewSpec 合同（新增 `contracts/image-preview.v1.*`）并加了一致性守卫测试（Schema/示例/运行时三方同步、同一批正负例双方判定一致）。仍未实现目标 3D 合同的运行时模型、产品版本审核工作流与非 6 秒时长，见 [A02/A03 验收](reports/A02_A03_ACCEPTANCE.md)
