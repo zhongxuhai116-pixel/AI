@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import BackgroundTasks, FastAPI, Depends, File, Header, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
@@ -2867,6 +2867,103 @@ def retry_job(
         "status": "QUEUED",
         "attempt": attempt,
         "status_url": f"/api/v1/jobs/{job_id}",
+    }
+
+
+ARTIFACT_UPLOADS = {
+    # 远程 Worker 只允许回传这两类文件，且文件名固定，避免任意写入。
+    "video": ("preview.mp4", 400 * 1024 * 1024),
+    "manifest": ("metadata.json", 8 * 1024 * 1024),
+}
+
+
+def _worker_job_and_plan(job_id: str) -> tuple[dict, str, dict]:
+    job = get_job(job_id)
+    run_dir = RUNS / job_id
+    plan_path = run_dir / "director_plan.json"
+    try:
+        plan_snapshot = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(409, f"任务缺少有效的 DirectorPlan 快照: {exc}") from None
+    return job, plan_path.read_text(encoding="utf-8"), plan_snapshot
+
+
+@app.get("/internal/v1/workers/jobs/{job_id}/input", dependencies=[Depends(_ensure_worker_token)])
+def worker_job_input(job_id: str, worker_id: str, lease_epoch: int) -> dict:
+    """远程 Worker 取任务输入：冻结计划 + 素材下载地址（不暴露文件系统路径）。"""
+    security.check_worker_id(worker_id)
+    with connect() as db:
+        require_active_lease(db, job_id, worker_id, lease_epoch)
+    job, _plan_text, plan_snapshot = _worker_job_and_plan(job_id)
+    with connect() as db:
+        asset = db.execute("SELECT * FROM assets WHERE id = ?", (job["asset_id"],)).fetchone()
+    if not asset:
+        raise HTTPException(409, "任务输入素材不存在")
+    return {
+        "job_id": job_id,
+        "asset": {
+            "id": asset["id"],
+            "name": asset["name"],
+            "kind": asset["kind"],
+            "mime": asset["mime"],
+            "sha256": asset["sha256"],
+            "size_bytes": asset["size_bytes"],
+            "download_url": f"/internal/v1/workers/jobs/{job_id}/input/asset",
+        },
+        "plan": plan_snapshot,
+        "output": plan_snapshot.get("output", {}),
+        "lease_epoch": lease_epoch,
+    }
+
+
+@app.get("/internal/v1/workers/jobs/{job_id}/input/asset", dependencies=[Depends(_ensure_worker_token)])
+def worker_job_asset(job_id: str, worker_id: str, lease_epoch: int):
+    security.check_worker_id(worker_id)
+    with connect() as db:
+        require_active_lease(db, job_id, worker_id, lease_epoch)
+        job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(404, "任务不存在")
+        asset = db.execute("SELECT * FROM assets WHERE id = ?", (job["asset_id"],)).fetchone()
+    if not asset:
+        raise HTTPException(409, "任务输入素材不存在")
+    path = resolve_asset_path(asset)
+    return FileResponse(path, media_type=asset["mime"], filename=asset["name"])
+
+
+@app.post("/internal/v1/workers/jobs/{job_id}/artifact", dependencies=[Depends(_ensure_worker_token)])
+async def worker_job_artifact(
+    job_id: str,
+    worker_id: str = Form(...),
+    lease_epoch: int = Form(...),
+    kind: str = Form(...),
+    file: UploadFile = File(...),
+) -> dict:
+    """远程 Worker 回传产物：文件名白名单 + 大小上限 + 只允许写进该任务的目录。"""
+    security.check_worker_id(worker_id)
+    if kind not in ARTIFACT_UPLOADS:
+        raise HTTPException(422, f"不支持的产物类型: {kind}")
+    expected_name, limit = ARTIFACT_UPLOADS[kind]
+    with connect() as db:
+        require_active_lease(db, job_id, worker_id, lease_epoch)
+    data = await file.read()
+    if not data:
+        raise HTTPException(422, "产物为空")
+    if len(data) > limit:
+        raise HTTPException(413, f"产物超过上限（{limit // (1024 * 1024)} MB）")
+    run_dir = (RUNS / job_id).resolve()
+    target = (run_dir / expected_name).resolve()
+    if run_dir not in target.parents:
+        raise HTTPException(403, "产物路径不在授权目录内")
+    target.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    return {
+        "job_id": job_id,
+        "kind": kind,
+        "filename": expected_name,
+        "bytes": len(data),
+        "sha256": digest,
+        "storage_reference": _storage_reference(job_id, str(target)),
     }
 
 
