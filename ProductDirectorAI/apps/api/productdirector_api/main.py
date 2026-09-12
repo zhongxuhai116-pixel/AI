@@ -34,7 +34,7 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image, ImageStat
-from . import director_plan, security, storage
+from . import director, director_plan, security, storage
 from .director_plan import CameraPath, ProductPose, SceneSpec, Vector3
 from .providers import comfyui
 
@@ -524,6 +524,16 @@ class H3VideoRequest(BaseModel):
     length: int = Field(default=124, ge=5, le=362)
     steps: int = Field(default=4, ge=1, le=100)
     seed: int = Field(default=20260912, ge=0)
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
+
+
+class DirectorPlanRequest(BaseModel):
+    """V2：把自然语言描述转成合法、可编辑的分镜计划草稿。"""
+
+    intent: str = Field(min_length=1, max_length=4000)
+    product_asset_id: str | None = None
+    asset_kind: Literal["image", "model"] = "image"
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
@@ -1981,6 +1991,72 @@ def update_provider_job(provider_job_id: str, **values) -> None:
             "UPDATE provider_jobs SET " + ", ".join(f"{key} = ?" for key in values) + " WHERE id = ?",
             [*values.values(), provider_job_id],
         )
+
+
+def build_director_llm():
+    """按配置返回 LLM 生成函数；未启用或缺凭证时返回 None（退到规则生成）。"""
+    if director.provider_from_env() != "minimax":
+        return None
+    row = provider_row()
+    if not row:
+        return None
+    try:
+        api_key = unprotect_secret(row["encrypted_key"])
+    except HTTPException:
+        return None
+    model = os.getenv("PRODUCTDIRECTOR_DIRECTOR_MODEL", "MiniMax-Text-01")
+
+    def llm(intent: str, asset_kind: str) -> dict:
+        status, payload = minimax_call(
+            api_key,
+            "/v1/chat/completions",
+            {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": director.LLM_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"产品素材类型：{asset_kind}。描述：{intent}"},
+                ],
+                "temperature": 0.7,
+            },
+            base_url=row["base_url"],
+        )
+        if status != 200:
+            raise RuntimeError(f"LLM 返回 HTTP {status}")
+        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return director.parse_llm_content(content)
+
+    return llm
+
+
+@app.post("/api/v1/director/plan")
+def director_plan(request: DirectorPlanRequest) -> dict:
+    """描述 → 合法可编辑计划草稿。
+
+    服务端校验是必经步骤：候选计划不合法会被修复（最多两次），
+    仍不合法则退回模板。默认使用本地规则生成器，不调用收费 API。
+    """
+    owner_id, _, _project_id = normalize_contract_context(request.owner_id, request.project_id)
+    asset_kind = request.asset_kind
+    if request.product_asset_id:
+        with connect() as db:
+            asset = db.execute("SELECT * FROM assets WHERE id = ?", (request.product_asset_id,)).fetchone()
+        if not asset:
+            raise HTTPException(404, "产品素材不存在")
+        if asset["owner_id"] != owner_id:
+            raise HTTPException(403, "越权使用素材")
+        asset_kind = asset["kind"]
+
+    result = director.build_plan(
+        request.intent,
+        asset_kind,
+        validator=PlanUpdate,
+        llm=build_director_llm(),
+    )
+    public = result.public()
+    public["asset_kind"] = asset_kind
+    public["validated"] = True
+    public["configured_provider"] = director.provider_from_env()
+    return public
 
 
 @app.get("/api/v1/providers/h3/status")
