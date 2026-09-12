@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mimetypes
 import os
 import subprocess
 import sys
@@ -38,6 +39,8 @@ FFMPEG = os.environ.get("PD_FFMPEG", "ffmpeg")
 FFPROBE = os.environ.get("PD_FFPROBE", "ffprobe")
 GLB_FIXTURE = REPO / "tests" / "fixtures" / "generic-product.glb"
 JOB_TIMEOUT = int(os.environ.get("PD_JOB_TIMEOUT", "1200"))
+# 可选：用用户提供的真实产品图替换程序生成的夹具图（该文件不进入 Git）。
+IMAGE_OVERRIDE = os.environ.get("PD_IMAGE_PATH", "")
 
 SHOTS = [
     {"id": "shot_01", "name": "正面推近", "duration_frames": 24, "camera": "static", "focal_length_mm": 85},
@@ -131,11 +134,9 @@ class Acceptance:
         )
         plan.raise_for_status()
         plan_id = plan.json()["id"]
-        shots = [
-            dict(shot, name=(shot["name"] if expect_kind == "model" else "细节定格"))
-            for shot in SHOTS
-        ]
+        shots = [dict(shot) for shot in SHOTS]
         if expect_kind != "model":
+            # 图片路径没有物理 3D 环绕，第三镜改名，避免过度声明。
             shots[2] = dict(shots[2], name="细节定格")
         edited = self.client.patch(
             f"/api/v1/plans/{plan_id}",
@@ -200,9 +201,21 @@ def main() -> int:
         return 2
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = Path(os.environ.get("PD_OUT_DIR", REPO / "var" / "acceptance" / stamp))
-    png = out_dir / "fixture-product.png"
     out_dir.mkdir(parents=True, exist_ok=True)
-    make_png_fixture(png)
+    if IMAGE_OVERRIDE:
+        source = Path(IMAGE_OVERRIDE)
+        if not source.is_file():
+            print(f"PD_IMAGE_PATH 不存在: {source}", file=sys.stderr)
+            return 2
+        image_path = out_dir / f"product{source.suffix.lower()}"
+        image_path.write_bytes(source.read_bytes())
+        image_mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+        image_label = source.name
+    else:
+        image_path = out_dir / "fixture-product.png"
+        make_png_fixture(image_path)
+        image_mime = "image/png"
+        image_label = "fixture-product.png"
 
     acceptance = Acceptance(token, out_dir)
     summary: dict = {
@@ -210,11 +223,19 @@ def main() -> int:
         "base_url": BASE,
         "out_dir": str(out_dir),
         "health": acceptance.client.get("/api/v1/health").json(),
-        "fixtures": {"png_sha256": sha256(png), "glb_sha256": sha256(GLB_FIXTURE)},
+        "inputs": {
+            "image": {
+                "label": image_label,
+                "source": IMAGE_OVERRIDE or "generated-fixture",
+                "sha256": sha256(image_path),
+                "bytes": image_path.stat().st_size,
+            },
+            "glb": {"label": GLB_FIXTURE.name, "sha256": sha256(GLB_FIXTURE)},
+        },
         "paths": [],
     }
     summary["paths"].append(
-        acceptance.run_path("image", "fixture-product.png", png.read_bytes(), "image/png", "image")
+        acceptance.run_path("image", image_label, image_path.read_bytes(), image_mime, "image")
     )
     summary["paths"].append(
         acceptance.run_path("glb", GLB_FIXTURE.name, GLB_FIXTURE.read_bytes(), "model/gltf-binary", "model")
