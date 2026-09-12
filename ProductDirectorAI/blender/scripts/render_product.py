@@ -210,21 +210,29 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
         node.directory = str(pass_root)
         node.file_name = "frame_"
         node.format.file_format = "OPEN_EXR_MULTILAYER"
-        made: list[str] = []
-        for name, socket, socket_type in [
+        plan = [
             ("beauty", "Image", "RGBA"),
             ("alpha", "Alpha", "FLOAT"),
             ("depth", "Depth", "FLOAT"),
             ("normal", "Normal", "VECTOR"),
-            ("index", "IndexOB", "FLOAT"),
-        ]:
+        ]
+        # 先把所有 item 建好，再统一连线：item 创建过程中 node.inputs 才逐项出现，
+        # 边建边连会把连线挂到错误的输入上（实测导致 EXR 里只有 beauty 一层）。
+        created: list[str] = []
+        for name, _socket, socket_type in plan:
             try:
                 node.file_output_items.new(socket_type, name)
-                tree.links.new(layers.outputs[socket], node.inputs[len(made)])
-                made.append(name)
+                created.append(name)
             except Exception as exc:  # 单个通道不支持时不影响其余通道
                 print(f"DIRECTOR_PASS_SKIPPED {name}: {exc}", flush=True)
-        print(f"DIRECTOR_PASS_CHANNELS {','.join(made)}", flush=True)
+        for index, (name, socket, _socket_type) in enumerate(plan):
+            if name not in created:
+                continue
+            try:
+                tree.links.new(layers.outputs[socket], node.inputs[index])
+            except Exception as exc:
+                print(f"DIRECTOR_PASS_LINK_FAILED {name}: {exc}", flush=True)
+        print(f"DIRECTOR_PASS_CHANNELS {','.join(created)}", flush=True)
         layout = "multilayer-exr"
     tree.links.new(layers.outputs["Image"], node.inputs[0])
     print(f"DIRECTOR_PASSES root={pass_root} layout={layout}", flush=True)
