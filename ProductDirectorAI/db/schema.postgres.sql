@@ -181,3 +181,14 @@ CREATE TABLE IF NOT EXISTS provider_jobs (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_contracts_plan_version ON plan_contracts (plan_id, version);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_plan_id_idempotency ON runs (plan_id, idempotency_key);
+
+CREATE TABLE IF NOT EXISTS fidelity_policies (
+  id TEXT PRIMARY KEY,
+  product_version_id TEXT NOT NULL REFERENCES product_versions(id),
+  version INTEGER NOT NULL,
+  mode TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (product_version_id, version)
+);

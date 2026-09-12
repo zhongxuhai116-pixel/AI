@@ -361,6 +361,17 @@ def initialize_db() -> None:
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS fidelity_policies (
+              id TEXT PRIMARY KEY,
+              product_version_id TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              mode TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(product_version_id, version),
+              FOREIGN KEY(product_version_id) REFERENCES product_versions(id)
+            );
             """
     with connect() as db:
         db.executescript(schema_sql)
@@ -545,6 +556,51 @@ class H3VideoRequest(BaseModel):
     framing: Literal["product", "room"] = "product"
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
+
+
+class ProtectedRegion(BaseModel):
+    """归一化保护区域（0–1 相对坐标），用于严格保真合成时锁定产品像素。"""
+
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+    width: float = Field(gt=0.0, le=1.0)
+    height: float = Field(gt=0.0, le=1.0)
+    label: str = Field(default="", max_length=120)
+
+    @model_validator(mode="after")
+    def stays_inside_the_frame(self):
+        if self.x + self.width > 1.0 + 1e-6 or self.y + self.height > 1.0 + 1e-6:
+            raise ValueError("保护区域必须完全落在画面内（0–1 归一化）")
+        return self
+
+
+FIDELITY_MODES = ("STRICT", "CONTROLLED", "CREATIVE")
+FIDELITY_OPERATIONS = (
+    "color_transform", "edge_composite", "shadow_layer",
+    "reflection_layer", "occlusion_layer", "background_generation",
+)
+
+
+class FidelityPolicyRequest(BaseModel):
+    """V3-03：保真策略版本。STRICT 只允许确定性操作。"""
+
+    mode: Literal["STRICT", "CONTROLLED", "CREATIVE"]
+    protected_regions: list[ProtectedRegion] = Field(default_factory=list, max_length=64)
+    allowed_operations: list[str] = Field(default_factory=list, max_length=16)
+    notes: str = Field(default="", max_length=2000)
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
+
+    @model_validator(mode="after")
+    def validate_operations(self):
+        unknown = [item for item in self.allowed_operations if item not in FIDELITY_OPERATIONS]
+        if unknown:
+            raise ValueError(f"未知的允许操作: {', '.join(unknown)}")
+        if self.mode == "STRICT":
+            forbidden = [item for item in self.allowed_operations if item == "background_generation"]
+            if forbidden:
+                raise ValueError("STRICT 模式不允许背景生成直接覆盖产品像素")
+        return self
 
 
 class DirectorPlanRequest(BaseModel):
@@ -2746,6 +2802,75 @@ def list_product_versions(
                 (owner_id, project_id),
             ).fetchall()
     return [product_version_public(row) for row in rows]
+
+
+def fidelity_policy_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "product_version_id": row["product_version_id"],
+        "version": row["version"],
+        "mode": row["mode"],
+        "payload_sha256": row["payload_sha256"],
+        "created_at": row["created_at"],
+        "policy": json.loads(row["payload"]),
+    }
+
+
+def load_product_version_for_owner(product_version_id: str, owner_id: str, project_id: str):
+    with connect() as db:
+        row = db.execute("SELECT * FROM product_versions WHERE id = ?", (product_version_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "产品版本不存在")
+    if row["owner_id"] != owner_id or row["project_id"] != project_id:
+        raise HTTPException(403, "越权访问产品版本")
+    return row
+
+
+@app.post("/api/v1/product-versions/{product_version_id}/fidelity-policies", status_code=201)
+def create_fidelity_policy(product_version_id: str, request: FidelityPolicyRequest) -> dict:
+    """为产品版本创建一个**不可改写**的保真策略版本。"""
+    owner_id, _, project_id = normalize_contract_context(request.owner_id, request.project_id)
+    load_product_version_for_owner(product_version_id, owner_id, project_id)
+    policy = {
+        "mode": request.mode,
+        "protected_regions": [region.model_dump() for region in request.protected_regions],
+        "allowed_operations": list(request.allowed_operations),
+        "notes": request.notes,
+    }
+    payload_text = json.dumps(policy, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    policy_id = str(uuid.uuid4())
+    with connect() as db:
+        begin_immediate(db)
+        latest = db.execute(
+            "SELECT COALESCE(MAX(version), 0) AS version FROM fidelity_policies WHERE product_version_id = ?",
+            (product_version_id,),
+        ).fetchone()
+        version = int(latest["version"]) + 1
+        db.execute(
+            "INSERT INTO fidelity_policies (id, product_version_id, version, mode, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (policy_id, product_version_id, version, request.mode, payload_text, digest, utc_now()),
+        )
+    with connect() as db:
+        row = db.execute("SELECT * FROM fidelity_policies WHERE id = ?", (policy_id,)).fetchone()
+    return fidelity_policy_public(row)
+
+
+@app.get("/api/v1/product-versions/{product_version_id}/fidelity-policies")
+def list_fidelity_policies(
+    product_version_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    load_product_version_for_owner(product_version_id, owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM fidelity_policies WHERE product_version_id = ? ORDER BY version DESC",
+            (product_version_id,),
+        ).fetchall()
+    return [fidelity_policy_public(row) for row in rows]
 
 
 @app.post("/api/v1/product-versions/{product_version_id}/approve")
