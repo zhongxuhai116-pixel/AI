@@ -61,6 +61,8 @@ QA_BLACK_PIXEL_LEVEL = 16
 # 渲染前的最低可用磁盘空间；不足时快速失败，避免写出半截成片。
 MIN_FREE_DISK_MB = float(os.getenv("PRODUCTDIRECTOR_MIN_FREE_DISK_MB", "1024"))
 MINIMAX_API_BASE_URL = os.getenv("MINIMAX_API_BASE_URL", "https://api.minimaxi.com").rstrip("/")
+# 设为真值时 API 不再进程内执行作业，任务留给独立 Worker（供 worker 模式与演练使用）。
+INLINE_EXECUTOR_DISABLED = os.getenv("PRODUCTDIRECTOR_DISABLE_INLINE_EXECUTOR", "").strip().lower() in {"1", "true", "yes"}
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -2735,7 +2737,7 @@ def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
                 json.dumps(plan_snapshot, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-    if created_new:
+    if created_new and not INLINE_EXECUTOR_DISABLED:
         background.add_task(execute_job, job_id)
     return {
         "job_id": job_id,
