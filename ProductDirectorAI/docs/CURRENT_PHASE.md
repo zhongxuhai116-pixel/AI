@@ -52,6 +52,7 @@
 - 换电脑后本机真实（非 mock）图片链路复验通过：1080×1920、H.264、144 帧、6 秒，边界帧六张哈希互不相同，产物与清单哈希见 [本机 FFmpeg 验收](reports/V1_LOCAL_FFMPEG_E2E.md)；本机无 Blender，GLB 未在本机复验
 - 云端已部署本轮代码（`8e6fe3c`）：修复 web 服务缺 `node_modules` 导致的崩溃重启；新增 `/etc/productdirector/v1.env`（root 0600）保存 Owner/Worker/Fernet 密钥并接入 systemd；匿名访问返回 401
 - 云端双链路真实验收通过：图片作业 3.0 秒、GLB 作业 63.2 秒（真实 Blender 渲染 144 帧），均为 H.264、1080×1920、24fps、144 帧、6 秒，边界帧六张哈希互不相同；GPU 采样峰值 75%、显存 1641 MiB
+- A06 进行中：媒体质量门已落地（镜头边界取样帧的均值/标准差 + `blackdetect` 黑屏占比，不通过即阻断作业并写入 Manifest），本地与云端真实链路均通过；失败重试入口、视角确认与 UI 端到端验收尚未完成，见 [A06 用户流程与质量](reports/A06_USER_FLOW_QUALITY.md)
 - 深色侧栏、浅色卡片、橙色主动作的 V1 工作台
 
 ## 暂不实现
