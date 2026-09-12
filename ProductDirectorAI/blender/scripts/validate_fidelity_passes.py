@@ -7,8 +7,10 @@
 检查：帧数一致、遮罩近二值且覆盖合理、深度在产品区为有限正值、法线模长接近 1、
 以及 EXR 与遮罩的产品区域基本吻合。
 
+不依赖 Blender：用项目 venv 运行即可（Pillow 读遮罩 PNG，OpenEXR 读多层 EXR）。
+
 用法：
-    blender --background --python blender/scripts/validate_fidelity_passes.py -- \
+    .venv/bin/python blender/scripts/validate_fidelity_passes.py \
         --passes <run_dir>/frames/passes --frames 72 --json <out.json>
 """
 from __future__ import annotations
@@ -19,8 +21,8 @@ import math
 import sys
 from pathlib import Path
 
-import bpy
 import numpy as np
+from PIL import Image
 
 
 def parse_args():
@@ -32,12 +34,8 @@ def parse_args():
 
 
 def read_mask(path: Path) -> np.ndarray:
-    image = bpy.data.images.load(str(path), check_existing=False)
-    pixels = np.array(image.pixels[:], dtype=np.float32)
-    width, height = image.size
-    array = pixels.reshape(height, width, 4)
-    bpy.data.images.remove(image)
-    return array[:, :, 3]
+    with Image.open(path) as image:
+        return np.array(image.convert("RGBA").split()[3], dtype=np.float32) / 255.0
 
 
 def read_exr(path: Path) -> dict:
