@@ -175,15 +175,21 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
         node.directory = str(pass_root)
         node.file_name = "frame_"
         node.format.file_format = "OPEN_EXR_MULTILAYER"
-        for index, (name, socket, socket_type) in enumerate([
+        made: list[str] = []
+        for name, socket, socket_type in [
             ("beauty", "Image", "RGBA"),
             ("alpha", "Alpha", "FLOAT"),
             ("depth", "Depth", "FLOAT"),
             ("normal", "Normal", "VECTOR"),
-            ("index", "IndexOB", "INT"),
-        ]):
-            node.file_output_items.new(socket_type, name)
-            tree.links.new(layers.outputs[socket], node.inputs[index])
+            ("index", "IndexOB", "FLOAT"),
+        ]:
+            try:
+                node.file_output_items.new(socket_type, name)
+                tree.links.new(layers.outputs[socket], node.inputs[len(made)])
+                made.append(name)
+            except Exception as exc:  # 单个通道不支持时不影响其余通道
+                print(f"DIRECTOR_PASS_SKIPPED {name}: {exc}", flush=True)
+        print(f"DIRECTOR_PASS_CHANNELS {','.join(made)}", flush=True)
         layout = "multilayer-exr"
     tree.links.new(layers.outputs["Image"], node.inputs[0])
     print(f"DIRECTOR_PASSES root={pass_root} layout={layout}", flush=True)
