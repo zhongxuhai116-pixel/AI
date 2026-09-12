@@ -70,3 +70,57 @@ OK
 - 目标 3D 合同（`director-plan.v1.schema.json` 的相机轨迹/位姿/场景）**尚未实现**为运行时模型；当前只有简化字段。
 - 缺少产品版本的审核/批准工作流与多 Owner/Workspace 管理接口（现为单 Owner 部署）。
 - 主规格的时长边界（除固定 6 秒外）未实现。
+
+---
+
+## 2026-09-12 追加：目标 3D 合同落地（A02 增量）
+
+上一节列的第 1 条已处理：根 Schema 的相机轨迹、产品位姿与场景现在是真实的运行时能力，并且**真的驱动 Blender 出片**。
+
+### 运行时新增字段
+
+| 位置 | 字段 | 说明 |
+| --- | --- | --- |
+| `Shot` | `camera_target_m` | 相机注视点；缺省沿用历史默认 `(0, 0, 0.7)` |
+| `Shot` | `camera_path` | 判别式联合：`hero_orbit`（半径/高度/起止角度）、`dolly_in` / `side_track`（起止位置）、`static`（位置） |
+| `Shot` | `sensor_width_mm` | 传感器宽度，默认 36 |
+| 计划 | `product_pose` | 产品位置/旋转/缩放，在归一化底座上叠加 |
+| 计划 | `scene` | 模板、背景色（`#RRGGBB`）、布光预设（`softbox` / `three_point`） |
+
+旧计划不填这些字段时，Blender 脚本使用与历史完全相同的默认取景，因此历史作业可复现。
+
+### 合同桥接（`apps/api/productdirector_api/director_plan.py`）
+
+- `to_target_document(snapshot)`：运行时快照 → 符合根 Schema 的 3D 文档；Manifest 里以 `director_plan_3d` 字段随产物保存。
+- `from_target_document(document)`：3D 文档 → 运行时字段（下转换）。
+- 目标合同把 `product_pose.scale` 固定为 1、`sensor_width_mm` 固定为 36，而运行时已支持更大范围：此时**显式抛 `TargetContractError`**，Manifest 记录 `director_plan_3d_error`，不会输出一份"看起来合规"的文档。
+
+### 验证证据
+
+单元/契约测试（本地 87/87）：
+
+| 用例 | 覆盖 |
+| --- | --- |
+| `test_default_snapshot_converts_to_a_valid_3d_document` | 默认快照映射出的文档通过根 Schema 校验 |
+| `test_unspecified_3d_fields_fall_back_to_renderer_defaults` | 缺省值与 Blender 脚本历史默认一致 |
+| `test_explicit_3d_fields_survive_the_bridge` | 显式轨迹/注视点/场景不丢失 |
+| `test_contract_limits_are_reported_instead_of_silently_clamped` | 超出目标合同范围时报错而非静默裁剪 |
+| `test_round_trip_preserves_shot_semantics` | 往返后镜头语义不变且仍被运行时接受 |
+| `test_target_schema_example_still_round_trips` | 官方示例可往返 |
+| `test_runtime_rejects_unknown_camera_path_type` / `..._out_of_range_orbit` | 非法轨迹类型与半径 0 被拒绝 |
+
+真实渲染对比（`scripts/director_plan_3d_check.py`，同一 GLB、云端 RTX 4090、1080×1920、144 帧）：
+
+| 计划 | 耗时 | 视频 SHA-256 | 质量门 | director_plan_3d |
+| --- | ---: | --- | --- | --- |
+| 默认（不提供 3D 字段） | 55.2 秒 | `6e6f46a241645f81…` | passed | 已写入 |
+| 显式轨迹（环绕半径 6.5m、-80°→80°、注视点抬高、三点布光、背景 `#101828`） | 55.4 秒 | `3115137984802851…` | passed | 已写入 |
+
+默认计划的哈希与此前所有验收批次**完全一致**，说明新增字段没有改变默认行为；显式轨迹产出不同成片，说明这些字段真的进入了渲染。
+
+### 仍未完成
+
+- 产品版本的审核/批准工作流与多 Owner/Workspace 管理接口（现为单 Owner 部署）。
+- 主规格的时长边界（除固定 6 秒外）未实现。
+- 目标合同把 `scale` 固定为 1、`sensor_width_mm` 固定为 36；放开需要用带版本号的 Schema 迁移，不能直接改现有合同。
+- 前端尚未暴露相机轨迹/位姿/场景编辑控件（当前通过 API 与合同驱动）。
