@@ -1,0 +1,4 @@
+# 只用于 A03 的 SQLite -> PostgreSQL 迁移演练（scripts/pg_migrate.py）。
+# 运行时 API 仍使用 SQLite，不需要安装此文件。
+-r requirements.txt
+psycopg[binary]==3.3.5
