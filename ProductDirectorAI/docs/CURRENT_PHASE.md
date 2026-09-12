@@ -1,6 +1,6 @@
 # 当前阶段
 
-> 2026-09-11 换电脑最新结论：V1、A04、A05 均为 PARTIAL。换电脑后已复跑后端 28/28、前端 build、Sites 4/4，并完成 A04 竞争窗口与长任务续租加固，证据见 [A04 恢复加固报告](reports/A04_RECOVERY_HARDENING.md)；SSH 仍在认证前超时，未部署云端。先读 [最新继续入口](NEXT_COMPUTER_START.md) 与 [A05 交接报告](reports/A05_SECURITY_HANDOFF.md)。下方分时记录的“完整验收”标题仅反映历史局部检查。
+> 2026-09-12 最新结论：V1 仍为 PARTIAL，但本轮代码**已真实部署到云节点**（HEAD `8e6fe3c`），云端图片与 GLB 双链路真实出片通过，A05 鉴权在云端生效（匿名 401 / 带令牌 200），web 服务崩溃重启已修复。本地后端 28/28、前端 build、Sites 4/4 通过；本地图片链路真实出片通过。证据见 [云端部署与双链路出片验收](reports/CLOUD_DEPLOY_A05_ACCEPTANCE.md)、[A04 恢复加固](reports/A04_RECOVERY_HARDENING.md)、[本机 FFmpeg 验收](reports/V1_LOCAL_FFMPEG_E2E.md)。先读 [最新继续入口](NEXT_COMPUTER_START.md)。下方分时记录的“完整验收”标题仅反映历史局部检查。
 
 - 当前版本：V1 · 3D Director MVP
 - 状态：PARTIAL；新云节点 V1 基础设施、GPU 渲染、通用 GLB/图片端到端链路、DirectorPlan 分镜语义及 1080×1920 基线导出已 PASS，完整产品合同、可靠任务、鉴权和用户真实素材仍待验收
@@ -50,6 +50,8 @@
 - 已验收三镜头修改真正驱动 Blender：85mm 定格 24 帧、24mm 侧向移动 72 帧、55mm 环绕 48 帧；Manifest 记录冻结计划 SHA-256
 - 已验收同一组修改真正驱动图片 FFmpeg 成片：四个边界帧全部不同，输出为 540×960、24fps、144 帧、6 秒；图片的 `hero_orbit` 明确是 2D 视差近似，不宣称物理 3D 环绕
 - 换电脑后本机真实（非 mock）图片链路复验通过：1080×1920、H.264、144 帧、6 秒，边界帧六张哈希互不相同，产物与清单哈希见 [本机 FFmpeg 验收](reports/V1_LOCAL_FFMPEG_E2E.md)；本机无 Blender，GLB 未在本机复验
+- 云端已部署本轮代码（`8e6fe3c`）：修复 web 服务缺 `node_modules` 导致的崩溃重启；新增 `/etc/productdirector/v1.env`（root 0600）保存 Owner/Worker/Fernet 密钥并接入 systemd；匿名访问返回 401
+- 云端双链路真实验收通过：图片作业 3.0 秒、GLB 作业 63.2 秒（真实 Blender 渲染 144 帧），均为 H.264、1080×1920、24fps、144 帧、6 秒，边界帧六张哈希互不相同；GPU 采样峰值 75%、显存 1641 MiB
 - 深色侧栏、浅色卡片、橙色主动作的 V1 工作台
 
 ## 暂不实现

@@ -1,6 +1,6 @@
 # 云服务器交接
 
-> 本次换电脑交接：SSH 在认证前超时，未登录或部署本轮 A05 改动。下表部署/版本/运行状态均为历史观察，恢复连接后先只读复验。新代码配置见 [最新继续入口](NEXT_COMPUTER_START.md)。
+> 2026-09-12 更新：已恢复 SSH（云防火墙需放行当前出口 IP；本轮实际出口为深圳电信 `14.155.108.107`），本轮代码已部署到云端，图片与 GLB 双链路真实出片通过。部署细节、密钥环境文件与产物哈希见 [云端部署与双链路出片验收](reports/CLOUD_DEPLOY_A05_ACCEPTANCE.md)。下表部署状态已按本次复验修正。
 
 更新日期：2026-09-11。本文只保存脱敏事实，不包含公网/内网地址、实例 ID、账号、密码、访问令牌、客户端公网 IP 或私钥。
 
@@ -16,8 +16,9 @@
 | Blender | 官方 Blender 5.2.1 LTS，`/usr/local/bin/blender` | PASS |
 | FFmpeg | Ubuntu FFmpeg/ffprobe 4.4.2，`/usr/bin` | PASS |
 | Node | 官方 Node.js 22.23.2，`/opt/productdirector/node` | PASS |
-| 项目 | GitHub `main` 已同步最新已验收 V1 代码与文档 | PASS |
+| 项目 | GitHub `main` 已同步本轮代码：云端 HEAD `8e6fe3c` | PASS |
 | 服务 | API `localhost:8000`；Web `localhost:4173`；systemd enabled/active | PASS；未公网暴露 |
+| 鉴权 | API 需 Owner 访问密钥；Worker 需独立密钥；密钥存于 `/etc/productdirector/v1.env`（root 0600） | PASS；匿名访问返回 401 |
 
 旧节点曾完成约 291GB 根分区扩容，但该事实不得套用到当前新节点。当前节点禁止重复执行旧 growpart/resize2fs 记录，也不要在未核对云盘配置前格式化、重分区或假设已有 300GB。
 
@@ -48,8 +49,20 @@
 - 项目：`/home/ubuntu/AI/ProductDirectorAI`
 - Python 环境：`/home/ubuntu/AI/ProductDirectorAI/.venv`
 - 运行数据：`/home/ubuntu/AI/ProductDirectorAI/var`
+- 服务端密钥：`/etc/productdirector/v1.env`（`root:root` 0600，包含 Owner/Worker/Fernet 密钥；不要打印或提交）
+- 部署前备份：`/home/ubuntu/pd-backup-<时间戳>`（工作区补丁、未跟踪文件、systemd 单元）
 
-只读检查：`systemctl status productdirector-v1-api productdirector-v1-web`、`curl http://localhost:8000/api/v1/health`、`curl -I http://localhost:4173`。服务当前没有完整身份/权限层，不得直接改为所有网卡监听或开放云防火墙。需要远程访问时先实现鉴权或经用户明确授权配置受限隧道。
+只读检查（API 现在需要鉴权）：
+
+```bash
+systemctl status productdirector-v1-api productdirector-v1-web --no-pager
+sudo bash -c 'set -a; . /etc/productdirector/v1.env; set +a; \
+  curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $PRODUCTDIRECTOR_OWNER_TOKEN" \
+  http://127.0.0.1:8000/api/v1/health'
+curl -I http://127.0.0.1:4173/
+```
+
+仍是私有单 Owner、回环/受控隧道场景：不要改为所有网卡监听，也不要开放云防火墙；远程访问需用户明确授权并先完成受限隧道。
 
 ## MiniMax H3 决策
 

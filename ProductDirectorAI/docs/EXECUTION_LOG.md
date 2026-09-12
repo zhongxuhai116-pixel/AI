@@ -100,3 +100,13 @@
 - 产物：1080×1920、H.264、24fps、144 帧、6.000 秒、206,693 字节；视频 SHA-256 `b689c76aa8003e336ee4b680913f3852d0ae1fcf7a9bb14307574fe77401f4b1`，Manifest SHA-256 `eb8fdeae901cee6c557af5fcdaa742d8eeb7f94e1f08963779e46518b7e1556b`。
 - 分镜语义生效：第 1/24/25/96/97/144 帧六张边界帧哈希全部不同；Manifest 记录冻结计划的 SHA-256 `3ecab00c99b19b02445355b925931450af423e9625e0cbc8e5a6aa8aec48846d`。
 - 本机没有 Blender，GLB 链路本次未复验；证据与复验步骤见 [本机真实 FFmpeg 图片链路验收](reports/V1_LOCAL_FFMPEG_E2E.md)。
+
+### 2026-09-12 追加：云端部署与双链路出片验收
+
+- 恢复云 SSH：实例 SSH 长期超时的真实原因是云防火墙 `TCP:22` 只放行了旧设备出口 IP；放行当前出口后恢复。云端另有两个前置问题：`productdirector-v1-web` 因缺 `node_modules/vite` 崩溃重启 305 次；仓库停在 `68532ec` 且有未提交改动。
+- 安全部署：先备份云端工作区补丁、未跟踪文件与 systemd 单元到 `/home/ubuntu/pd-backup-20260912-093845`，再 stash 本地改动并快进到 `8e6fe3c`。
+- 依赖与构建：云端 `pip install -r apps/api/requirements-test.txt`、`apps/web` 执行 `npm ci`（67 包）与 `npm run build`，web 服务恢复。
+- 鉴权落地：生成 `/etc/productdirector/v1.env`（root 0600）保存 Owner/Worker/Fernet 密钥，两个 systemd 单元加入 `EnvironmentFile` 并重启；匿名 `/api/v1/health` 返回 401，携带 Owner 令牌返回 200。
+- 双链路验收：新增可复跑脚本 `scripts/v1_cloud_acceptance.py`。图片作业 `3acb27ad-…` 3.0 秒完成；GLB 作业 `afd2e8d0-…` 63.2 秒完成真实 Blender 渲染。两者均为 H.264、1080×1920、24fps、144 帧、6.000 秒，边界帧六张哈希互不相同。
+- GPU 证据：渲染期间 43 次采样，峰值利用率 75%、峰值显存 1641 MiB、活跃采样 16 次。
+- 未完成：真实杀进程重领、远程 Worker 输入/回收、用户真实素材与稳定性对照、前端登录页浏览器验收。证据见 [云端部署与双链路出片验收](reports/CLOUD_DEPLOY_A05_ACCEPTANCE.md)。
