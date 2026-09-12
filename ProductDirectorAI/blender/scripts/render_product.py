@@ -146,30 +146,36 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
     if hasattr(bpy.types, "CompositorNodeComposite"):
         composite = tree.nodes.new("CompositorNodeComposite")
         tree.links.new(layers.outputs["Image"], composite.inputs["Image"])
-    # Blender 5 的 File Output 只支持 EXR，因此所有通道统一用 32 位 EXR：
-    # 对 Depth/Normal/Index 本来就需要浮点，Beauty/Alpha 用 EXR 也无损。
-    channels = {
-        "beauty": ("Image", "RGBA"),
-        "alpha": ("Alpha", "BW"),
-        "depth": ("Depth", "BW"),
-        "normal": ("Normal", "RGBA"),
-        "index": ("IndexOB", "BW"),
-    }
-    for name, (socket, color_mode) in channels.items():
-        node = tree.nodes.new("CompositorNodeOutputFile")
-        if hasattr(node, "base_path"):
-            # Blender 4：base_path + file_slots
-            node.base_path = str(pass_root / name)
-            node.file_slots[0].path = "frame_"
-        else:
-            # Blender 5：directory + file_name（帧号由渲染器追加）
-            node.directory = str(pass_root / name)
-            node.file_name = "frame_"
-        node.format.file_format = "OPEN_EXR"
-        node.format.color_depth = "32"
-        node.format.color_mode = color_mode
-        tree.links.new(layers.outputs[socket], node.inputs[0])
-    print(f"DIRECTOR_PASSES root={pass_root} channels={','.join(channels)}", flush=True)
+    node = tree.nodes.new("CompositorNodeOutputFile")
+    if hasattr(node, "base_path"):
+        # Blender 4：每个通道一个输出节点，各自目录、PNG/EXR 自选。
+        node.base_path = str(pass_root / "beauty")
+        node.file_slots[0].path = "frame_"
+        node.format.file_format = "PNG"
+        node.format.color_depth = "8"
+        extra = {
+            "alpha": ("Alpha", "PNG", "8", "BW"),
+            "depth": ("Depth", "OPEN_EXR", "32", "BW"),
+            "normal": ("Normal", "OPEN_EXR", "16", "RGBA"),
+            "index": ("IndexOB", "OPEN_EXR", "16", "BW"),
+        }
+        for name, (socket, file_format, depth, color_mode) in extra.items():
+            extra_node = tree.nodes.new("CompositorNodeOutputFile")
+            extra_node.base_path = str(pass_root / name)
+            extra_node.file_slots[0].path = "frame_"
+            extra_node.format.file_format = file_format
+            extra_node.format.color_depth = depth
+            extra_node.format.color_mode = color_mode
+            tree.links.new(layers.outputs[socket], extra_node.inputs[0])
+        layout = "per-channel"
+    else:
+        # Blender 5 只提供多层 EXR：每帧一个 .exr，内含全部 pass 槽位。
+        node.directory = str(pass_root)
+        node.file_name = "frame_"
+        node.format.file_format = "OPEN_EXR_MULTILAYER"
+        layout = "multilayer-exr"
+    tree.links.new(layers.outputs["Image"], node.inputs[0])
+    print(f"DIRECTOR_PASSES root={pass_root} layout={layout}", flush=True)
 
 
 def load_plan(path: str, total_frames: int) -> list[dict]:
