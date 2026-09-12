@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import time
@@ -69,6 +70,39 @@ def build_workflow(image: str, crop: list[int], prefix: str, seed: int, resoluti
     }
 
 
+COMFY_ROOT = Path(os.environ.get("PD_COMFY_ROOT", "/home/ubuntu/comfy-h3"))
+
+
+def resolve_glb(outputs: dict) -> Path:
+    """从 ComfyUI 的 history outputs 里解析出 GLB 的磁盘路径。
+
+    SaveGLB 返回的是 `{"filename": ..., "subfolder": ..., "type": "output"}`
+    这样的结构（不是纯字符串），必须按 subfolder 拼回路径。
+    """
+
+    def candidates():
+        for node_output in outputs.values():
+            for value in node_output.values():
+                items = value if isinstance(value, list) else [value]
+                for item in items:
+                    if isinstance(item, dict):
+                        filename = item.get("filename") or ""
+                        if not str(filename).lower().endswith(".glb"):
+                            continue
+                        subfolder = item.get("subfolder") or ""
+                        kind = item.get("type") or "output"
+                        root = COMFY_ROOT / (kind if kind in {"output", "input", "temp"} else "output")
+                        yield root / subfolder / str(filename)
+                    elif isinstance(item, str) and item.lower().endswith(".glb"):
+                        path = Path(item)
+                        yield path if path.is_absolute() else COMFY_ROOT / "output" / path
+
+    for candidate in candidates():
+        if candidate.exists():
+            return candidate
+    return next(candidates(), Path("/nonexistent.glb"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8188")
@@ -113,25 +147,10 @@ def main() -> int:
         return 1
 
     outputs = record.get("outputs", {})
-    produced = []
-    for node_output in outputs.values():
-        for value in node_output.values():
-            if isinstance(value, list):
-                produced.extend(item for item in value if isinstance(item, str))
-            elif isinstance(value, str):
-                produced.append(value)
-    glb = next((item for item in produced if item.lower().endswith(".glb")), None)
-    if not glb:
-        print(json.dumps(outputs, ensure_ascii=False)[:2000], file=sys.stderr)
-        return 1
-
-    source = Path(glb)
-    if not source.is_absolute():
-        # ComfyUI 的输出目录；SaveGLB 会写到 output/3d/<prefix>_00001_.glb
-        candidates = [Path(glb), Path("/home/ubuntu/comfy-h3") / glb, Path("/home/ubuntu/comfy-h3/output") / glb]
-        source = next((candidate for candidate in candidates if candidate.exists()), Path(glb))
+    source = resolve_glb(outputs)
     if not source.exists():
-        print(f"找不到输出文件: {glb}", file=sys.stderr)
+        print(json.dumps(outputs, ensure_ascii=False)[:2000], file=sys.stderr)
+        print(f"找不到输出文件: {source}", file=sys.stderr)
         return 1
 
     target = Path(args.out)
