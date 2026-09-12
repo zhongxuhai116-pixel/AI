@@ -34,7 +34,7 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image, ImageStat
-from . import security
+from . import security, storage
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -135,15 +135,22 @@ if FFMPEG:
     FFPROBE = str(ffprobe_candidate) if ffprobe_candidate.exists() else find_executable("ffprobe", [])
 
 
-def connect() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH, check_same_thread=False)
-    connection.row_factory = sqlite3.Row
-    return connection
+def postgres_schema_sql() -> str:
+    """PostgreSQL 建表脚本（与 SQLite 版逐列对应）。"""
+    path = ROOT / "db" / "schema.postgres.sql"
+    if not path.exists():
+        raise RuntimeError(f"缺少 PostgreSQL schema 文件: {path}")
+    return path.read_text(encoding="utf-8")
 
 
-def begin_immediate(db: sqlite3.Connection) -> None:
+def connect():
+    """返回数据库连接：默认 SQLite；设置 PRODUCTDIRECTOR_DATABASE_URL 可切到 PostgreSQL。"""
+    return storage.connect(DB_PATH)
+
+
+def begin_immediate(db) -> None:
     """升级为写事务，确保读取租约状态与写入结果在同一事务内完成。"""
-    db.execute("BEGIN IMMEDIATE")
+    storage.begin_writer(db)
 
 
 @dataclass(frozen=True)
@@ -167,16 +174,14 @@ def lease_scope(lease: LeaseContext):
         CURRENT_LEASE.reset(token)
 
 
-def ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+def ensure_column(db, table: str, column: str, definition: str) -> None:
+    columns = set(storage.table_columns(db, table))
     if column not in columns:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def initialize_db() -> None:
-    with connect() as db:
-        db.executescript(
-            """
+    schema_sql = postgres_schema_sql() if storage.is_postgres() else """
             CREATE TABLE IF NOT EXISTS assets (
               id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
@@ -340,17 +345,19 @@ def initialize_db() -> None:
               key_fingerprint TEXT NOT NULL
             );
             """
-        )
+    with connect() as db:
+        db.executescript(schema_sql)
         ensure_column(db, "run_jobs", "lease_owner", "TEXT")
         ensure_column(db, "run_jobs", "lease_expires_at", "TEXT")
         ensure_column(db, "run_jobs", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(db, "assets", "owner_id", "TEXT NOT NULL DEFAULT 'owner-default'")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
-        legacy_index = db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_runs_idempotency'"
-        ).fetchone()
-        if legacy_index:
-            db.execute("DROP INDEX idx_runs_idempotency")
+        if not storage.is_postgres():
+            legacy_index = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_runs_idempotency'"
+            ).fetchone()
+            if legacy_index:
+                db.execute("DROP INDEX idx_runs_idempotency")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_plan_id_idempotency ON runs(plan_id, idempotency_key)")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_contracts_plan_version ON plan_contracts(plan_id, version)")
         now = utc_now()
