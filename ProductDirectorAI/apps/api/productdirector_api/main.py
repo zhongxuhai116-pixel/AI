@@ -2323,6 +2323,18 @@ def h3_job_status(
 
     status = comfyui.status_text(record)
     if status == "RUNNING":
+        # 区分"排队中"与"正在生成"：只看 history 会把两者都当成 RUNNING。
+        stage = row["stage"]
+        try:
+            snapshot = comfyui.queue_snapshot()
+            if row["external_id"] in snapshot["running"]:
+                stage = "GENERATE"
+            elif row["external_id"] in snapshot["pending"]:
+                stage = "QUEUED"
+        except comfyui.ComfyUIError:
+            stage = row["stage"]
+        if stage != row["stage"]:
+            update_provider_job(provider_job_id, stage=stage)
         return provider_job_public(load_provider_job(provider_job_id))
     if status == "FAILED":
         update_provider_job(provider_job_id, status="FAILED", stage="GENERATE", error="Provider 报告执行失败")

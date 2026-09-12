@@ -165,3 +165,36 @@ artifact: mp4 1,068,806 字节  h264 576×1024 124 帧 5.167 秒
 ### 8.4 成本
 
 完整链路（重建 + Blender + H3 124 帧）单次约 **8.5 分钟**，比单图版本（约 7.5 分钟）多约一分钟，换来更稳定的产品一致性。
+
+---
+
+## 9. 取消语义与单卡产能（2026-09-12 追加）
+
+### 9.1 实现
+
+| 能力 | 行为 |
+| --- | --- |
+| `GET /api/v1/providers/h3/queue` | ComfyUI 全局队列深度 + 本项目任务在队列中的真实状态（running / pending / unknown），并标注 `single_gpu_serial` |
+| `POST /api/v1/providers/h3/jobs/{id}/cancel` | **排队中**：通过 `/queue` 的 `delete` 精确删除该 prompt，只影响这一个任务；**已在执行**：默认拒绝并记录取消请求，返回 409 说明"ComfyUI 只有全局 `/interrupt`，会影响该实例上所有正在运行的任务"；私有单租户部署可显式 `?force=true` 强制中断，并在记录里标注是强制中断 |
+| `cancel_requested` 列 | 记录用户是否请求过取消 |
+| 状态粒度修复 | 之前排队中的任务也会显示 `RUNNING`；现在会读取队列，把阶段区分为 `QUEUED` 与 `GENERATE` |
+
+### 9.2 真实云端验证（并发排队 + 排队取消）
+
+连续提交两个重建任务：
+
+```
+A submitted → queue: running=1 pending=1 depth=2
+our jobs   : A = running, B = pending
+cancel B   : 200  status=CANCELLED（"用户在排队阶段取消"）
+final A    : SUCCEEDED  artifact sha 449a7e0b…
+final B    : CANCELLED
+```
+
+即：**单卡确实是串行排队**（两个任务同时提交时，第二个进入 pending）；**排队阶段取消是精确且安全的**——只删掉 B，A 不受影响并正常出片。
+
+### 9.3 仍未完成
+
+1. **运行中取消**：需要显式 `force=true` 触发全局中断；未做"先记录取消、等当前任务结束后不再推进"的协作式取消。
+2. **并发上限**：只验证了"一运行一排队"，未测多任务排队时的吞吐、显存峰值与失败率；也没有自动重排或优先级。
+3. **成本核算**：未记录每次任务的显存峰值、磁盘增量与电费/云费用换算。

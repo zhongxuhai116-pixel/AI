@@ -199,6 +199,21 @@ class H3ProviderTests(unittest.TestCase):
             {"provider_job_id": provider_job_id, "operation": "RECONSTRUCT_3D", "queue_state": "pending"}
         ])
 
+    def test_status_distinguishes_queued_from_running(self) -> None:
+        provider_job_id = self._submitted_job()
+        external_id = self._provider_rows()[0]["external_id"]
+        with patch.object(comfyui, "history", return_value=None), patch.object(
+            comfyui, "queue_snapshot", return_value={"running": [], "pending": [external_id], "depth": 1}
+        ):
+            body = self.client.get(f"/api/v1/providers/h3/jobs/{provider_job_id}").json()
+        self.assertEqual(body["status"], "RUNNING")
+        self.assertEqual(body["stage"], "QUEUED")
+        with patch.object(comfyui, "history", return_value=None), patch.object(
+            comfyui, "queue_snapshot", return_value={"running": [external_id], "pending": [], "depth": 1}
+        ):
+            body = self.client.get(f"/api/v1/providers/h3/jobs/{provider_job_id}").json()
+        self.assertEqual(body["stage"], "GENERATE")
+
     def test_cancel_pending_job_deletes_only_that_prompt(self) -> None:
         provider_job_id = self._submitted_job()
         row = self._provider_rows()[0]
