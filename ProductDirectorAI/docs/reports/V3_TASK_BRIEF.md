@@ -144,3 +144,33 @@
 3. 用 AOV 自定义通道（需逐材质配置，改动面大）。
 
 推荐第 1 条。在选定并实现前，V3-01 记为**未完成（4/5 通道）**，V3-03 之后不开工。
+
+## 9. 遮罩已实现，但多层 EXR 仍只写入一层（2026-09-12）
+
+### 9.1 已完成并有证据
+
+| 项 | 结果 |
+| --- | --- |
+| 主帧 | 72/72 ✓ |
+| **产品遮罩（第 5 通道）** | **72/72 PNG**；覆盖率 14.65%、二值度 **0.9953**（干净遮罩） |
+| 两次渲染总耗时 | 36.3 秒（72 帧；遮罩那遍只渲产品，代价很小） |
+
+实现方式：`render_mask_pass()` 额外渲染一遍"只显示产品网格 + 透明背景"，其 Alpha 即产品遮罩；渲染后恢复可见性、输出路径、格式与合成器状态。
+
+### 9.2 仍未通过：多层 EXR 只含 `beauty` 一层
+
+OpenEXR 读出的通道分组只有 `['beauty']`（RGBA），说明 **alpha / depth / normal 三个 item 没有真正写入**。已排除"边建边连导致索引错位"这个猜想（改成先建完 item 再连线，结果不变）。下一步要查的是：Blender 5 的 File Output 节点中，每个 item 各自的输入 socket 名称/归属，以及连线是否真的落在对应 item 上（`node.inputs` 与 `file_output_items` 的对应关系需要实测确认）。
+
+### 9.3 已完全摸清的 OpenEXR 读取细节（供下一步直接用）
+
+```python
+import OpenEXR, numpy as np
+part = OpenEXR.File(path).parts[0]
+window = part.header.get("dataWindow")     # tuple: (array([minX,minY]), array([maxX,maxY]))
+width  = int(window[1][0]) + 1             # 540
+height = int(window[1][1]) + 1             # 960
+names  = list(part.channels.keys())        # 当前只有 ['beauty']
+plane  = np.array(part.channels[name].pixels, dtype=np.float32).reshape(height, width, 4)
+```
+
+校验器 `blender/scripts/validate_fidelity_passes.py` 已按此实现，且**不再依赖 Blender**（venv 的 Pillow 读遮罩 PNG、OpenEXR 读多层 EXR），当前唯一阻塞就是 9.2。
