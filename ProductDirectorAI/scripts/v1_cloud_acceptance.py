@@ -92,10 +92,11 @@ def probe(path: Path) -> dict:
     }
 
 
-def boundary_frames(video: Path, out_dir: Path) -> dict:
+def boundary_frames(video: Path, out_dir: Path, prefix: str) -> dict:
+    """抽取三段镜头边界帧；文件名带路径前缀，避免图片/GLB 两条链路互相覆盖。"""
     frames: dict[str, str] = {}
     for label, frame in [("f001", 1), ("f024", 24), ("f025", 25), ("f096", 96), ("f097", 97), ("f144", 144)]:
-        target = out_dir / f"{label}.png"
+        target = out_dir / f"{prefix}-{label}.png"
         result = subprocess.run(
             [FFMPEG, "-y", "-v", "error", "-i", str(video), "-vf", f"select=eq(n\\,{frame - 1})",
              "-frames:v", "1", str(target)],
@@ -179,7 +180,7 @@ class Acceptance:
         manifest_path.write_bytes(manifest.content)
         manifest_body = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-        frames = boundary_frames(video_path, self.out_dir)
+        frames = boundary_frames(video_path, self.out_dir, label)
         record.update({
             "video": {"bytes": video_path.stat().st_size, "sha256": sha256(video_path), **probe(video_path)},
             "manifest": {
