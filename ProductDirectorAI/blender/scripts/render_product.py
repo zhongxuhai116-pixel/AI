@@ -170,9 +170,20 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
         layout = "per-channel"
     else:
         # Blender 5 只提供多层 EXR：每帧一个 .exr，内含全部 pass 槽位。
+        # 关键：必须显式创建 file_output_items，否则该节点不会写出任何文件
+        # （实测：不加 items 时 72 帧渲染完成但 passes/ 目录为空）。
         node.directory = str(pass_root)
         node.file_name = "frame_"
         node.format.file_format = "OPEN_EXR_MULTILAYER"
+        for index, (name, socket, socket_type) in enumerate([
+            ("beauty", "Image", "RGBA"),
+            ("alpha", "Alpha", "Alpha"),
+            ("depth", "Depth", "Float"),
+            ("normal", "Normal", "Vector"),
+            ("index", "IndexOB", "Float"),
+        ]):
+            node.file_output_items.new(socket_type, name)
+            tree.links.new(layers.outputs[socket], node.inputs[index])
         layout = "multilayer-exr"
     tree.links.new(layers.outputs["Image"], node.inputs[0])
     print(f"DIRECTOR_PASSES root={pass_root} layout={layout}", flush=True)
