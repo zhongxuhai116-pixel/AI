@@ -131,11 +131,14 @@ function AssetCard({ asset, assetUrl, onUpload, onDemo, busy }) {
   </section>;
 }
 
-function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnchor, onCropAnchorChange, assetUrl, onGenerate, busy }) {
+function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnchor, onCropAnchorChange, assetUrl, onGenerate, onAiGenerate, busy }) {
   return <section className="card director-card">
     <div className="card-head"><div><h2>导演描述</h2><span>V1 模板导演</span></div><button>高级设置 <CaretRight /></button></div>
     <textarea value={intent} onChange={(e) => setIntent(e.target.value)} />
-    <div className="counter"><span>{intent.length} / 4000</span><span>API Provider 将在 V2 接入</span></div>
+    <div className="counter"><span>{intent.length} / 4000</span><span>AI 导演：本地生成 + 服务端校验</span></div>
+    <div className="director-actions">
+      <button className="primary" disabled={busy || !intent.trim()} onClick={onAiGenerate}><Sparkle weight="fill" />用描述生成分镜</button>
+    </div>
     <div className="outputs">
       {[["视频比例", "9:16 竖屏"], ["总时长", "6 秒"], ["帧率", "24 fps"]].map(([label, value]) => <label key={label}><span>{label}</span><button>{value}<CaretDown /></button></label>)}
       <label>
@@ -186,6 +189,27 @@ function Shots({ plan, setPlan, assetUrl }) {
   return <section className="card shots">
     <div className="card-head"><div><h2>分镜计划</h2><span className="count">3 SHOTS · {totalFrames} / 144 帧</span></div><small>{plan ? (totalFrames === 144 ? "计划草稿" : "总时长必须为 144 帧") : "等待生成"}</small></div>
     <div className="shot-grid">{shots.map((shot, index) => <article className={!plan ? "muted" : ""} key={shot.id}><div className="shot-img">{assetUrl ? <img src={assetUrl} alt="当前产品" /> : <div className="model-thumb"><Cube weight="duotone" /></div>}<b>SHOT 0{index + 1}</b><button><Play weight="fill" /></button></div><div className="shot-body"><input value={shot.name} readOnly={!plan} onChange={(e) => update(index, "name", e.target.value)} /><select disabled={!plan} value={shot.camera} onChange={(e) => update(index, "camera", e.target.value)}>{Object.entries(cameraLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><p><label>焦距 <input aria-label={`SHOT ${index + 1} 焦距`} disabled={!plan} type="number" min="15" max="120" value={shot.focal_length_mm} onChange={(e) => update(index, "focal_length_mm", Number(e.target.value))} /> mm</label><label>时长 <input aria-label={`SHOT ${index + 1} 时长`} disabled={!plan} type="number" min="24" max="144" value={shot.duration_frames} onChange={(e) => update(index, "duration_frames", Number(e.target.value))} /> 帧 · {(Number(shot.duration_frames || 0) / 24).toFixed(1)}s</label></p></div></article>)}</div>
+  </section>;
+}
+
+const providerOperationLabels = { RECONSTRUCT_3D: "3D 重建", GENERATE_VIDEO: "H3 视频生成" };
+
+function ProviderJobs({ jobs, onCancel }) {
+  return <section className="card provider-jobs">
+    <div className="card-head"><div><h2>H3 生成任务</h2><span className="count">{jobs.length} 条</span></div><small>自托管 MiniMax H3 · 单卡串行</small></div>
+    {jobs.length === 0
+      ? <div className="empty-job"><Clock /><span>还没有云端生成任务</span></div>
+      : <div className="table-wrap"><table>
+        <thead><tr><th>类型</th><th>状态</th><th>阶段</th><th>产物</th><th>创建时间</th><th /></tr></thead>
+        <tbody>{jobs.map((item) => <tr key={item.id}>
+          <td><span>{providerOperationLabels[item.operation] || item.operation}</span></td>
+          <td><Pill status={item.status} /></td>
+          <td>{item.status === "RUNNING" && item.cancel_requested ? "已记录取消请求" : item.stage}</td>
+          <td>{item.artifact_ready ? (item.artifact_asset_id ? "已入库" : "可下载") : "—"}</td>
+          <td>{new Date(item.created_at).toLocaleString("zh-CN", { hour12: false })}</td>
+          <td>{["RUNNING", "QUEUED"].includes(item.status) && <button onClick={() => onCancel(item)}>取消</button>}</td>
+        </tr>)}</tbody>
+      </table></div>}
   </section>;
 }
 
@@ -243,6 +267,7 @@ export function App() {
   const [plan, setPlan] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [provider, setProvider] = useState(null);
+  const [providerJobs, setProviderJobs] = useState([]);
   const [job, setJob] = useState(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState(null);
@@ -256,6 +281,7 @@ export function App() {
         apiRequest("/jobs"),
         apiRequest("/providers/minimax/status"),
       ]);
+      const providerJobsResponse = await apiRequest("/providers/h3/jobs").catch(() => null);
       if ([h, a, j, p].some((response) => response.status === 401)) {
         sessionCsrfToken = ""; setSession(null); return;
       }
@@ -263,6 +289,7 @@ export function App() {
       const nextHealth = await h.json(); const nextAssets = await a.json(); const nextJobs = await j.json(); const nextProvider = p.ok ? await p.json() : null;
       setProvider(nextProvider);
       setHealth(nextHealth); setAssets(nextAssets); setJobs(nextJobs);
+      if (providerJobsResponse && providerJobsResponse.ok) setProviderJobs(await providerJobsResponse.json());
       if (!asset && nextAssets[0]) { setAsset(nextAssets[0]); setAssetUrl(`${API}/assets/${nextAssets[0].id}/content`); }
       if (job) { const current = nextJobs.find((item) => item.id === job.id); if (current) setJob(current); }
     } catch { setHealth(null); }
@@ -342,6 +369,60 @@ export function App() {
   }
   async function cancel() { if (job) { await apiRequest(`/jobs/${job.id}/cancel`, { method: "POST" }); refresh(); } }
   async function retry() { if (job) { await apiRequest(`/jobs/${job.id}/retry`, { method: "POST" }); refresh(); } }
+  async function aiGenerate() {
+    if (!asset) return setToast(["danger", "请先上传产品图片或 GLB。"]);
+    setBusy(true);
+    try {
+      const draft = await apiRequest("/director/plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ intent: intent || "展示产品外观与细节", product_asset_id: asset.id }),
+      });
+      if (!draft.ok) throw new Error((await draft.json()).detail || "AI 导演生成失败");
+      const generated = await draft.json();
+      const created = await apiRequest("/plans/template", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          product_asset_id: asset.id,
+          intent: generated.plan.intent,
+          ratio: "9:16",
+          duration_seconds: 6,
+          output,
+          crop_anchor: cropAnchor,
+        }),
+      });
+      if (!created.ok) throw new Error((await created.json()).detail || "计划创建失败");
+      const base = await created.json();
+      const saved = await apiRequest(`/plans/${base.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ intent: generated.plan.intent, shots: generated.plan.shots, crop_anchor: cropAnchor }),
+      });
+      if (!saved.ok) throw new Error((await saved.json()).detail || "分镜保存失败");
+      const planResult = await saved.json();
+      setIntent(planResult.intent);
+      setPlan(planResult);
+      setCropAnchor(planResult.crop_anchor || cropAnchor);
+      setToast(["success", `AI 导演已生成分镜（${generated.provider}，尝试 ${generated.attempts} 次${generated.repairs.length ? "，含修复" : ""}），可直接编辑。`]);
+    } catch (error) {
+      setToast(["danger", error.message]);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function cancelProviderJob(item) {
+    try {
+      const response = await apiRequest(`/providers/h3/jobs/${item.id}/cancel`, { method: "POST" });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || "取消失败");
+      setToast(["success", `任务已取消（${providerOperationLabels[item.operation] || item.operation}）。`]);
+    } catch (error) {
+      setToast(["danger", error.message]);
+    } finally {
+      refresh();
+    }
+  }
   async function saveProvider(apiKey) {
     setBusy(true);
     try {
@@ -408,9 +489,11 @@ export function App() {
             onCropAnchorChange={setCropAnchor}
             assetUrl={asset?.kind === "image" ? assetUrl : ""}
             onGenerate={generatePlan}
+            onAiGenerate={aiGenerate}
             busy={busy}
           />
           <RenderCard health={health} plan={plan} job={job} onRender={run} onCancel={cancel} onRetry={retry} />
+          <ProviderJobs jobs={providerJobs} onCancel={cancelProviderJob} />
           <Shots plan={plan} setPlan={setPlan} assetUrl={asset?.kind === "image" ? assetUrl : ""} />
           <Jobs jobs={filtered} selected={job?.id} onOpen={setJob} />
         </div>

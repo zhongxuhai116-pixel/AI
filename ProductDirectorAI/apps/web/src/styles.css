@@ -113,6 +113,9 @@ button { color: inherit; }
   .sidebar { width: 72px; }.brand { padding: 0 18px; }.brand > div,.sidebar nav span,.version > div { display: none; }.sidebar nav { padding-inline: 10px; }.sidebar nav button { justify-content: center; padding: 0; }.sidebar nav button.active::before { left: -10px; }.version { justify-content: center; }.main { margin-left: 72px; width: calc(100% - 72px); }.grid { grid-template-columns: 1fr 1fr; }.render-card { grid-column: 1/-1; }.shots { grid-column: 1/-1; }
 }
 /* A06 构图锚点：预览横向/纵向素材进入 9:16 时保留的区域 */
+.director-actions { padding: 0 14px 12px; }.director-actions button { width: 100%; }
+.provider-jobs { grid-column: 1 / -1; }
+
 .crop-preview { grid-column: 1 / -1; display: flex; align-items: center; gap: 11px; padding: 4px 0 9px; }.crop-preview .crop-frame { width: 54px; height: 96px; flex: none; border: 1px solid #dfe4eb; border-radius: 4px; overflow: hidden; background: #f0f2f5; display: grid; place-items: center; color: #91a0b8; }.crop-preview .crop-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }.crop-preview .crop-frame svg { width: 22px; }.crop-preview small { color: #8b95a5; font-size: 8px; line-height: 1.7; }
 
 @media (max-width: 760px) {
