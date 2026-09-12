@@ -1,5 +1,7 @@
 # 当前阶段
 
+> **2026-09-12 收尾（最新）**：V1 与 V2 均为 **ACCEPTED**（用户确认），当前推进 **V3 产品保真**——V3-01/02 通过、V3-03/04 完成、V3-05 核心通过但仍有未完成项（真实 AI 背景、阴影/反射/遮挡独立层），V3-06…V3-10 未开工。后端本地与云端 **152/152**，云端 api / web / postgresql / comfy-h3 四个服务 active。本轮已推送 GitHub（含独立仓库 `comfyui-h3-cloud-records` 的 H3 加速归档）。**先读 [下一次操作交接说明](HANDOFF_NEXT_SESSION.md)**；下面全部内容为历史分时记录，标题里的"完整验收"只反映当时的局部检查。
+
 > 2026-09-12 最新结论：V1 仍为 PARTIAL，但本轮代码**已真实部署到云节点**（HEAD `8e6fe3c`），云端图片与 GLB 双链路真实出片通过，A05 鉴权在云端生效（匿名 401 / 带令牌 200），web 服务崩溃重启已修复。本地后端 28/28、前端 build、Sites 4/4 通过；本地图片链路真实出片通过。证据见 [云端部署与双链路出片验收](reports/CLOUD_DEPLOY_A05_ACCEPTANCE.md)、[A04 恢复加固](reports/A04_RECOVERY_HARDENING.md)、[本机 FFmpeg 验收](reports/V1_LOCAL_FFMPEG_E2E.md)。先读 [最新继续入口](NEXT_COMPUTER_START.md)。下方分时记录的“完整验收”标题仅反映历史局部检查。
 
 - 当前版本：**V1 已 ACCEPTED（2026-09-12，用户确认）；V2 已 ACCEPTED（同日）；当前进入 V3 产品保真**

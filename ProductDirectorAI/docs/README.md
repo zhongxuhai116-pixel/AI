@@ -1,22 +1,24 @@
 # 文档总入口
 
-更新日期：2026-09-11。适用于换电脑、换执行模型和按阶段继续到 V6。
+更新日期：2026-09-12。适用于换电脑、换执行模型和按阶段继续到 V6。
 
 ## 先读这四份
 
-**本次换电脑先读 [NEXT_COMPUTER_START.md](NEXT_COMPUTER_START.md)**，其中包含最新恢复步骤和继续指令。[A05 交接报告](reports/A05_SECURITY_HANDOFF.md) 与 [A04 恢复加固报告](reports/A04_RECOVERY_HARDENING.md) 记录本地 28 项后端测试与待完成项。
+**先读 [下一次操作交接说明](HANDOFF_NEXT_SESSION.md)**——它记录 V1 / V2 已 ACCEPTED、V3 做到哪一步、本轮推送到 GitHub 的内容和下次开工的入口。[NEXT_COMPUTER_START.md](NEXT_COMPUTER_START.md) 是 2026-09-11 换电脑时的历史入口，其中"V1 仍为 PARTIAL""云 SSH 超时"等描述已过时。
 
-1. [换电脑接手手册](HANDOFF_NEW_COMPUTER.md)：克隆、恢复环境、私人数据、凭证与接手提示。
+1. [下一次操作交接说明](HANDOFF_NEXT_SESSION.md)：当前状态、访问方式、下次开工步骤与工程纪律。
 2. [当前阶段](CURRENT_PHASE.md)：当前范围、阻断与下一步。
-3. [V1 实现与规划差距](V1_IMPLEMENTATION_GAPS.md)：不要把原型或历史 PASS 当作完整 V1 验收。
-4. [云服务器交接记录](CLOUD_SERVER_HANDOFF.md)：新节点 SSH、运行时、GPU 渲染和 V1 全链路事实。
+3. [V3 任务书与排查记录](reports/V3_TASK_BRIEF.md)：V3-01…V3-10 的清单、当前进度与 Blender 5 踩坑记录。
+4. [换电脑接手手册](HANDOFF_NEW_COMPUTER.md) / [云服务器交接记录](CLOUD_SERVER_HANDOFF.md)：克隆、恢复环境、私人数据、凭证与新节点运行时事实。
 
 ## 全部文档索引
 
 | 文件 | 用途与状态 |
 | --- | --- |
 | [完整 V1–V6 规划](../ProductDirectorAI_V1-V6_Codex_Development_Plan.md) | 唯一主规格；用户已授权逐阶段推进到 V6 |
+| [下一次操作交接说明](HANDOFF_NEXT_SESSION.md) | 当前状态、GitHub 归档范围与下次开工步骤；取代 2026-09-11 的换电脑入口 |
 | [V1 → V6 加速执行计划](V6_ACCELERATION_PLAN.md) | 复用云端已安装 H3；七个 V1 收尾工作包、阶段依赖、验收和 GitHub 记录方式 |
+| [V3 任务书与排查记录](reports/V3_TASK_BRIEF.md) | V3-01…V3-10 清单、进度、风险，以及 Blender 5.2 合成器 API 的完整踩坑记录 |
 | [A01 环境与记录基线](reports/A01_ENVIRONMENT_BASELINE.md) | V1 收尾第一包：环境版本、构建复核、云端基线记录与变更约束 |
 | [A02 / A03 验收](reports/A02_A03_ACCEPTANCE.md) | 合同不可变与幂等/重入访问验收记录 |
 | [A04 验收](reports/A04_ACCEPTANCE.md) | Worker 租约、事件恢复与旧 epoch 拒绝的第一段验收记录 |
@@ -52,9 +54,9 @@
 
 | 版本 | 主规划章节 | 重点 | 当前状态 |
 | --- | --- | --- | --- |
-| V1 | 第 7 章 | 素材、模板导演、Blender/FFmpeg、任务、导出 | 云基础设施、GLB/图片链路与分镜语义 PASS；完整退出门未通过 |
-| V2 | 第 8 章 | AI Director、Provider、ComfyUI、MiniMax H3 | 已授权；等待 V1 阶段门 |
-| V3 | 第 9 章 | 产品保真、多视图、分层、QA | 已授权；未实施，不能越级 |
+| V1 | 第 7 章 | 素材、模板导演、Blender/FFmpeg、任务、导出 | **ACCEPTED**（2026-09-12 用户确认） |
+| V2 | 第 8 章 | AI Director、Provider、ComfyUI、MiniMax H3 | **ACCEPTED**（同日确认） |
+| V3 | 第 9 章 | 产品保真、多视图、分层、QA | **进行中**：V3-01…V3-04 通过，V3-05 核心通过（有未完成项），V3-06…V3-10 未开工 |
 | V4 | 第 10 章 | 人体 Proxy、动作、接触与交互审核 | 已授权；未实施，不能越级 |
 | V5 | 第 11 章 | 参考视频分析、镜头语言重新演绎 | 已授权；未实施，不能越级 |
 | V6 | 第 12 章 | Profile、字幕/配音/BGM、Automation API、批量、发布包、资源成本、一键发布 | 已授权；未实施，不能越级 |
