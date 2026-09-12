@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -55,6 +56,8 @@ QA_MIN_STDDEV = float(os.getenv("PRODUCTDIRECTOR_QA_MIN_STDDEV", "2.0"))
 QA_MIN_MEAN = float(os.getenv("PRODUCTDIRECTOR_QA_MIN_MEAN", "6.0"))
 QA_MAX_BLACK_RATIO = float(os.getenv("PRODUCTDIRECTOR_QA_MAX_BLACK_RATIO", "0.35"))
 QA_BLACK_PIXEL_LEVEL = 16
+# 渲染前的最低可用磁盘空间；不足时快速失败，避免写出半截成片。
+MIN_FREE_DISK_MB = float(os.getenv("PRODUCTDIRECTOR_MIN_FREE_DISK_MB", "1024"))
 MINIMAX_API_BASE_URL = os.getenv("MINIMAX_API_BASE_URL", "https://api.minimaxi.com").rstrip("/")
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -1614,6 +1617,8 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
         asset = row_to_dict(asset_row)
         asset["path"] = str(resolve_asset_path(asset))
         run_dir = RUNS / job_id
+        # 先确认磁盘写得出，再启动真实渲染，避免产出半截帧序列或空视频。
+        ensure_disk_space(run_dir)
         plan_path = run_dir / "director_plan.json"
         try:
             plan_snapshot_bytes = plan_path.read_bytes()
@@ -1870,6 +1875,7 @@ async def create_asset(file: UploadFile = File(...)) -> dict:
     stored.write_bytes(data)
     digest = hashlib.sha256(data).hexdigest()
     kind = "model" if suffix == ".glb" else "image"
+    glb_info = inspect_glb(data) if kind == "model" else None
     mime = mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
     created = utc_now()
     with connect() as db:
@@ -1886,6 +1892,7 @@ async def create_asset(file: UploadFile = File(...)) -> dict:
         "size_bytes": len(data),
         "sha256": digest,
         "created_at": created,
+        "glb": glb_info,
     }
 
 
@@ -1895,6 +1902,71 @@ def list_assets() -> list[dict]:
         rows = db.execute("SELECT * FROM assets WHERE owner_id = ? ORDER BY created_at DESC",
                           (security.current_owner.get() or DEFAULT_OWNER_ID,)).fetchall()
     return [{key: row[key] for key in row.keys() if key != "path"} for row in rows]
+
+
+def inspect_glb(data: bytes) -> dict:
+    """解析 GLB 头部与 JSON 块，拦截损坏文件与外部资源引用。
+
+    V1 只接受自包含 GLB：单文件上传无法携带 sidecar 纹理或缓冲，
+    带外部 URI 的模型在 Blender 里会渲染成无纹理表面，必须在入口拒绝。
+    """
+    if len(data) < 20:
+        raise HTTPException(422, "GLB 文件过小或已损坏")
+    magic, version, declared = struct.unpack_from("<4sII", data, 0)
+    if magic != b"glTF":
+        raise HTTPException(422, "GLB 魔数不正确")
+    if declared != len(data):
+        raise HTTPException(422, f"GLB 声明长度 {declared} 与实际 {len(data)} 不一致")
+    offset = 12
+    document = None
+    while offset + 8 <= len(data):
+        chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
+        offset += 8
+        chunk = data[offset:offset + chunk_length]
+        offset += chunk_length
+        if chunk_type == 0x4E4F534A:  # 'JSON'
+            try:
+                document = json.loads(chunk.decode("utf-8").rstrip("\x00 "))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise HTTPException(422, "GLB 的 JSON 块无法解析") from None
+            break
+    if document is None:
+        raise HTTPException(422, "GLB 缺少 JSON 块")
+    external = [
+        str(image.get("uri"))
+        for image in document.get("images", [])
+        if image.get("uri") and not str(image.get("uri")).startswith("data:")
+    ]
+    external += [
+        str(buffer.get("uri"))
+        for buffer in document.get("buffers", [])
+        if buffer.get("uri") and not str(buffer.get("uri")).startswith("data:")
+    ]
+    if external:
+        raise HTTPException(422, "GLB 引用了外部纹理/缓冲文件；V1 只支持自包含 GLB，请导出时内嵌资源")
+    if not document.get("meshes"):
+        raise HTTPException(422, "GLB 不包含任何网格，无法渲染")
+    return {
+        "version": version,
+        "meshes": len(document.get("meshes", [])),
+        "materials": len(document.get("materials", [])),
+        "images": len(document.get("images", [])),
+        "has_textures": bool(document.get("images") or document.get("textures")),
+    }
+
+
+def ensure_disk_space(target: Path, required_mb: float | None = None) -> float:
+    """渲染前检查目标磁盘可用空间，返回可用 MB；不足时抛出可读错误。"""
+    needed = MIN_FREE_DISK_MB if required_mb is None else required_mb
+    probe = target if target.exists() else target.parent
+    try:
+        usage = shutil.disk_usage(probe)
+    except OSError:
+        return float("inf")
+    free_mb = usage.free / (1024 * 1024)
+    if free_mb < needed:
+        raise RuntimeError(f"磁盘空间不足：可用 {free_mb:.0f} MB，低于要求的 {needed:.0f} MB")
+    return free_mb
 
 
 def resolve_asset_path(asset) -> Path:

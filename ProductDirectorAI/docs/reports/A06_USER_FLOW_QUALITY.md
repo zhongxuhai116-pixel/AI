@@ -10,7 +10,7 @@
 | 错误 / 取消 / 重试状态 | ✅ 已实现（取消、错误、失败/取消后重试）；重试的浏览器交互验证仍待做 | 本节第 2 节 |
 | 尺寸 / 朝向 / 可拍摄视角确认 | ✅ 已实现（裁切锚点 + 实时 9:16 预览）；浏览器交互验证仍待做 | 本节第 3 节 |
 | 桌面与窄屏 UI 端到端流程 | ✅ 已用真实 Chrome 走查通过 | 本节第 4 节 |
-| 损坏素材 / 缺纹理 / 磁盘不足处理 | 部分（损坏素材有 422/409；缺 Blender/依赖缺失的失败态已在浏览器验证；缺纹理与磁盘不足未覆盖） | 本节第 4 节 |
+| 损坏素材 / 缺资源 / 磁盘不足处理 | ✅ 已实现并验证 | 本节第 5 节 |
 
 ## 1. 媒体质量门（已实现）
 
@@ -183,3 +183,44 @@ node work/browser-e2e/e2e.mjs
 
 - 走查在本机 Chromium 上执行；未覆盖 Safari/Firefox、真实 HTTPS 反代与跨站 Cookie 场景。
 - 窄屏走查只验证布局与导航，未逐项操作分镜编辑控件。
+
+## 5. 损坏素材 / 缺资源 / 磁盘不足的明确处理（已实现）
+
+### 5.1 GLB 上传即校验
+
+此前只有扩展名和体积检查：损坏的 GLB、引用外部纹理的 GLB 都会通过上传，直到用户在 Blender 阶段才看到一个难懂的错误，或者更糟——渲染出没有纹理的平面模型。
+
+现在 `inspect_glb()` 在**上传时**解析 GLB 头部与 JSON 块：
+
+| 情况 | 处理 |
+| --- | --- |
+| 文件过小 / 魔数不是 `glTF` | 422「GLB 文件过小或已损坏」/「GLB 魔数不正确」 |
+| 声明长度与实际字节数不一致 | 422「GLB 声明长度 … 与实际 … 不一致」 |
+| 缺少 JSON 块 / JSON 无法解析 | 422 |
+| `images` 或 `buffers` 引用外部文件 | 422「V1 只支持自包含 GLB，请导出时内嵌资源」——单文件上传带不了 sidecar 资源，这类模型只会渲染成无纹理表面 |
+| 没有任何网格 | 422「GLB 不包含任何网格，无法渲染」 |
+| 正常自包含模型 | 201，并在响应里返回 `glb` 结构摘要（版本、网格数、材质数、贴图数） |
+
+### 5.2 磁盘空间前置检查
+
+渲染前调用 `ensure_disk_space()` 检查目标盘可用空间（默认要求 ≥1024 MB，可用 `PRODUCTDIRECTOR_MIN_FREE_DISK_MB` 覆盖）。不足时**在启动 Blender/FFmpeg 之前**就以可读错误失败，不会留下半截帧序列或空视频。
+
+### 5.3 验证证据（`tests/test_asset_guards.py`，真实文件内容）
+
+| 用例 | 期望 |
+| --- | --- |
+| `test_corrupt_glb_is_rejected_at_upload` | 非 GLB 内容 → 422 |
+| `test_glb_with_wrong_declared_length_is_rejected` | 声明长度被篡改 → 422 |
+| `test_glb_with_external_texture_is_rejected` | 外部纹理 URI → 422 |
+| `test_glb_with_external_buffer_is_rejected` | 外部缓冲 URI → 422 |
+| `test_glb_without_meshes_is_rejected` | 无网格 → 422 |
+| `test_self_contained_fixture_reports_its_structure` | 仓库夹具 → 201 且返回结构摘要（3 网格、0 贴图） |
+| `test_render_fails_fast_when_disk_space_is_low` | 阈值调高后作业快速进入 `FAILED`，错误信息含「磁盘空间不足」 |
+| `test_disk_guard_allows_render_when_space_is_available` | 空间充足时正常放行 |
+
+后端回归：本地 **51/51** 通过。
+
+### 已知限制
+
+- 只校验 GLB 结构，不做材质/贴图质量判断；缺纹理但结构合法的模型仍会渲染（这是模型本身的内容问题，不是流程缺陷）。
+- 磁盘检查是渲染前的单次快照，长时间渲染过程中若磁盘被占满，仍会在编码阶段报错（错误信息可读，但不会中途暂停任务）。
