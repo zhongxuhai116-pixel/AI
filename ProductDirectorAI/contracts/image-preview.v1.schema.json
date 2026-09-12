@@ -79,6 +79,12 @@
         "duration_frames": {"type": "integer", "minimum": 24, "maximum": 144},
         "camera": {"enum": ["dolly_in", "side_track", "hero_orbit", "static"]},
         "focal_length_mm": {"type": "integer", "minimum": 15, "maximum": 120},
+        "required_strict_layers": {
+          "description": "本镜头明确要求系统提供并逐帧覆盖的独立分层；不表达保真策略是否允许。",
+          "type": "array",
+          "maxItems": 3,
+          "items": {"enum": ["shadow_layer", "reflection_layer", "occlusion_layer"]}
+        },
         "sensor_width_mm": {"type": "number", "description": "相机传感器宽度；目标 3D 合同当前固定为 36", "exclusiveMinimum": 0, "maximum": 200},
         "camera_target_m": {"$ref": "#/$defs/vector3", "description": "相机注视点；缺省时渲染器使用默认取景"},
         "camera_path": {"$ref": "#/$defs/cameraPath", "description": "目标 3D 合同的相机轨迹；缺省时按 camera 枚举生成默认轨迹"}

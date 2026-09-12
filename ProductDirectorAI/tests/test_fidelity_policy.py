@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import hashlib
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -81,6 +82,23 @@ class FidelityPolicyApiTests(unittest.TestCase):
         self.assertEqual(
             self._create(protected_regions=[{"x": 0.9, "y": 0.1, "width": 0.5, "height": 0.2}]).status_code, 422
         )
+
+    def test_strict_background_workflow_contract_and_generation_boundary(self) -> None:
+        workflow = {
+            "name": "local.background",
+            "version": "1.0.0",
+            "workflow_hash": hashlib.sha256(b"local.background@1.0.0").hexdigest(),
+            "protection_map": [{"product_region": "logo", "background_region": "outside_product"}],
+        }
+        approved = self._create(background_workflows=[workflow])
+        self.assertEqual(approved.status_code, 201, approved.text)
+        self.assertEqual(approved.json()["policy"]["background_workflows"][0], workflow)
+
+        forbidden = self._create(
+            allowed_operations=["color_transform", "background_generation"],
+            background_workflows=[workflow],
+        )
+        self.assertEqual(forbidden.status_code, 422, forbidden.text)
 
     def test_unknown_version_is_rejected(self) -> None:
         response = self.client.post(

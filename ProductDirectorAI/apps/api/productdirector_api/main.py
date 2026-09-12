@@ -5,6 +5,7 @@ import contextvars
 import hashlib
 import hmac
 import json
+import math
 import mimetypes
 import os
 import re
@@ -37,6 +38,19 @@ from PIL import Image, ImageStat
 from . import director, director_plan, security, storage
 from .director_plan import CameraPath, ProductPose, SceneSpec, Vector3
 from .providers import comfyui
+from .strict_background import (
+    BackgroundProducerError,
+    MODE_CONTROLLED_IMPORT,
+    MODE_INDEPENDENT_WORKFLOW,
+    default_controlled_source_root,
+    load_background_evidence,
+    run_controlled_background_workflow,
+    verify_background_evidence_files,
+    verify_evidence_binding,
+    verify_workflow_contract,
+    write_background_evidence,
+)
+from . import strict_qa
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -45,12 +59,27 @@ UPLOADS = VAR / "uploads"
 RUNS = VAR / "runs"
 DB_PATH = VAR / "productdirector.db"
 BLENDER_SCRIPT = ROOT / "blender" / "scripts" / "render_product.py"
+FIDELITY_PASS_VALIDATOR = ROOT / "blender" / "scripts" / "validate_fidelity_passes.py"
+STRICT_COMPOSITE = ROOT / "scripts" / "strict_composite.py"
+STRICT_SOURCE_VALIDATOR = ROOT / "scripts" / "validate_strict_sources.py"
+STRICT_VERIFIED_INPUT_TRUST = "VERIFIED_RENDER_SOURCE"
+CONTROLLED_BLENDER_PRODUCT_TRUST = "CONTROLLED_BLENDER_PRODUCT"
+CONTROLLED_RENDER_EVIDENCE_FILE = "controlled_render_evidence.json"
+STRICT_COLOR_CONTRACT = {
+    "product_color_space": "display-srgb",
+    "background_color_space": "display-srgb",
+    "layer_color_space": "display-srgb",
+    "working_space": "display-linear",
+    "output_color_space": "display-srgb",
+    "blender_view_transform": "AgX",
+}
 
 DEFAULT_OWNER_ID = "owner-default"
 DEFAULT_WORKSPACE_ID = "workspace-default"
 DEFAULT_PROJECT_ID = "project-default"
 LEASE_SECONDS = 60
-TERMINAL_JOB_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
+VERIFICATION_PASSED = "VERIFICATION_PASSED"
+TERMINAL_JOB_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED", "QA_REJECTED", VERIFICATION_PASSED}
 # 长任务续租间隔：至少每 1 秒一次，且不小于租约的三分之一，避免渲染期间租约失效。
 HEARTBEAT_SECONDS = max(1.0, LEASE_SECONDS / 3)
 # A06 媒体质量门：只拦截“明显坏了”的成片，避免把低对比度的正常产品画面误判为失败。
@@ -285,6 +314,14 @@ def initialize_db() -> None:
               progress INTEGER NOT NULL,
               job_id TEXT NOT NULL,
               attempt_count INTEGER NOT NULL DEFAULT 1,
+              product_review_id TEXT,
+              product_review_sha256 TEXT,
+              fidelity_policy_id TEXT,
+              fidelity_policy_version INTEGER,
+              fidelity_policy_sha256 TEXT,
+              fidelity_snapshot_json TEXT,
+              strict_source_manifest_json TEXT,
+              strict_source_manifest_sha256 TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               FOREIGN KEY(plan_id) REFERENCES plans(id),
@@ -383,6 +420,35 @@ def initialize_db() -> None:
               created_at TEXT NOT NULL,
               FOREIGN KEY(product_version_id) REFERENCES product_versions(id)
             );
+            CREATE TABLE IF NOT EXISTS qa_threshold_sets (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              product_version_id TEXT,
+              threshold_set_version TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(owner_id, project_id, product_version_id, threshold_set_version)
+            );
+            CREATE TABLE IF NOT EXISTS qa_reports (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              threshold_set_id TEXT NOT NULL,
+              threshold_set_version TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              status TEXT NOT NULL,
+              manifest_sha256 TEXT,
+              binding_sha256 TEXT,
+              decision TEXT,
+              decision_notes TEXT,
+              decision_manifest_sha256 TEXT,
+              decided_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             """
     with connect() as db:
         db.executescript(schema_sql)
@@ -394,6 +460,9 @@ def initialize_db() -> None:
         ensure_column(db, "provider_jobs", "artifact_sha256", "TEXT")
         ensure_column(db, "provider_jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(db, "product_versions", "approved_at", "TEXT")
+        for column in ("product_review_id", "product_review_sha256", "fidelity_policy_id", "fidelity_policy_sha256", "fidelity_snapshot_json", "strict_source_manifest_json", "strict_source_manifest_sha256", "controlled_render_evidence_json", "controlled_render_evidence_sha256"):
+            ensure_column(db, "runs", column, "TEXT")
+        ensure_column(db, "runs", "fidelity_policy_version", "INTEGER")
         for column in ("verified_dimensions", "view_coverage", "unverified_regions", "logo_regions", "camera_visibility_constraints"):
             ensure_column(db, "product_versions", column, "TEXT")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
@@ -418,6 +487,23 @@ def initialize_db() -> None:
             "INSERT OR IGNORE INTO projects(id, owner_id, workspace_id, name, created_at) VALUES (?, ?, ?, ?, ?)",
             (DEFAULT_PROJECT_ID, DEFAULT_OWNER_ID, DEFAULT_WORKSPACE_ID, "ProductDirector Default Project", now),
         )
+        default_threshold = dict(strict_qa.DEFAULT_STRICT_QA_THRESHOLD_SET)
+        default_threshold_text = json.dumps(
+            default_threshold, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO qa_threshold_sets(id, owner_id, project_id, product_version_id, threshold_set_version, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+            (
+                default_threshold["threshold_set_id"],
+                DEFAULT_OWNER_ID,
+                DEFAULT_PROJECT_ID,
+                default_threshold["threshold_set_version"],
+                default_threshold_text,
+                hashlib.sha256(default_threshold_text.encode("utf-8")).hexdigest(),
+                now,
+            ),
+        )
 
 
 initialize_db()
@@ -439,6 +525,8 @@ class Shot(BaseModel):
     duration_frames: int = Field(ge=24, le=144)
     camera: Literal["dolly_in", "side_track", "hero_orbit", "static"]
     focal_length_mm: int = Field(ge=15, le=120)
+    # 本镜头明确要求的独立分层；策略 allowed_operations 只表达“允许”，不强制每镜头生成。
+    required_strict_layers: list[Literal["shadow_layer", "reflection_layer", "occlusion_layer"]] = Field(default_factory=list, max_length=3)
     # 目标 3D 合同的显式字段；不填时渲染器沿用历史默认取景。
     sensor_width_mm: float = Field(default=36, gt=0, le=200)
     camera_target_m: Vector3 | None = None
@@ -530,7 +618,62 @@ class RunRequest(BaseModel):
     idempotency_key: str | None = None
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
+    # V3-01：Strict Run 必须引用真实冻结的审核与策略快照，不能读可变 latest。
+    # 默认 false 保持 V1/V2 既有行为；显式打开或传入任一绑定字段时强制三件套齐备。
+    require_fidelity_snapshot: bool = False
+    plan_contract_id: str | None = None
+    product_review_id: str | None = None
+    product_review_sha256: str | None = None
+    fidelity_policy_id: str | None = None
+    fidelity_policy_sha256: str | None = None
+    background_workflow: StrictBackgroundWorkflowInput | None = None
+    background_source_mode: Literal["INDEPENDENT_BACKGROUND_WORKFLOW", "CONTROLLED_IMPORT"] | None = None
 
+    @model_validator(mode="after")
+    def validate_fidelity_binding(self):
+        binding_fields = (self.plan_contract_id, self.product_review_id, self.fidelity_policy_id)
+        if self.require_fidelity_snapshot or any(field is not None for field in binding_fields):
+            missing = []
+            if self.plan_contract_id is None:
+                missing.append("plan_contract_id")
+            if self.product_review_id is None:
+                missing.append("product_review_id")
+            if self.fidelity_policy_id is None:
+                missing.append("fidelity_policy_id")
+            if missing:
+                raise ValueError("保真 Run 必须同时冻结 plan_contract_id、product_review_id、fidelity_policy_id；缺少: " + ", ".join(missing))
+        if self.product_review_sha256 is not None and self.product_review_id is None:
+            raise ValueError("product_review_sha256 必须与 product_review_id 同时提供")
+        if self.fidelity_policy_sha256 is not None and self.fidelity_policy_id is None:
+            raise ValueError("fidelity_policy_sha256 必须与 fidelity_policy_id 同时提供")
+        if self.background_workflow is not None and not self.require_fidelity_snapshot and all(
+            field is None for field in binding_fields
+        ):
+            raise ValueError("background_workflow 只能在 Strict Run 中绑定")
+        if (self.background_workflow is None) != (self.background_source_mode is None):
+            raise ValueError("background_workflow 与 background_source_mode 必须同时提供")
+        return self
+
+
+
+class StrictRenderEvidence(BaseModel):
+    """本批可复验的本地 Blender 产物证据；只记录来源，不升级 Strict 资格。"""
+    producer: str = Field(min_length=1, max_length=80)
+    producer_version: str = Field(min_length=1, max_length=40)
+    pass_layout: Literal["single-multilayer", "per-channel"]
+
+
+class StrictBackgroundWorkflowInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    version: str = Field(min_length=1, max_length=80)
+    workflow_hash: str = Field(min_length=64, max_length=64)
+    protection_map: list[dict] = Field(default_factory=list)
+    output_ref: str = Field(default="strict/background")
+
+
+class StrictSourceManifestRequest(BaseModel):
+    render_evidence: StrictRenderEvidence
+    background_workflow: StrictBackgroundWorkflowInput
 
 class H3ReconstructRequest(BaseModel):
     """V2：用现有 H3/ComfyUI 环境从产品图重建 3D 模型。"""
@@ -592,7 +735,94 @@ FIDELITY_OPERATIONS = (
     "color_transform", "edge_composite", "shadow_layer",
     "reflection_layer", "occlusion_layer", "background_generation",
 )
+STRICT_LAYER_OPERATIONS = ("shadow_layer", "reflection_layer", "occlusion_layer")
+STRICT_OPERATION_TO_LAYER = {
+    "shadow_layer": "shadow",
+    "reflection_layer": "reflection",
+    "occlusion_layer": "occlusion",
+}
 
+
+def _qa_default_threshold_payload() -> dict:
+    return dict(strict_qa.DEFAULT_STRICT_QA_THRESHOLD_SET)
+
+
+def _qa_default_threshold_set_id() -> str:
+    return hashlib.sha256(
+        json.dumps(_qa_default_threshold_payload(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _qa_threshold_payload_sha256(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_qa_threshold_payload(payload: dict) -> dict:
+    allowed = set(strict_qa.DEFAULT_STRICT_QA_THRESHOLD_SET)
+    unknown = [key for key in payload if key not in allowed]
+    if unknown:
+        raise HTTPException(422, f"未知 QA 阈值字段: {', '.join(unknown)}")
+    merged = dict(strict_qa.DEFAULT_STRICT_QA_THRESHOLD_SET)
+    merged.update(payload)
+    baseline = strict_qa.DEFAULT_STRICT_QA_THRESHOLD_SET
+    ratio_fields = {
+        "contour_iou_min",
+        "mask_alpha_iou_min",
+        "min_mask_coverage",
+        "min_mask_binary_ratio",
+        "logo_mask_min_coverage",
+        "verified_dimension_max_relative_error",
+    }
+    mae_fields = {"color_core_mae_max", "edge_mae_max", "logo_core_mae_max"}
+    max_looser_allowed = {
+        "color_core_mae_max": 1.0 / 255.0,
+        "edge_mae_max": 0.02,
+        "logo_core_mae_max": 1.0 / 255.0,
+        "verified_dimension_max_relative_error": 0.01,
+    }
+    min_looser_allowed = {
+        "contour_iou_min": 0.995,
+        "mask_alpha_iou_min": 0.995,
+        "min_mask_coverage": 0.01,
+        "min_mask_binary_ratio": 0.98,
+        "logo_mask_min_coverage": 0.99,
+    }
+    for key in allowed - {"schema_version", "threshold_set_id", "threshold_set_version"}:
+        try:
+            value = float(merged[key])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(422, f"QA 阈值 {key} 必须为数值") from exc
+        if not math.isfinite(value) or value < 0:
+            raise HTTPException(422, f"QA 阈值 {key} 必须为非负有限数值")
+        if key in ratio_fields and value > 1.0:
+            raise HTTPException(422, f"QA 阈值 {key} 必须在 [0,1] 范围内")
+        if key in mae_fields and value > 1.0:
+            raise HTTPException(422, f"QA 阈值 {key} 超出合理 MAE 范围 [0,1]")
+        if key in max_looser_allowed and value > max_looser_allowed[key] + 1e-12:
+            raise HTTPException(
+                422,
+                f"QA 阈值 {key} 不得比默认基线更宽松（基线 {max_looser_allowed[key]}）",
+            )
+        if key in min_looser_allowed and value < min_looser_allowed[key] - 1e-12:
+            raise HTTPException(
+                422,
+                f"QA 阈值 {key} 不得比默认基线更宽松（基线 {min_looser_allowed[key]}）",
+            )
+        merged[key] = value
+    merged["threshold_set_version"] = str(payload.get("threshold_set_version") or "2026.09.1")
+    merged["threshold_set_id"] = str(payload.get("threshold_set_id") or _qa_default_threshold_set_id())
+    return merged
+
+
+
+class ApprovedBackgroundWorkflow(BaseModel):
+    """批准用于 Strict 非产品区域输入的背景来源工作流；不允许在产品保护区域内生成。"""
+    name: str = Field(min_length=1, max_length=120)
+    version: str = Field(min_length=1, max_length=80)
+    workflow_hash: str = Field(min_length=64, max_length=64)
+    protection_map: list[dict] = Field(default_factory=list, max_length=64)
 
 class FidelityPolicyRequest(BaseModel):
     """V3-03：保真策略版本。STRICT 只允许确定性操作。"""
@@ -600,6 +830,7 @@ class FidelityPolicyRequest(BaseModel):
     mode: Literal["STRICT", "CONTROLLED", "CREATIVE"]
     protected_regions: list[ProtectedRegion] = Field(default_factory=list, max_length=64)
     allowed_operations: list[str] = Field(default_factory=list, max_length=16)
+    background_workflows: list[ApprovedBackgroundWorkflow] = Field(default_factory=list, max_length=32)
     notes: str = Field(default="", max_length=2000)
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
@@ -641,6 +872,25 @@ class ProductReviewRequest(BaseModel):
             if not self.camera_visibility_constraints:
                 raise ValueError("单图来源的版本必须给出相机可见性限制")
         return self
+
+
+class QaThresholdSetRequest(BaseModel):
+    threshold_set_version: str = Field(min_length=1, max_length=80)
+    thresholds: dict = Field(default_factory=dict)
+    product_version_id: str | None = None
+    project_id: str = DEFAULT_PROJECT_ID
+    owner_id: str = DEFAULT_OWNER_ID
+
+
+class QaRunRequest(BaseModel):
+    threshold_set_id: str | None = None
+    threshold_set_version: str | None = None
+
+
+class QaDecisionRequest(BaseModel):
+    decision: Literal["APPROVED", "REJECTED"]
+    manifest_hash: str = Field(min_length=64, max_length=64)
+    notes: str = Field(default="", max_length=2000)
 
 
 class DirectorPlanRequest(BaseModel):
@@ -849,6 +1099,22 @@ def resolve_job_owner_scope(job_id: str, owner_id: str = DEFAULT_OWNER_ID, proje
     if row["owner_id"] != owner_id or row["project_id"] != project_id:
         raise HTTPException(403, "越权访问任务")
 
+
+
+
+def resolve_run_owner_scope(run_id: str, owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJECT_ID) -> None:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        row = db.execute(
+            "SELECT r.owner_id, pv.project_id FROM runs r "
+            "JOIN plan_contracts pc ON pc.id = r.plan_contract_id "
+            "JOIN product_versions pv ON pv.id = pc.product_version_id "
+            "WHERE r.id = ?", (run_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Run 不存在")
+    if row["owner_id"] != owner_id or row["project_id"] != project_id:
+        raise HTTPException(403, "越权访问 Run")
 
 def row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
@@ -1067,6 +1333,101 @@ def ensure_plan_contract(
     return contract
 
 
+def fidelity_run_request_hash(plan_payload_sha256: str, request: RunRequest) -> str:
+    """把保真绑定字段并入 Run 幂等 hash，避免不同冻结引用共享同一 idempotency_key。"""
+    binding_fields = (
+        request.plan_contract_id,
+        request.product_review_id,
+        request.fidelity_policy_id,
+    )
+    if not request.require_fidelity_snapshot and all(field is None for field in binding_fields):
+        return plan_payload_sha256
+    material = {
+        "plan_payload_sha256": plan_payload_sha256,
+        "plan_contract_id": request.plan_contract_id,
+        "product_review_id": request.product_review_id,
+        "product_review_sha256": request.product_review_sha256,
+        "fidelity_policy_id": request.fidelity_policy_id,
+        "fidelity_policy_sha256": request.fidelity_policy_sha256,
+        "background_workflow": request.background_workflow.model_dump() if request.background_workflow else None,
+        "background_source_mode": request.background_source_mode,
+    }
+    return plan_contract_snapshot_hash(canonical_payload(material))
+
+
+def get_plan_contract_for_owner(
+    db: sqlite3.Connection,
+    plan_id: str,
+    contract_id: str | None,
+    owner_id: str,
+    project_id: str,
+) -> sqlite3.Row:
+    if not contract_id:
+        raise HTTPException(409, "Strict Run 缺少冻结合同引用")
+    row = db.execute(
+        """
+        SELECT pc.*, pv.owner_id, pv.project_id
+        FROM plan_contracts pc
+        JOIN product_versions pv ON pv.id = pc.product_version_id
+        WHERE pc.id = ? AND pc.plan_id = ?
+        """,
+        (contract_id, plan_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "冻结合同不存在或不属于该计划")
+    if row["owner_id"] != owner_id or row["project_id"] != project_id:
+        raise HTTPException(403, "越权访问冻结合同")
+    return row
+
+
+def freeze_fidelity_binding(
+    db: sqlite3.Connection,
+    contract: sqlite3.Row,
+    product_review_id: str | None,
+    product_review_sha256: str | None,
+    fidelity_policy_id: str | None,
+    fidelity_policy_sha256: str | None,
+    owner_id: str,
+) -> dict:
+    """校验并冻结 Run 引用的真实审核/策略记录，绝不回退到可变 latest。"""
+    if not product_review_id or not fidelity_policy_id:
+        raise HTTPException(409, "Strict Run 缺少审核或策略冻结引用")
+    product_version_id = contract["product_version_id"]
+    review = db.execute(
+        "SELECT * FROM product_reviews WHERE id = ? AND product_version_id = ?",
+        (product_review_id, product_version_id),
+    ).fetchone()
+    if not review:
+        raise HTTPException(404, "保真审核不存在或不属于该产品版本")
+    if review["reviewer"] != owner_id:
+        raise HTTPException(403, "越权引用他人审核记录")
+    if review["decision"] != "APPROVED":
+        raise HTTPException(409, "保真审核未通过，不能启动 Strict Run")
+    if product_review_sha256 is not None and product_review_sha256.lower() != review["payload_sha256"].lower():
+        raise HTTPException(409, "产品审核 hash 与冻结记录不符")
+    policy = db.execute(
+        "SELECT * FROM fidelity_policies WHERE id = ? AND product_version_id = ?",
+        (fidelity_policy_id, product_version_id),
+    ).fetchone()
+    if not policy:
+        raise HTTPException(404, "保真策略不存在或不属于该产品版本")
+    if policy["mode"] != "STRICT":
+        raise HTTPException(409, "Strict Run 仅接受 STRICT 保真策略")
+    if fidelity_policy_sha256 is not None and fidelity_policy_sha256.lower() != policy["payload_sha256"].lower():
+        raise HTTPException(409, "保真策略 hash 与冻结记录不符")
+    return {
+        "product_version_id": product_version_id,
+        "plan_contract_id": contract["id"],
+        "plan_contract_version": contract["version"],
+        "plan_contract_sha256": contract["payload_sha256"],
+        "product_review_id": review["id"],
+        "product_review_sha256": review["payload_sha256"],
+        "fidelity_policy_id": policy["id"],
+        "fidelity_policy_version": policy["version"],
+        "fidelity_policy_sha256": policy["payload_sha256"],
+        "fidelity_mode": policy["mode"],
+    }
+
 def append_job_event(db: sqlite3.Connection, job_id: str, event_type: str, payload: dict | None = None) -> None:
     job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if not job:
@@ -1216,6 +1577,12 @@ def complete_leased_job(job_id: str, request: WorkerCompleteRequest) -> dict:
     with connect() as db:
         begin_immediate(db)
         run_job = require_active_lease(db, job_id, request.worker_id, request.lease_epoch)
+        strict_row = db.execute(
+            "SELECT fidelity_snapshot_json FROM runs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        if strict_row and strict_row["fidelity_snapshot_json"]:
+            raise HTTPException(409, "Strict Run 必须由 Strict runtime closure 完成，不能通过 legacy complete 置为 SUCCEEDED")
         _apply_job_update(db, job_id, values)
         db.execute(
             "UPDATE run_jobs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?",
@@ -1362,7 +1729,7 @@ def _apply_job_update(db: sqlite3.Connection, job_id: str, values: dict) -> None
                 for key, value in values.items()
                 if key not in {"status", "stage", "progress", "cancel_requested"}
             }
-        if values.get("status") == "SUCCEEDED" and (
+        if values.get("status") in {"SUCCEEDED", VERIFICATION_PASSED} and (
             current["cancel_requested"] or current["status"] == "CANCEL_REQUESTED"
         ):
             # 取消与完成竞争：取消胜出，不把用户已取消的任务改回成功。
@@ -1474,21 +1841,160 @@ def get_job(job_id: str) -> dict:
     return row_to_dict(row)
 
 
+def _job_has_frozen_snapshot(job_id: str) -> bool:
+    with connect() as db:
+        row = db.execute(
+            "SELECT fidelity_snapshot_json FROM runs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+    return bool(row and row["fidelity_snapshot_json"])
+
+
+def _job_manifest_payload(job_id: str, manifest_path: str | None) -> dict | None:
+    if not manifest_path:
+        return None
+    try:
+        path = _resolve_job_artifact_path(job_id, manifest_path)
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (HTTPException, OSError, json.JSONDecodeError):
+        return None
+
+
+def _verify_manifest_bound_files(job_id: str, manifest: dict, output_spec: OutputSpec) -> list[str]:
+    """批准前重算当前 Manifest 引用的 Strict 输入/合成/成片文件 hash。"""
+    failures: list[str] = []
+    strict_root = RUNS / job_id / "strict"
+
+    def verify_entries(entries: list[dict], root: Path, label: str) -> None:
+        for entry in entries:
+            relative = entry.get("path")
+            expected = str(entry.get("sha256", "")).lower()
+            if not relative:
+                failures.append(f"{label} 缺少文件路径")
+                continue
+            path = (root / relative).resolve()
+            try:
+                path.relative_to(root.resolve())
+            except ValueError:
+                failures.append(f"{label} 文件路径越界: {relative}")
+                continue
+            if not path.exists() or not path.is_file():
+                failures.append(f"{label} 文件缺失: {relative}")
+                continue
+            if _file_sha256(path).lower() != expected:
+                failures.append(f"{label} 文件已被替换: {relative}")
+
+    input_manifest = manifest.get("input_manifest")
+    if not isinstance(input_manifest, dict) or not input_manifest.get("files"):
+        failures.append("Strict manifest 缺少逐文件 input_manifest")
+    else:
+        verify_entries(input_manifest.get("files", []), strict_root, "input_manifest")
+    source_manifest = manifest.get("source_manifest")
+    source_manifest_required = manifest.get("input_trust") == "REGISTERED_LOCAL_SAMPLE"
+    if source_manifest_required and not isinstance(source_manifest, dict):
+        failures.append("Strict manifest 缺少受控来源逐文件 source_manifest")
+    elif isinstance(source_manifest, dict):
+        for layer in source_manifest.get("layers", {}).values():
+            if isinstance(layer, dict):
+                verify_entries(layer.get("files", []), strict_root, "source_manifest")
+    background_evidence = manifest.get("background_evidence")
+    if isinstance(background_evidence, dict):
+        failures.extend(verify_background_evidence_files(strict_root, background_evidence, output_spec))
+    if not manifest.get("output_sha256"):
+        failures.append("Strict manifest 缺少成片文件 hash")
+    else:
+        output = RUNS / job_id / "strict_preview.mp4"
+        if not output.exists() or _file_sha256(output).lower() != str(manifest["output_sha256"]).lower():
+            failures.append("Strict 成片文件已变化或缺失")
+    if not manifest.get("composite_output_sha256"):
+        failures.append("Strict manifest 缺少合成帧产物 hash")
+    else:
+        composite_root = strict_root / "composite_out"
+        if _strict_tree_sha256(composite_root) != str(manifest["composite_output_sha256"]).lower():
+            failures.append("Strict 合成帧产物已变化")
+    return failures
+
+
+def job_release_eligibility(job: dict) -> dict:
+    """可发布/可继承 Strict PASS 的显式资格门。
+
+    V1/V2 legacy 成功任务继续兼容；Strict Run 只有明确 fidelity_complete=true、
+    非预置采样来源且状态为 SUCCEEDED，才允许下游聚合/发布视为完整 Strict 成果。
+    """
+    status = job.get("status")
+    strict_mode = _job_has_frozen_snapshot(job["id"])
+    manifest = _job_manifest_payload(job["id"], job.get("manifest_path"))
+    fidelity_complete = None
+    input_trust = None
+    manifest_strict_mode = False
+    if isinstance(manifest, dict):
+        fidelity_complete = manifest.get("fidelity_complete")
+        input_trust = manifest.get("input_trust")
+        manifest_strict_mode = manifest.get("strict_mode") is True
+    result: dict = {
+        "eligible": False,
+        "strict_mode": manifest_strict_mode or strict_mode,
+        "fidelity_complete": fidelity_complete,
+        "input_trust": input_trust,
+        "verification_only": False,
+        "reason": "",
+    }
+    if status == VERIFICATION_PASSED:
+        result["verification_only"] = True
+        result["reason"] = "Strict 验证小样仅用于非商业验证，不可发布或继承 Strict PASS"
+        return result
+    if status != "SUCCEEDED":
+        result["reason"] = f"任务状态为 {status}，尚未达到可发布完成状态"
+        return result
+    if not strict_mode:
+        if not job.get("output_path"):
+            result["reason"] = "任务缺少可发布产物"
+            return result
+        result["eligible"] = True
+        result["reason"] = "V1/V2 基础预演成果"
+        return result
+    if not isinstance(manifest, dict) or manifest.get("strict_mode") is not True:
+        result["reason"] = "Strict 成果缺少可信 manifest，不能发布"
+        return result
+    if input_trust != STRICT_VERIFIED_INPUT_TRUST:
+        result["verification_only"] = True
+        result["reason"] = "Strict 输入来源未达到可信闭环，input_trust 必须为 " + STRICT_VERIFIED_INPUT_TRUST
+        return result
+    if fidelity_complete is not True:
+        result["reason"] = "Strict 成果 fidelity_complete 不为 true，不能发布"
+        return result
+    if not job.get("output_path"):
+        result["reason"] = "Strict 成果缺少可发布产物"
+        return result
+    if not _job_has_valid_qa_approval(job["id"]):
+        result["reason"] = "Strict 成果缺少有效 QA 人工批准或批准绑定已失效"
+        return result
+    result["eligible"] = True
+    result["reason"] = "Strict 成果已通过完整来源与保真闭环"
+    return result
+
+
 def create_run_record(
     plan_row: sqlite3.Row,
     owner_id: str,
     project_id: str,
     idempotency_key: str | None,
     request_hash: str,
-) -> tuple[str, str, bool]:
+    *,
+    plan_contract_id: str | None = None,
+    product_review_id: str | None = None,
+    product_review_sha256: str | None = None,
+    fidelity_policy_id: str | None = None,
+    fidelity_policy_sha256: str | None = None,
+    require_fidelity_snapshot: bool = False,
+    background_workflow: StrictBackgroundWorkflowInput | None = None,
+    background_source_mode: str | None = None,
+    required_strict_layers: list[str] | None = None,
+) -> tuple[str, str, bool, dict | None]:
     now = utc_now()
     run_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     with connect() as db:
-        contract = ensure_plan_contract(db, plan_row, owner_id, project_id)
-        asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan_row["product_asset_id"],)).fetchone()
-        if not asset:
-            raise HTTPException(409, "计划绑定的产品素材不存在")
         if idempotency_key:
             existing = db.execute(
                 "SELECT id, job_id, request_hash, status FROM runs WHERE idempotency_key = ? AND plan_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -1497,14 +2003,61 @@ def create_run_record(
             if existing:
                 if existing["request_hash"] != request_hash:
                     raise HTTPException(409, "同一 idempotency_key 的计划内容冲突")
-                return existing["id"], existing["job_id"], False
+                return existing["id"], existing["job_id"], False, None
+
+        fidelity_snapshot = None
+        strict_binding = require_fidelity_snapshot or any(
+            field is not None for field in (plan_contract_id, product_review_id, fidelity_policy_id)
+        )
+        if strict_binding:
+            contract = get_plan_contract_for_owner(db, plan_row["id"], plan_contract_id, owner_id, project_id)
+            latest = get_default_contract(plan_row["id"], db, owner_id, project_id)
+            if not latest:
+                raise HTTPException(409, "计划冻结合同缺失")
+            if contract["id"] != latest["id"]:
+                raise HTTPException(409, "计划已更新，旧保真审批已失效，请引用最新冻结合同")
+            fidelity_snapshot = freeze_fidelity_binding(
+                db, contract, product_review_id, product_review_sha256,
+                fidelity_policy_id, fidelity_policy_sha256, owner_id,
+            )
+            required_layers = list(dict.fromkeys(required_strict_layers or []))
+            unknown = [item for item in required_layers if item not in STRICT_LAYER_OPERATIONS]
+            if unknown:
+                raise HTTPException(409, "未知的 Strict 必需层: " + ", ".join(unknown))
+            policy_row = db.execute(
+                "SELECT payload FROM fidelity_policies WHERE id = ?", (fidelity_policy_id,),
+            ).fetchone()
+            policy_payload = json.loads(policy_row["payload"]) if policy_row else {}
+            allowed_operations = set(policy_payload.get("allowed_operations", []))
+            not_allowed = [item for item in required_layers if item not in allowed_operations]
+            if not_allowed:
+                raise HTTPException(409, "Strict 必需层未获保真策略允许: " + ", ".join(not_allowed))
+            if background_workflow is not None:
+                if background_source_mode not in {MODE_INDEPENDENT_WORKFLOW, MODE_CONTROLLED_IMPORT}:
+                    raise HTTPException(409, "background_source_mode 必须是独立背景工作流或受控导入")
+                workflow_payload = background_workflow.model_dump()
+                workflow_payload["output_ref"] = "strict/background"
+                if not _approved_background_workflow(policy_payload, workflow_payload):
+                    raise HTTPException(409, "背景工作流未出现在已冻结 STRICT 保真策略的批准列表")
+                fidelity_snapshot["background_workflow"] = workflow_payload
+                fidelity_snapshot["background_source_mode"] = background_source_mode
+            fidelity_snapshot["required_strict_layers"] = required_layers
+        else:
+            if background_workflow is not None:
+                raise HTTPException(409, "background_workflow 只能在 Strict Run 中绑定")
+            contract = ensure_plan_contract(db, plan_row, owner_id, project_id)
+
+        asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan_row["product_asset_id"],)).fetchone()
+        if not asset:
+            raise HTTPException(409, "计划绑定的产品素材不存在")
+        snapshot_json = json.dumps(fidelity_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if fidelity_snapshot else None
         db.execute(
             "INSERT INTO jobs VALUES (?, ?, ?, ?, 'QUEUED', 'PREPARE', 0, NULL, NULL, NULL, 0, ?, ?)",
             (job_id, plan_row["id"], asset["id"], asset["kind"], now, now),
         )
         db.execute(
-            "INSERT INTO runs (id, plan_id, plan_contract_id, owner_id, request_hash, idempotency_key, status, stage, progress, job_id, attempt_count, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', 'PREPARE', 0, ?, 1, ?, ?)",
+            "INSERT INTO runs (id, plan_id, plan_contract_id, owner_id, request_hash, idempotency_key, status, stage, progress, job_id, attempt_count, created_at, updated_at, product_review_id, product_review_sha256, fidelity_policy_id, fidelity_policy_version, fidelity_policy_sha256, fidelity_snapshot_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', 'PREPARE', 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 plan_row["id"],
@@ -1515,6 +2068,12 @@ def create_run_record(
                 job_id,
                 now,
                 now,
+                fidelity_snapshot["product_review_id"] if fidelity_snapshot else None,
+                fidelity_snapshot["product_review_sha256"] if fidelity_snapshot else None,
+                fidelity_snapshot["fidelity_policy_id"] if fidelity_snapshot else None,
+                fidelity_snapshot["fidelity_policy_version"] if fidelity_snapshot else None,
+                fidelity_snapshot["fidelity_policy_sha256"] if fidelity_snapshot else None,
+                snapshot_json,
             ),
         )
         db.execute(
@@ -1528,7 +2087,7 @@ def create_run_record(
             (str(uuid.uuid4()), run_id, now),
         )
         append_job_event(db, job_id, "job.created", {"run_id": run_id, "plan_id": plan_row["id"]})
-    return run_id, job_id, True
+    return run_id, job_id, True, fidelity_snapshot
 
 
 def image_base_zoom(focal_length_mm: int) -> float:
@@ -1787,6 +2346,1248 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_p
     )
     if encode.returncode != 0:
         raise RuntimeError(encode.stderr[-2000:])
+def load_strict_run_snapshot(db: sqlite3.Connection, job_id: str) -> dict | None:
+    row = db.execute(
+        "SELECT plan_id, owner_id, fidelity_snapshot_json FROM runs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    if not row or not row["fidelity_snapshot_json"]:
+        return None
+    try:
+        snapshot = json.loads(row["fidelity_snapshot_json"])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Strict Run 快照损坏: {exc}") from exc
+    snapshot["plan_id"] = row["plan_id"]
+    snapshot["owner_id"] = row["owner_id"]
+    return snapshot
+
+
+def _read_json_report(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def build_strict_input_manifest(job_id: str, strict_root: Path, snapshot: dict) -> tuple[dict, str]:
+    """为预置 Strict 输入建立逐文件身份合同；只证明文件当前内容，不证明上游来源。"""
+    files: list[dict] = []
+    for folder_name in ("passes", "product", "mask", "background", "shadow", "reflection", "occlusion"):
+        folder = strict_root / folder_name
+        if not folder.exists():
+            continue
+        for path in sorted(folder.rglob("*")):
+            if not path.is_file() or path.name == "input_manifest.json":
+                continue
+            files.append({
+                "path": path.relative_to(strict_root).as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+    manifest = {
+        "job_id": job_id,
+        "plan_id": snapshot["plan_id"],
+        "plan_contract_id": snapshot["plan_contract_id"],
+        "product_version_id": snapshot["product_version_id"],
+        "files": files,
+    }
+    text = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return manifest, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _canonical_json_text(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _latest_run_id_for_job(db: sqlite3.Connection, job_id: str) -> str | None:
+    row = db.execute(
+        "SELECT id FROM runs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def load_qa_threshold_set(
+    db: sqlite3.Connection,
+    owner_id: str,
+    project_id: str,
+    threshold_set_id: str | None,
+    threshold_set_version: str | None,
+    product_version_id: str | None = None,
+) -> dict:
+    """加载冻结阈值集；未显式指定时使用项目默认阈值，不允许从请求临时放宽。"""
+    if threshold_set_id is None and threshold_set_version is None:
+        threshold_set_id = strict_qa.DEFAULT_STRICT_QA_THRESHOLD_SET["threshold_set_id"]
+        threshold_set_version = strict_qa.DEFAULT_STRICT_QA_THRESHOLD_SET["threshold_set_version"]
+    conditions = ["owner_id = ?", "project_id = ?"]
+    values: list = [owner_id, project_id]
+    if threshold_set_id is not None:
+        conditions.append("id = ?")
+        values.append(threshold_set_id)
+    if threshold_set_version is not None:
+        conditions.append("threshold_set_version = ?")
+        values.append(threshold_set_version)
+    if product_version_id is not None:
+        conditions.append("(product_version_id IS NULL OR product_version_id = ?)")
+        values.append(product_version_id)
+    row = db.execute(
+        f"SELECT * FROM qa_threshold_sets WHERE {' AND '.join(conditions)} ORDER BY created_at DESC LIMIT 1",
+        values,
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "冻结 QA 阈值集不存在或不属于当前项目")
+    payload = json.loads(row["payload"])
+    return {
+        "id": row["id"],
+        "threshold_set_version": row["threshold_set_version"],
+        "payload": payload,
+        "payload_sha256": row["payload_sha256"],
+    }
+
+
+def _qa_run_context(db: sqlite3.Connection, run_id: str) -> dict:
+    run = db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if not run:
+        raise HTTPException(404, "Run 不存在")
+    if not run["fidelity_snapshot_json"]:
+        raise HTTPException(409, "非 Strict Run 不能执行 Strict QA")
+    snapshot = json.loads(run["fidelity_snapshot_json"])
+    job_id = run["job_id"]
+    plan_row = db.execute("SELECT payload FROM plans WHERE id = ?", (run["plan_id"],)).fetchone()
+    if not plan_row:
+        raise HTTPException(404, "计划不存在")
+    plan_payload = json.loads(plan_row["payload"])
+    output_spec = OutputSpec.model_validate(plan_payload.get("output", {}))
+    policy_row = db.execute(
+        "SELECT payload FROM fidelity_policies WHERE id = ?", (snapshot["fidelity_policy_id"],),
+    ).fetchone()
+    review_row = db.execute(
+        "SELECT payload FROM product_reviews WHERE id = ?", (snapshot["product_review_id"],),
+    ).fetchone()
+    if not policy_row or not review_row:
+        raise HTTPException(409, "冻结保真策略或产品审核不存在")
+    asset_row = db.execute(
+        "SELECT * FROM assets WHERE id = (SELECT asset_id FROM jobs WHERE id = ?)",
+        (job_id,),
+    ).fetchone()
+    asset_path = None
+    if asset_row:
+        asset = row_to_dict(asset_row)
+        asset_path = Path(resolve_asset_path(asset))
+    return {
+        "run": row_to_dict(run),
+        "run_id": run_id,
+        "job_id": job_id,
+        "snapshot": snapshot,
+        "plan_payload": plan_payload,
+        "output_spec": output_spec,
+        "policy_payload": json.loads(policy_row["payload"]),
+        "review_payload": json.loads(review_row["payload"]),
+        "asset_path": asset_path,
+        "controlled_evidence": load_controlled_render_evidence(db, job_id),
+    }
+
+
+def _qa_binding_sha256(
+    db: sqlite3.Connection,
+    run_id: str,
+    manifest_sha256: str,
+    threshold_payload_sha256: str,
+    qa_report_payload_sha256: str,
+) -> str:
+    run = db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if not run:
+        raise HTTPException(404, "Run 不存在")
+    contract = db.execute(
+        "SELECT payload_sha256 FROM plan_contracts WHERE id = ?", (run["plan_contract_id"],),
+    ).fetchone()
+    product_version = db.execute(
+        "SELECT snapshot_sha256 FROM product_versions WHERE id = ?",
+        (json.loads(run["fidelity_snapshot_json"])["product_version_id"],),
+    ).fetchone()
+    review = db.execute(
+        "SELECT payload_sha256 FROM product_reviews WHERE id = ?",
+        (run["product_review_id"],),
+    ).fetchone()
+    policy = db.execute(
+        "SELECT payload_sha256 FROM fidelity_policies WHERE id = ?",
+        (run["fidelity_policy_id"],),
+    ).fetchone()
+    job = db.execute(
+        "SELECT asset_id FROM jobs WHERE id = ?", (run["job_id"],),
+    ).fetchone()
+    asset = None
+    if job and job["asset_id"]:
+        asset = db.execute(
+            "SELECT sha256 FROM assets WHERE id = ?", (job["asset_id"],),
+        ).fetchone()
+    parts = {
+        "run_id": run_id,
+        "plan_contract_sha256": contract["payload_sha256"] if contract else None,
+        "product_version_sha256": product_version["snapshot_sha256"] if product_version else None,
+        "product_review_sha256": review["payload_sha256"] if review else None,
+        "fidelity_policy_sha256": policy["payload_sha256"] if policy else None,
+        "asset_sha256": asset["sha256"] if asset else None,
+        "strict_source_manifest_sha256": run["strict_source_manifest_sha256"],
+        "controlled_render_evidence_sha256": run["controlled_render_evidence_sha256"],
+        "qa_threshold_sha256": threshold_payload_sha256,
+        "qa_report_sha256": qa_report_payload_sha256,
+        "manifest_sha256": manifest_sha256,
+    }
+    return hashlib.sha256(_canonical_json_text(parts).encode("utf-8")).hexdigest()
+
+
+def _qa_report_decision_validity(db: sqlite3.Connection, row) -> dict:
+    """读取时重新验证 APPROVED 是否仍绑定到当前 Manifest/输入/产物/合同。
+
+    旧 decision 字段只代表历史人工决定；文件、阈值、审核、策略、计划或资产变化后，
+    下游不得继续读取为有效批准。
+    """
+    result = {
+        "decision": row["decision"] if row else None,
+        "decision_valid": False,
+        "effective_decision": row["decision"] if row else None,
+        "reason": "",
+    }
+    if not row or row["decision"] != "APPROVED":
+        result["reason"] = "QA 报告尚无有效人工批准"
+        return result
+    try:
+        latest = db.execute(
+            "SELECT id FROM qa_reports WHERE job_id = ? ORDER BY created_at DESC, updated_at DESC LIMIT 1",
+            (row["job_id"],),
+        ).fetchone()
+        if not latest or latest["id"] != row["id"]:
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "已有更新的 QA 报告，旧批准失效"
+            return result
+        job = db.execute("SELECT * FROM jobs WHERE id = ?", (row["job_id"],)).fetchone()
+        if not job:
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "QA 报告绑定的 Job 不存在"
+            return result
+        manifest = _job_manifest_payload(row["job_id"], job["manifest_path"])
+        if not isinstance(manifest, dict):
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "当前 Job 缺少可信 manifest 文件"
+            return result
+        current_manifest_sha256 = hashlib.sha256(
+            _canonical_json_text(manifest).encode("utf-8")
+        ).hexdigest()
+        if not row["decision_manifest_sha256"] or not row["manifest_sha256"]:
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "QA 批准缺少精确 manifest_hash 绑定"
+            return result
+        if (
+            current_manifest_sha256.lower() != row["manifest_sha256"].lower()
+            or current_manifest_sha256.lower() != row["decision_manifest_sha256"].lower()
+        ):
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "Manifest 已变化，旧 QA 批准失效"
+            return result
+        manifest_qa_report = manifest.get("qa_report")
+        if (
+            not isinstance(manifest_qa_report, dict)
+            or hashlib.sha256(_canonical_json_text(manifest_qa_report).encode("utf-8")).hexdigest()
+            != row["payload_sha256"]
+        ):
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "Manifest 中的 QA 报告与已冻结报告不一致"
+            return result
+        context = _qa_run_context(db, row["run_id"])
+        bound_failures = _verify_manifest_bound_files(
+            row["job_id"], manifest, context["output_spec"]
+        )
+        if bound_failures:
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "Strict 输入/产物已变化: " + "；".join(bound_failures[:8])
+            return result
+        if row["status"] != "PASS":
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "QA 报告状态不是 PASS"
+            return result
+        threshold = db.execute(
+            "SELECT payload_sha256 FROM qa_threshold_sets WHERE id = ?",
+            (row["threshold_set_id"],),
+        ).fetchone()
+        if not threshold:
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "QA 阈值集不存在"
+            return result
+        current_binding = _qa_binding_sha256(
+            db,
+            row["run_id"],
+            current_manifest_sha256,
+            threshold["payload_sha256"],
+            row["payload_sha256"],
+        )
+        if current_binding != row["binding_sha256"]:
+            result["effective_decision"] = "REVOKED"
+            result["reason"] = "QA 绑定输入已变化，旧批准失效"
+            return result
+        asset_row = db.execute(
+            "SELECT * FROM assets WHERE id = (SELECT asset_id FROM jobs WHERE id = ?)",
+            (row["job_id"],),
+        ).fetchone()
+        if asset_row:
+            asset = row_to_dict(asset_row)
+            asset_path = Path(resolve_asset_path(asset))
+            if not asset_path.is_file() or _file_sha256(asset_path).lower() != str(asset["sha256"]).lower():
+                result["effective_decision"] = "REVOKED"
+                result["reason"] = "产品资产文件已变化"
+                return result
+        result["decision_valid"] = True
+        result["effective_decision"] = "APPROVED"
+        result["reason"] = ""
+        return result
+    except HTTPException as exc:
+        result["effective_decision"] = "REVOKED"
+        result["reason"] = f"{exc.status_code}: {exc.detail}"
+        return result
+    except Exception as exc:
+        result["effective_decision"] = "REVOKED"
+        result["reason"] = "QA 批准有效性复核失败: " + str(exc)[:300]
+        return result
+
+
+def _job_has_valid_qa_approval(job_id: str) -> bool:
+    """发布门不得读取旧 decision 字段，必须按当前绑定重算有效性。"""
+    with connect() as db:
+        row = db.execute(
+            """
+            SELECT * FROM qa_reports
+            WHERE job_id = ?
+            ORDER BY created_at DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if not row or row["decision"] != "APPROVED":
+            return False
+        return _qa_report_decision_validity(db, row)["decision_valid"]
+
+
+def _persist_qa_report(
+    db: sqlite3.Connection,
+    run_id: str,
+    job_id: str,
+    qa_report: dict,
+    threshold_set: dict,
+    manifest_sha256: str,
+) -> str:
+    payload_text = _canonical_json_text(qa_report)
+    payload_sha256 = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    binding = _qa_binding_sha256(
+        db, run_id, manifest_sha256, threshold_set["payload_sha256"], payload_sha256
+    )
+    report_id = str(uuid.uuid4())
+    now = utc_now()
+    db.execute(
+        """
+        INSERT INTO qa_reports(
+          id, run_id, job_id, threshold_set_id, threshold_set_version,
+          payload, payload_sha256, status, manifest_sha256, binding_sha256,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            report_id, run_id, job_id, threshold_set["id"], threshold_set["threshold_set_version"],
+            payload_text, payload_sha256, qa_report["status"], manifest_sha256, binding,
+            now, now,
+        ),
+    )
+    return report_id
+
+
+def _collect_strict_layer_files(strict_root: Path) -> dict[str, dict]:
+    """逐文件读取 Strict 层并计算 sha256；只描述目录当前内容。"""
+    layers: dict[str, dict] = {}
+    for layer_name in ("passes", "product", "mask", "background", "shadow", "reflection", "occlusion"):
+        folder = strict_root / layer_name
+        if not folder.exists():
+            continue
+        files = []
+        for path in sorted(folder.rglob("*")):
+            if not path.is_file() or path.name in {"input_manifest.json", "source_manifest.json"}:
+                continue
+            files.append({
+                "path": path.relative_to(strict_root).as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+        layers[layer_name] = {"root": layer_name, "files": files}
+    return layers
+
+
+def _required_strict_layers_from_plan(plan_payload: dict) -> list[str]:
+    """从冻结分镜合同汇总本次明确要求的独立层；缺失字段按空处理以兼容旧计划。"""
+    required: list[str] = []
+    for shot in plan_payload.get("shots", []):
+        for layer in shot.get("required_strict_layers", []):
+            if layer in STRICT_LAYER_OPERATIONS and layer not in required:
+                required.append(layer)
+    return required
+
+
+_FRAME_INDEX_RE = re.compile(r"(?:^|[^0-9])(\d+)(?:$|[^0-9])")
+
+
+def _layer_file_frame_set(layer: dict) -> set[int]:
+    frames: set[int] = set()
+    for entry in layer.get("files", []):
+        stem = Path(entry.get("path", "")).stem
+        match = _FRAME_INDEX_RE.search(stem)
+        if match:
+            frames.add(int(match.group(1)))
+    return frames
+
+
+def _optional_layer_frame_file_failures(layer: dict, layer_name: str) -> list[str]:
+    """可选层必须具有可识别且唯一的帧号；逐文件格式/有限值校验由合成器完成。"""
+    failures: list[str] = []
+    seen: dict[int, str] = {}
+    for entry in layer.get("files", []):
+        relative = entry.get("path", "")
+        stem = Path(relative).stem
+        match = _FRAME_INDEX_RE.search(stem)
+        if not match:
+            failures.append(f"{layer_name} 层包含不可识别帧名：{relative}")
+            continue
+        frame = int(match.group(1))
+        if frame in seen:
+            failures.append(f"{layer_name} 层存在重复帧 {frame}: {seen[frame]}, {relative}")
+        seen[frame] = relative
+    return failures
+
+
+def _required_layer_frame_contracts(plan_payload: dict, frame_count: int) -> tuple[dict[str, set[int]], list[str]]:
+    """按冻结分镜逐段计算必需层必须覆盖的帧集合；分镜总帧与计划不符即失败。"""
+    contracts: dict[str, set[int]] = {}
+    failures: list[str] = []
+    cursor = 1
+    shots = plan_payload.get("shots", [])
+    for index, shot in enumerate(shots):
+        duration = shot.get("duration_frames")
+        if not isinstance(duration, int) or duration <= 0:
+            failures.append(f"分镜 {index + 1} duration_frames 无效")
+            continue
+        end = cursor + duration - 1
+        for layer in shot.get("required_strict_layers", []):
+            if layer in STRICT_LAYER_OPERATIONS:
+                layer_name = STRICT_OPERATION_TO_LAYER[layer]
+                contracts.setdefault(layer_name, set()).update(range(cursor, end + 1))
+        cursor = end + 1
+    if cursor - 1 != frame_count:
+        failures.append(f"分镜帧范围合计 {cursor - 1} 与冻结计划 {frame_count} 不一致")
+    return contracts, failures
+
+
+def _strict_layer_contract_failures(
+    layers: dict, policy_payload: dict, required_layers: list[str] | None = None,
+    required_layer_frames: dict[str, set[int]] | None = None,
+    expected_frames: set[int] | None = None,
+) -> list[str]:
+    """按冻结 STRICT 策略核对背景与独立层合同；allowed_operations 是允许列表，
+    只有本镜头/本次合同明确要求时缺失才失败，且要求层必须逐帧覆盖对应分镜区间。"""
+    failures: list[str] = []
+    if not layers.get("background") or not layers["background"].get("files"):
+        failures.append("Strict 输入来源缺少 background 层合同")
+    allowed_operations = set(policy_payload.get("allowed_operations", []))
+    required = set(required_layers or ())
+    for operation, layer_name in STRICT_OPERATION_TO_LAYER.items():
+        if layer_name in (required_layer_frames or {}):
+            required.add(operation)
+    for operation, layer_name in (("shadow_layer", "shadow"), ("reflection_layer", "reflection"), ("occlusion_layer", "occlusion")):
+        layer = layers.get(layer_name) or {}
+        layer_present = bool(layer.get("files"))
+        present_frames = _layer_file_frame_set(layer) if layer_present else set()
+        if operation in required and not layer_present:
+            failures.append(f"本镜头/本次合同要求 {operation}，但 Strict 输入来源缺少 {layer_name} 层合同")
+        if operation not in allowed_operations and layer_present:
+            failures.append(f"Strict 输入来源包含未获策略允许的 {layer_name} 层")
+        if layer_present:
+            failures.extend(_optional_layer_frame_file_failures(layer, layer_name))
+            if expected_frames is not None:
+                out_of_range = sorted(present_frames - expected_frames)
+                if out_of_range:
+                    failures.append(f"{layer_name} 层含越出冻结全片帧集合的帧：{out_of_range[:12]}")
+        required_frames = (required_layer_frames or {}).get(layer_name)
+        if required_frames:
+            missing = sorted(required_frames - present_frames)
+            if missing:
+                failures.append(f"本镜头要求的 {layer_name} 层缺少帧：{missing[:12]}")
+    return failures
+
+
+def load_strict_source_manifest(db: sqlite3.Connection, job_id: str) -> dict | None:
+    row = db.execute(
+        "SELECT strict_source_manifest_json, strict_source_manifest_sha256 FROM runs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    if not row or not row["strict_source_manifest_json"]:
+        return None
+    try:
+        manifest = json.loads(row["strict_source_manifest_json"])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Strict 输入来源快照损坏: {exc}") from exc
+    actual = hashlib.sha256(_canonical_json_text(manifest).encode("utf-8")).hexdigest()
+    if actual != row["strict_source_manifest_sha256"]:
+        raise RuntimeError("Strict 输入来源快照哈希不匹配")
+    return manifest
+
+
+def _approved_background_workflow(policy_payload: dict, workflow: dict) -> bool:
+    """背景工作流必须按 name/version/workflow_hash/输入保护区映射完整匹配已冻结策略。"""
+    for item in policy_payload.get("background_workflows", []):
+        if item.get("name") != workflow.get("name") or item.get("version") != workflow.get("version"):
+            continue
+        expected = str(item.get("workflow_hash", "")).lower()
+        actual = str(workflow.get("workflow_hash", "")).lower()
+        if not expected or not actual or expected != actual:
+            continue
+        expected_map = _canonical_json_text({"protection_map": item.get("protection_map", [])})
+        actual_map = _canonical_json_text({"protection_map": workflow.get("protection_map", [])})
+        if expected_map == actual_map:
+            return True
+    return False
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _strict_tree_sha256(root: Path) -> str:
+    """按相对路径 + sha256 计算 Strict 目录树的不可变摘要。"""
+    entries: list[dict] = []
+    if not root.exists():
+        return hashlib.sha256(b"").hexdigest()
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        entries.append({
+            "path": path.relative_to(root).as_posix(),
+            "sha256": _file_sha256(path),
+        })
+    return hashlib.sha256(_canonical_json_text({"files": entries}).encode("utf-8")).hexdigest()
+
+
+def _decode_process_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def probe_blender_version(executable: str | None) -> str | None:
+    """读取锁定 Blender 可执行文件的真实版本；失败返回 None，不猜测。"""
+    if not executable:
+        return None
+    try:
+        result = subprocess.run([executable, "--version"], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    text = _decode_process_text(result.stdout) + _decode_process_text(result.stderr)
+    first_line = text.strip().splitlines()
+    return first_line[0].strip() if first_line else None
+
+
+def build_controlled_blender_command(
+    asset: dict, strict_root: Path, plan_path: Path, output_spec: OutputSpec
+) -> list[str]:
+    """构造由 Worker 掌控的 Blender 多通道渲染命令；不接受用户自报 producer。"""
+    return [
+        BLENDER,
+        "--background",
+        "--python", str(BLENDER_SCRIPT),
+        "--",
+        "--input", asset["path"],
+        "--output", str(strict_root),
+        "--width", str(output_spec.width),
+        "--height", str(output_spec.height),
+        "--frames", str(output_spec.frame_count),
+        "--plan", str(plan_path),
+        "--passes",
+    ]
+
+
+def run_controlled_blender_command(command: list[str]):
+    """执行受控 Blender 命令；独立成函数便于 Worker/测试替换进程实现。"""
+    return subprocess.run(command, capture_output=True)
+
+
+def _parse_blender_pass_channels(stdout: str) -> list[str]:
+    for line in (stdout or "").splitlines():
+        if line.startswith("DIRECTOR_PASS_CHANNELS "):
+            raw = line.split(" ", 1)[1].strip()
+            return [item.strip() for item in raw.split(",") if item.strip()]
+    return []
+
+
+def _controlled_render_contract_failures(
+    db: sqlite3.Connection, asset: dict, strict_snapshot: dict, plan_snapshot: dict
+) -> list[str]:
+    """受控渲染启动前，把资产/版本/计划合同逐项核对为结构化失败。"""
+    failures: list[str] = []
+    contract = db.execute(
+        """
+        SELECT pc.*, pv.product_asset_id, pv.owner_id, pv.project_id, pv.snapshot_sha256
+        FROM plan_contracts pc
+        JOIN product_versions pv ON pv.id = pc.product_version_id
+        WHERE pc.id = ? AND pc.plan_id = ?
+        """,
+        (strict_snapshot["plan_contract_id"], strict_snapshot["plan_id"]),
+    ).fetchone()
+    if not contract:
+        return ["受控渲染冻结合同不存在或不属于该计划"]
+    if contract["owner_id"] != strict_snapshot["owner_id"]:
+        return ["受控渲染越权访问冻结合同"]
+    latest = get_default_contract(
+        strict_snapshot["plan_id"], db, strict_snapshot["owner_id"], contract["project_id"]
+    )
+    if not latest or latest["id"] != contract["id"]:
+        failures.append("计划已更新，旧保真审批已失效，请引用最新冻结合同")
+    try:
+        frozen = freeze_fidelity_binding(
+            db, contract, strict_snapshot["product_review_id"], strict_snapshot["product_review_sha256"],
+            strict_snapshot["fidelity_policy_id"], strict_snapshot["fidelity_policy_sha256"], strict_snapshot["owner_id"],
+        )
+    except HTTPException as exc:
+        return [f"{exc.status_code}: {exc.detail}"]
+    if frozen["product_review_sha256"] != strict_snapshot["product_review_sha256"]:
+        failures.append("产品审核 hash 与 Run 快照不一致")
+    if frozen["fidelity_policy_sha256"] != strict_snapshot["fidelity_policy_sha256"]:
+        failures.append("保真策略 hash 与 Run 快照不一致")
+    if frozen["product_version_id"] != strict_snapshot["product_version_id"]:
+        failures.append("冻结产品版本与 Run 快照不一致")
+    if contract["product_asset_id"] != asset["id"]:
+        failures.append("冻结合同产品资产与 Job 资产不一致")
+    expected_asset_sha256 = str(asset.get("sha256", "")).lower()
+    actual_asset_sha256 = _file_sha256(Path(asset["path"]))
+    if expected_asset_sha256 != actual_asset_sha256:
+        failures.append("产品资产文件 hash 与冻结资产不一致")
+    plan_snapshot_sha256 = plan_contract_payload_hash(plan_snapshot)[1]
+    if contract["payload_sha256"] != plan_snapshot_sha256:
+        failures.append("DirectorPlan 快照 hash 与冻结合同不一致")
+    return failures
+
+
+def _run_controlled_pass_validation(pass_root: Path, output_spec: OutputSpec) -> tuple[dict | None, str | None]:
+    report_path = pass_root / "passes_report.json"
+    cmd = [
+        sys.executable, str(FIDELITY_PASS_VALIDATOR),
+        "--passes", str(pass_root), "--frames", str(output_spec.frame_count),
+        "--start-frame", "1", "--json", str(report_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    report = _read_json_report(report_path)
+    if report is None:
+        detail = (_decode_process_text(result.stderr) + _decode_process_text(result.stdout)).strip()[-2000:]
+        return None, f"五通道校验执行失败: {detail}"
+    return report, None
+
+
+def load_controlled_render_evidence(db: sqlite3.Connection, job_id: str) -> dict | None:
+    row = db.execute(
+        "SELECT controlled_render_evidence_json, controlled_render_evidence_sha256 FROM runs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    if not row or not row["controlled_render_evidence_json"]:
+        return None
+    try:
+        evidence = json.loads(row["controlled_render_evidence_json"])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"受控渲染证据损坏: {exc}") from exc
+    actual = hashlib.sha256(_canonical_json_text(evidence).encode("utf-8")).hexdigest()
+    if actual != row["controlled_render_evidence_sha256"]:
+        raise RuntimeError("受控渲染证据哈希不匹配")
+    return evidence
+
+
+def verify_controlled_render_evidence(strict_root: Path, evidence: dict, asset_path: Path | None = None) -> list[str]:
+    """用当前磁盘文件复核已冻结受控渲染证据；篡改、缺失或多出文件均失败。"""
+    failures: list[str] = []
+    expected: dict[str, str] = {}
+    for item in evidence.get("generated_files", []):
+        expected[item["path"]] = item.get("sha256", "")
+    current: dict[str, str] = {}
+    for path in sorted(strict_root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name in {"controlled_render_evidence.json", "passes_report.json"}:
+            continue
+        relative = path.relative_to(strict_root).as_posix()
+        current[relative] = _file_sha256(path)
+    missing = sorted(set(expected) - set(current))
+    extra = sorted(set(current) - set(expected))
+    if missing:
+        failures.append(f"受控渲染产物缺少文件：{missing[:8]}")
+    if extra:
+        failures.append(f"受控渲染产物多出未登记文件：{extra[:8]}")
+    for relative, expected_hash in expected.items():
+        if relative in current and current[relative].lower() != expected_hash.lower():
+            failures.append(f"受控渲染产物已被替换：{relative}")
+    if asset_path is not None and evidence.get("asset_sha256"):
+        if _file_sha256(asset_path).lower() != str(evidence.get("asset_sha256", "")).lower():
+            failures.append("受控渲染证据中的产品资产 hash 与当前文件不一致")
+    return failures
+
+
+def _matching_approved_background_workflow(policy_payload: dict, workflow: dict) -> dict | None:
+    """返回与冻结 Run 请求完全一致的策略批准项；无匹配返回 None。"""
+    for item in policy_payload.get("background_workflows", []):
+        if verify_workflow_contract(workflow, item):
+            continue
+        return item
+    return None
+
+
+def run_controlled_background_producer(
+    job_id: str,
+    worker_id: str,
+    lease_epoch: int,
+    run_dir: Path,
+    output_spec: OutputSpec,
+    snapshot: dict,
+    policy_payload: dict,
+) -> dict:
+    """同一持租约 Worker 内的系统受控背景 Producer；不读取客户端 producer 字段。"""
+    requested_workflow = snapshot.get("background_workflow")
+    if not isinstance(requested_workflow, dict):
+        return {"passed": True, "skipped": True}
+    approved_workflow = _matching_approved_background_workflow(policy_payload, requested_workflow)
+    if approved_workflow is None:
+        return {"passed": False, "failure": "冻结 Run 背景工作流未出现在已批准 STRICT 策略列表"}
+
+    strict_root = run_dir / "strict"
+    source_mode = snapshot.get("background_source_mode")
+    if source_mode == MODE_INDEPENDENT_WORKFLOW:
+        workflow_file_value = os.getenv("PRODUCTDIRECTOR_BACKGROUND_WORKFLOW_FILE", "").strip()
+        if not workflow_file_value:
+            return {"passed": False, "failure": "冻结 Run 选择独立背景工作流但现场 workflow 文件缺失；禁止自动回退受控导入"}
+        mode = MODE_INDEPENDENT_WORKFLOW
+        workflow_file = Path(workflow_file_value)
+        source_dir = None
+        mask_dir = None
+        controlled_root = None
+    elif source_mode == MODE_CONTROLLED_IMPORT:
+        mode = MODE_CONTROLLED_IMPORT
+        workflow_file = None
+        controlled_root = default_controlled_source_root()
+        source_dir = controlled_root / job_id
+        mask_dir = strict_root / "mask"
+    else:
+        return {"passed": False, "failure": "冻结 Run background_source_mode 缺失或不受支持"}
+
+    def lease_check(job_id: str, worker_id: str, lease_epoch: int) -> None:
+        with connect() as db:
+            require_active_lease(db, job_id, worker_id, lease_epoch)
+
+    try:
+        evidence = run_controlled_background_workflow(
+            job_id,
+            worker_id,
+            lease_epoch,
+            snapshot,
+            approved_workflow,
+            strict_root,
+            output_spec,
+            requested_workflow=requested_workflow,
+            mode=mode,
+            source_dir=source_dir,
+            mask_dir=mask_dir,
+            workflow_file=workflow_file,
+            controlled_root=controlled_root,
+            lease_check=lease_check,
+        )
+    except BackgroundProducerError as exc:
+        return {"passed": False, "failure": f"受控背景 Producer 失败: {exc}"}
+
+    evidence_path = write_background_evidence(strict_root, evidence)
+    binding_failures = verify_evidence_binding(
+        evidence, job_id, snapshot, approved_workflow.get("workflow_hash", "")
+    )
+    file_failures = verify_background_evidence_files(strict_root, evidence, output_spec)
+    failures = binding_failures + file_failures
+    if failures:
+        return {"passed": False, "failure": "背景证据运行后复核未通过: " + "；".join(failures[:12])}
+    return {"passed": True, "skipped": False, "evidence": evidence, "evidence_path": evidence_path}
+
+
+def _has_preseeded_strict_inputs(run_dir: Path) -> bool:
+    pass_root = run_dir / "strict" / "passes"
+    return pass_root.exists() and any(path.is_file() for path in pass_root.rglob("*"))
+
+
+def _resolve_strict_source_path(strict_root: Path, relative: str) -> Path:
+    root = strict_root.resolve()
+    path = (strict_root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise HTTPException(403, "Strict 来源路径不在授权目录内") from None
+    return path
+
+
+def _verify_strict_source_manifest(
+    strict_root: Path, manifest: dict, job_id: str, snapshot: dict,
+    output_spec: OutputSpec, policy_payload: dict, plan_payload: dict,
+) -> list[str]:
+    failures: list[str] = []
+    if manifest.get("job_id") != job_id:
+        failures.append("Strict 输入来源不属于当前 Job")
+    for field in ("plan_id", "plan_contract_id", "product_version_id", "owner_id"):
+        if manifest.get(field) != snapshot.get(field):
+            failures.append(f"Strict 输入来源 {field} 与 Run 快照不一致")
+    frames = manifest.get("frames") or {}
+    if frames.get("start_frame") != 1:
+        failures.append("Strict 输入来源 start_frame 必须为 1")
+    if frames.get("frame_count") != output_spec.frame_count:
+        failures.append("Strict 输入来源 frame_count 与冻结计划不一致")
+    if manifest.get("background_frame_offset", 0) != 0:
+        failures.append("Strict 输入来源 background_frame_offset 必须为 0")
+    background = manifest.get("background_workflow") or {}
+    if not _approved_background_workflow(policy_payload, background):
+        failures.append("背景工作流未出现在已冻结 STRICT 保真策略的批准列表")
+    layers = manifest.get("layers") or {}
+    required_layer_frames, plan_contract_failures = _required_layer_frame_contracts(
+        plan_payload, output_spec.frame_count
+    )
+    failures.extend(plan_contract_failures)
+    failures.extend(_strict_layer_contract_failures(
+        layers, policy_payload, snapshot.get("required_strict_layers"), required_layer_frames,
+        set(range(1, output_spec.frame_count + 1)),
+    ))
+    current_layers = _collect_strict_layer_files(strict_root)
+    expected_files: dict[str, str] = {}
+    for layer in (manifest.get("layers") or {}).values():
+        for file_entry in layer.get("files", []):
+            expected_files[file_entry["path"]] = file_entry.get("sha256", "")
+    current_files: dict[str, str] = {}
+    for layer in current_layers.values():
+        for file_entry in layer.get("files", []):
+            current_files[file_entry["path"]] = file_entry.get("sha256", "")
+    missing = sorted(set(expected_files) - set(current_files))
+    extra = sorted(set(current_files) - set(expected_files))
+    if missing:
+        failures.append(f"Strict 输入来源缺少文件：{missing[:8]}")
+    if extra:
+        failures.append(f"Strict 输入来源多出未注册文件：{extra[:8]}")
+    for relative, expected_hash in expected_files.items():
+        actual_hash = current_files.get(relative)
+        if actual_hash is None:
+            continue
+        if actual_hash.lower() != expected_hash.lower():
+            failures.append(f"Strict 输入文件已被替换：{relative}")
+    return failures
+
+
+def run_controlled_blender_passes(
+    job_id: str, worker_id: str, lease_epoch: int, asset: dict,
+    run_dir: Path, plan_path: Path, plan_snapshot: dict, output_spec: OutputSpec,
+    strict_snapshot: dict,
+) -> dict:
+    """Worker 掌控的真实 Blender 产品五通道受控渲染：发起、退出码、Pass 语义与逐文件 hash 证据。"""
+    with connect() as db:
+        require_active_lease(db, job_id, worker_id, lease_epoch)
+    with connect() as db:
+        failures = _controlled_render_contract_failures(db, asset, strict_snapshot, plan_snapshot)
+    if failures:
+        return {"passed": False, "failure": "受控渲染合同复核未通过: " + "；".join(failures[:12])}
+    if not BLENDER:
+        return {"passed": False, "failure": "Blender 未安装或未找到，不能启动受控产品渲染"}
+
+    strict_root = run_dir / "strict"
+    pass_root = strict_root / "passes"
+    pass_root.mkdir(parents=True, exist_ok=True)
+    command = build_controlled_blender_command(asset, strict_root, plan_path, output_spec)
+    blender_version = probe_blender_version(BLENDER)
+    update_job(job_id, status="RUNNING", stage="RENDER", progress=10)
+    try:
+        completed = run_controlled_blender_command(command)
+    except Exception as exc:
+        return {"passed": False, "failure": f"Blender 渲染进程启动失败: {exc}"}
+    stdout_text = _decode_process_text(completed.stdout)
+    stderr_text = _decode_process_text(completed.stderr)
+    if completed.returncode != 0:
+        detail = (stderr_text or stdout_text).strip()[-2000:]
+        return {"passed": False, "failure": f"Blender 渲染进程失败(exit={completed.returncode}): {detail}"}
+
+    update_job(job_id, stage="VERIFY", progress=80)
+    passes_report, passes_error = _run_controlled_pass_validation(pass_root, output_spec)
+    if passes_report is None:
+        return {"passed": False, "failure": passes_error or "五通道校验失败"}
+    if not passes_report.get("passed"):
+        detail = passes_report.get("failures", ["五通道校验未通过"])
+        return {"passed": False, "failure": "五通道校验未通过: " + "；".join(detail[:12])}
+
+    parsed_channels = _parse_blender_pass_channels(stdout_text)
+    generated_files: list[dict] = []
+    for path in sorted(strict_root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name in {CONTROLLED_RENDER_EVIDENCE_FILE, "passes_report.json"}:
+            continue
+        generated_files.append({
+            "path": path.relative_to(strict_root).as_posix(),
+            "sha256": _file_sha256(path),
+        })
+    evidence = {
+        "schema_version": "1.0",
+        "producer_control": "CONTROLLED_WORKER",
+        "worker_id": worker_id,
+        "lease_epoch": lease_epoch,
+        "blender_executable": str(BLENDER),
+        "blender_version": blender_version,
+        "render_script": str(BLENDER_SCRIPT),
+        "render_script_sha256": _file_sha256(BLENDER_SCRIPT),
+        "asset_id": asset["id"],
+        "asset_sha256": _file_sha256(Path(asset["path"])),
+        "product_version_id": strict_snapshot["product_version_id"],
+        "plan_contract_id": strict_snapshot["plan_contract_id"],
+        "plan_snapshot_sha256": plan_contract_payload_hash(plan_snapshot)[1],
+        "command": command,
+        "exit_code": completed.returncode,
+        "frames_requested": output_spec.frame_count,
+        "pass_semantics": parsed_channels,
+        "pass_layout": passes_report.get("layout"),
+        "generated_files": generated_files,
+    }
+    evidence_text = _canonical_json_text(evidence)
+    evidence_sha256 = hashlib.sha256(evidence_text.encode("utf-8")).hexdigest()
+    evidence_path = strict_root / CONTROLLED_RENDER_EVIDENCE_FILE
+    evidence_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+    verification_failures = verify_controlled_render_evidence(strict_root, evidence, Path(asset["path"]))
+    if verification_failures:
+        return {"passed": False, "failure": "受控渲染证据复核未通过: " + "；".join(verification_failures[:12])}
+
+    manifest = {
+        "schema_version": "1.0",
+        "job_id": job_id,
+        "plan_id": strict_snapshot["plan_id"],
+        "strict_mode": True,
+        "fidelity_snapshot": strict_snapshot,
+        "controlled_render_evidence": evidence,
+        "controlled_render_evidence_sha256": evidence_sha256,
+        "passes_report": passes_report,
+        "fidelity_complete": False,
+        "input_trust": CONTROLLED_BLENDER_PRODUCT_TRUST,
+        "width": output_spec.width,
+        "height": output_spec.height,
+        "fps": output_spec.fps,
+        "frame_count": output_spec.frame_count,
+        "duration_seconds": output_spec.duration_seconds,
+        "created_at": utc_now(),
+    }
+    manifest_path = run_dir / "metadata.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    with connect() as db:
+        begin_immediate(db)
+        require_active_lease(db, job_id, worker_id, lease_epoch)
+        now = utc_now()
+        db.execute(
+            "UPDATE runs SET controlled_render_evidence_json = ?, controlled_render_evidence_sha256 = ?, updated_at = ? WHERE job_id = ?",
+            (evidence_text, evidence_sha256, now, job_id),
+        )
+        append_job_event(db, job_id, "strict.render.controlled", {
+            "worker_id": worker_id,
+            "lease_epoch": lease_epoch,
+            "blender_version": blender_version,
+            "evidence_sha256": evidence_sha256,
+        })
+    return {"passed": True, "output": manifest_path, "manifest_path": manifest_path, "manifest": manifest}
+
+
+def _run_strict_source_validator(strict_root: Path, output_spec: OutputSpec) -> tuple[dict | None, str | None]:
+    report_path = strict_root / "source_report.json"
+    cmd = [
+        sys.executable, str(STRICT_SOURCE_VALIDATOR),
+        "--passes", str(strict_root / "passes"),
+        "--product", str(strict_root / "product"),
+        "--mask", str(strict_root / "mask"),
+        "--background", str(strict_root / "background"),
+        "--frames", str(output_spec.frame_count), "--start-frame", "1",
+        "--background-frame-offset", "0", "--json", str(report_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    report = _read_json_report(report_path)
+    if report is None:
+        detail = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()[-2000:]
+        return None, f"Strict 来源一致性校验执行失败: {detail}"
+    return report, None
+
+def run_strict_runtime_closure(job_id: str, run_dir: Path, plan_path: Path, output_spec: OutputSpec) -> dict:
+    """Strict Run 的 RENDER→COMPOSITE→QA 运行时闭环：真实读取并复核冻结引用，
+    运行通道校验器与 Strict 合成器，任一步失败都不能产出 SUCCEEDED。"""
+    with connect() as db:
+        snapshot = load_strict_run_snapshot(db, job_id)
+    if snapshot is None:
+        return {"passed": False, "failure": "Strict Run 缺少冻结快照"}
+
+    # 1) 复核冻结的 plan contract / review / policy 仍然有效且 hash 未漂移。
+    try:
+        with connect() as db:
+            contract = db.execute(
+                """
+                SELECT pc.*, pv.owner_id, pv.project_id
+                FROM plan_contracts pc
+                JOIN product_versions pv ON pv.id = pc.product_version_id
+                WHERE pc.id = ? AND pc.plan_id = ?
+                """,
+                (snapshot["plan_contract_id"], snapshot["plan_id"]),
+            ).fetchone()
+            if not contract:
+                raise HTTPException(404, "冻结合同不存在或不属于该计划")
+            if contract["owner_id"] != snapshot["owner_id"]:
+                raise HTTPException(403, "越权访问冻结合同")
+            latest = get_default_contract(snapshot["plan_id"], db, snapshot["owner_id"], contract["project_id"])
+            if not latest or contract["id"] != latest["id"]:
+                raise HTTPException(409, "计划已更新，旧保真审批已失效，请引用最新冻结合同")
+            frozen = freeze_fidelity_binding(
+                db, contract, snapshot["product_review_id"], snapshot["product_review_sha256"],
+                snapshot["fidelity_policy_id"], snapshot["fidelity_policy_sha256"], snapshot["owner_id"],
+            )
+            if frozen["product_review_sha256"] != snapshot["product_review_sha256"]:
+                raise HTTPException(409, "产品审核 hash 与 Run 快照不一致")
+            if frozen["fidelity_policy_sha256"] != snapshot["fidelity_policy_sha256"]:
+                raise HTTPException(409, "保真策略 hash 与 Run 快照不一致")
+    except HTTPException as exc:
+        return {"passed": False, "failure": f"{exc.status_code}: {exc.detail}"}
+
+    strict_root = run_dir / "strict"
+    pass_root = strict_root / "passes"
+    if not pass_root.exists():
+        return {"passed": False, "failure": "Strict Run 缺少五通道产物目录 strict/passes"}
+    try:
+        plan_payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"passed": False, "failure": f"Strict Run 缺少有效的 DirectorPlan 快照: {exc}"}
+
+    source_manifest = None
+    source_report = None
+    policy_payload: dict = {}
+    with connect() as db:
+        source_manifest = load_strict_source_manifest(db, job_id)
+        policy_row = db.execute(
+            "SELECT payload FROM fidelity_policies WHERE id = ?", (snapshot["fidelity_policy_id"],),
+        ).fetchone()
+        if policy_row:
+            try:
+                policy_payload = json.loads(policy_row["payload"])
+            except json.JSONDecodeError:
+                policy_payload = {}
+    background_evidence = load_background_evidence(strict_root)
+    if snapshot.get("background_workflow"):
+        if not background_evidence:
+            return {"passed": False, "failure": "Strict Run 绑定了 background_workflow 但缺少背景证据"}
+        approved_workflow = _matching_approved_background_workflow(
+            policy_payload, snapshot.get("background_workflow")
+        )
+        if approved_workflow is None:
+            return {"passed": False, "failure": "冻结 Run 背景工作流未出现在已批准 STRICT 策略列表"}
+        evidence_failures = verify_evidence_binding(
+            background_evidence, job_id, snapshot, approved_workflow.get("workflow_hash", "")
+        )
+        evidence_failures += verify_background_evidence_files(strict_root, background_evidence, output_spec)
+        if evidence_failures:
+            return {"passed": False, "failure": "背景证据运行后复核未通过: " + "；".join(evidence_failures[:12])}
+    if source_manifest is not None:
+        verification_failures = _verify_strict_source_manifest(
+            strict_root, source_manifest, job_id, snapshot, output_spec, policy_payload, plan_payload
+        )
+        if verification_failures:
+            return {"passed": False, "failure": "Strict 输入来源冻结复核未通过: " + "；".join(verification_failures[:12])}
+        source_report, source_error = _run_strict_source_validator(strict_root, output_spec)
+        if source_report is None:
+            return {"passed": False, "failure": source_error or "Strict 来源一致性校验失败"}
+        if not source_report.get("passed"):
+            failures = source_report.get("failures", ["Strict 来源一致性校验未通过"])
+            return {"passed": False, "failure": "Strict 来源一致性校验未通过: " + "；".join(failures[:12])}
+        input_manifest = source_manifest
+    else:
+        input_manifest, _ = build_strict_input_manifest(job_id, strict_root, snapshot)
+        required_layer_frames, plan_contract_failures = _required_layer_frame_contracts(
+            plan_payload, output_spec.frame_count
+        )
+        layer_contract_failures = _strict_layer_contract_failures(
+            _collect_strict_layer_files(strict_root), policy_payload,
+            snapshot.get("required_strict_layers"), required_layer_frames,
+            set(range(1, output_spec.frame_count + 1)),
+        )
+        if plan_contract_failures or layer_contract_failures:
+            return {"passed": False, "failure": "Strict 图层合同与冻结策略不一致: " + "；".join((plan_contract_failures + layer_contract_failures)[:12])}
+    input_manifest_sha256 = hashlib.sha256(_canonical_json_text(input_manifest).encode("utf-8")).hexdigest()
+    (strict_root / "input_manifest.json").write_text(
+        json.dumps(input_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # 2) 五通道真实校验（OpenEXR/Pillow，校验帧数、有限值、深度与法线）。
+    passes_report_path = strict_root / "passes_report.json"
+    pass_cmd = [
+        sys.executable, str(FIDELITY_PASS_VALIDATOR), "--passes", str(pass_root),
+        "--frames", str(output_spec.frame_count), "--start-frame", "1", "--json", str(passes_report_path),
+    ]
+    pass_result = subprocess.run(pass_cmd, capture_output=True)
+    passes_report = _read_json_report(passes_report_path)
+    if passes_report is None:
+        detail = (pass_result.stderr or pass_result.stdout or b"").decode("utf-8", "replace").strip()[-2000:]
+        return {"passed": False, "failure": f"五通道校验执行失败: {detail}"}
+    if not passes_report.get("passed"):
+        failures = passes_report.get("failures", ["五通道校验未通过"])
+        return {"passed": False, "failure": "五通道校验未通过: " + "；".join(failures[:12])}
+
+    # 3) 真实 Strict 合成与帧完整性 QA。
+    product_dir = strict_root / "product"
+    mask_dir = strict_root / "mask"
+    background_dir = strict_root / "background"
+    composite_out = strict_root / "composite_out"
+    for label, folder in (("产品层", product_dir), ("遮罩", mask_dir), ("背景", background_dir)):
+        if not folder.exists():
+            return {"passed": False, "failure": f"Strict Run 缺少{label}目录 strict/{folder.name}"}
+    strict_plan_path = strict_root / "strict_plan.json"
+    required_layer_frames, plan_contract_failures = _required_layer_frame_contracts(
+        plan_payload, output_spec.frame_count
+    )
+    strict_plan_path.write_text(
+        json.dumps({
+            "frame_count": output_spec.frame_count,
+            "start_frame": 1,
+            "background_frame_offset": 0,
+            "required_layers": {name: sorted(frames) for name, frames in required_layer_frames.items()},
+            "color_contract": STRICT_COLOR_CONTRACT,
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    composite_cmd = [
+        sys.executable, str(STRICT_COMPOSITE), "--product", str(product_dir), "--mask", str(mask_dir),
+        "--background", str(background_dir), "--out", str(composite_out), "--dilate", "0",
+        "--plan", str(strict_plan_path),
+        "--product-color-space", STRICT_COLOR_CONTRACT["product_color_space"],
+        "--background-color-space", STRICT_COLOR_CONTRACT["background_color_space"],
+        "--layer-color-space", STRICT_COLOR_CONTRACT["layer_color_space"],
+    ]
+    for layer_name in ("shadow", "reflection", "occlusion"):
+        layer_dir = strict_root / layer_name
+        if layer_dir.exists():
+            composite_cmd += [f"--{layer_name}", str(layer_dir)]
+    composite_result = subprocess.run(composite_cmd, capture_output=True)
+    composite_report = _read_json_report(composite_out / "composite_report.json")
+    if composite_report is None:
+        try:
+            composite_report = json.loads((composite_result.stdout or b"").decode("utf-8", "replace").strip())
+        except (ValueError, json.JSONDecodeError):
+            composite_report = None
+    if composite_report is None:
+        detail = (composite_result.stderr or composite_result.stdout or b"").decode("utf-8", "replace").strip()[-2000:]
+        return {"passed": False, "failure": f"Strict 合成执行失败: {detail}"}
+    if not composite_report.get("passed"):
+        failures = composite_report.get("failures", ["Strict 合成未通过"])
+        return {"passed": False, "failure": "Strict 合成 QA 未通过: " + "；".join(failures[:12])}
+
+    if not FFMPEG:
+        return {"passed": False, "failure": "FFmpeg 未安装或未找到"}
+    output = run_dir / "strict_preview.mp4"
+    encode = subprocess.run(
+        [FFMPEG, "-y", "-framerate", "24", "-start_number", "1", "-i", str(composite_out / "composite_%04d.png"),
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)],
+        capture_output=True,
+    )
+    if encode.returncode != 0 or not output.exists():
+        return {"passed": False, "failure": "Strict 合成帧编码失败: " + (encode.stderr or b"").decode("utf-8", "replace")[-2000:]}
+
+    plan_snapshot = json.loads(plan_path.read_text(encoding="utf-8"))
+    media_report = media_quality_report(output, plan_snapshot, output_spec, run_dir / "qa_strict")
+    media_report["computed_by"] = "productdirector.media_quality_report"
+    media_report["source_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
+    if not media_report["passed"]:
+        return {"passed": False, "failure": "Strict 编码成片媒体质量未通过: " + "；".join(media_report["failures"][:12])}
+    with connect() as db:
+        run_id = _latest_run_id_for_job(db, job_id)
+        review_row = db.execute(
+            "SELECT payload FROM product_reviews WHERE id = ?", (snapshot["product_review_id"],),
+        ).fetchone()
+        product_version = db.execute(
+            "SELECT project_id FROM product_versions WHERE id = ?", (snapshot["product_version_id"],),
+        ).fetchone()
+        if not review_row or not product_version:
+            return {"passed": False, "failure": "Strict QA 缺少冻结产品审核或产品版本"}
+        threshold_set = load_qa_threshold_set(
+            db, snapshot["owner_id"], product_version["project_id"], None, None
+        )
+        asset_row = db.execute(
+            "SELECT * FROM assets WHERE id = (SELECT asset_id FROM jobs WHERE id = ?)", (job_id,),
+        ).fetchone()
+        controlled_evidence = load_controlled_render_evidence(db, job_id)
+    asset_path = None
+    if asset_row:
+        asset = row_to_dict(asset_row)
+        asset_path = Path(resolve_asset_path(asset))
+    review_payload = json.loads(review_row["payload"])
+    qa_report = strict_qa.run_strict_qa(
+        strict_root,
+        plan_snapshot,
+        output_spec,
+        snapshot,
+        policy_payload,
+        review_payload,
+        threshold_set["payload"],
+        controlled_evidence=controlled_evidence,
+        media_report=media_report,
+        media_file=output,
+        asset_path=asset_path,
+    )
+    (strict_root / "qa_report.json").write_text(
+        json.dumps(qa_report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if qa_report["fatal_failures"]:
+        return {
+            "passed": False,
+            "failure": "Strict QA 未通过: " + "；".join(qa_report["fatal_failures"][:12]),
+        }
+    manifest = {
+        "schema_version": "1.0",
+        "job_id": job_id,
+        "plan_id": snapshot["plan_id"],
+        "strict_mode": True,
+        "fidelity_snapshot": snapshot,
+        "input_manifest": input_manifest,
+        "input_manifest_sha256": input_manifest_sha256,
+        "source_manifest": source_manifest,
+        "source_report": source_report,
+        "fidelity_complete": False,
+        "input_trust": (
+            "REGISTERED_LOCAL_SAMPLE"
+            if source_manifest is not None
+            else "CONTROLLED_IMPORT_VERIFICATION_SAMPLE"
+            if background_evidence and background_evidence.get("source_provenance") == "CONTROLLED_IMPORT"
+            else "PRESEEDED_LOCAL_SAMPLE"
+        ),
+        "passes_report": passes_report,
+        "composite_report": composite_report,
+        "composite_output_sha256": _strict_tree_sha256(composite_out),
+        "output_sha256": _file_sha256(output),
+        "qa_report": qa_report,
+        "qa_threshold_set": {
+            "id": threshold_set["id"],
+            "version": threshold_set["threshold_set_version"],
+            "payload_sha256": threshold_set["payload_sha256"],
+        },
+        "background_evidence": background_evidence,
+        "width": output_spec.width,
+        "height": output_spec.height,
+        "fps": output_spec.fps,
+        "frame_count": output_spec.frame_count,
+        "duration_seconds": output_spec.duration_seconds,
+        "director_plan": plan_snapshot,
+        "created_at": utc_now(),
+    }
+    manifest_path = run_dir / "metadata.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest_sha256 = hashlib.sha256(_canonical_json_text(manifest).encode("utf-8")).hexdigest()
+    with connect() as db:
+        _persist_qa_report(db, run_id, job_id, qa_report, threshold_set, manifest_sha256)
+    return {"passed": True, "output": output, "manifest_path": manifest_path, "manifest": manifest}
+
 def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
     lease = LeaseContext(job_id=job_id, worker_id=worker_id, lease_epoch=lease_epoch)
     keeper = HeartbeatKeeper(job_id, worker_id, lease_epoch)
@@ -1813,6 +3614,65 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"任务缺少有效的 DirectorPlan 快照: {exc}") from exc
         output_spec = OutputSpec.model_validate(plan_snapshot.get("output", {}))
+        with connect() as db:
+            strict_snapshot = load_strict_run_snapshot(db, job_id)
+        if strict_snapshot is not None:
+            with connect() as db:
+                source_manifest = load_strict_source_manifest(db, job_id)
+                controlled_evidence = load_controlled_render_evidence(db, job_id)
+                policy_row = db.execute(
+                    "SELECT payload FROM fidelity_policies WHERE id = ?",
+                    (strict_snapshot["fidelity_policy_id"],),
+                ).fetchone()
+            policy_payload = json.loads(policy_row["payload"]) if policy_row else {}
+            if source_manifest is None and controlled_evidence is None and not _has_preseeded_strict_inputs(run_dir):
+                controlled_result = run_controlled_blender_passes(
+                    job_id, worker_id, lease_epoch, asset, run_dir, plan_path,
+                    plan_snapshot, output_spec, strict_snapshot,
+                )
+                if not controlled_result["passed"]:
+                    update_job(job_id, status="QA_REJECTED", stage="QA_REJECTED", error=controlled_result["failure"], progress=100)
+                    release_worker_lease(job_id, worker_id, lease_epoch, "worker.failed", {"error": controlled_result["failure"]})
+                    return
+                background_result = run_controlled_background_producer(
+                    job_id, worker_id, lease_epoch, run_dir, output_spec,
+                    strict_snapshot, policy_payload,
+                )
+                if not background_result.get("skipped") and not background_result["passed"]:
+                    update_job(job_id, status="QA_REJECTED", stage="QA_REJECTED", error=background_result["failure"], progress=100)
+                    release_worker_lease(job_id, worker_id, lease_epoch, "worker.failed", {"error": background_result["failure"]})
+                    return
+                if strict_snapshot.get("background_workflow"):
+                    strict_result = run_strict_runtime_closure(job_id, run_dir, plan_path, output_spec)
+                    if not strict_result["passed"]:
+                        update_job(job_id, status="QA_REJECTED", stage="QA_REJECTED", error=strict_result["failure"], progress=100)
+                        release_worker_lease(job_id, worker_id, lease_epoch, "worker.failed", {"error": strict_result["failure"]})
+                        return
+                    update_job(job_id, status=VERIFICATION_PASSED, stage="VERIFIED_SAMPLE", progress=100,
+                               output_path=_storage_reference(job_id, str(strict_result["output"])),
+                               manifest_path=_storage_reference(job_id, str(strict_result["manifest_path"])),
+                               error=None)
+                    release_worker_lease(job_id, worker_id, lease_epoch, "worker.completed")
+                    return
+                update_job(
+                    job_id, status=VERIFICATION_PASSED, stage="VERIFIED_SAMPLE", progress=100,
+                    output_path=_storage_reference(job_id, str(controlled_result["manifest_path"])),
+                    manifest_path=_storage_reference(job_id, str(controlled_result["manifest_path"])),
+                    error=None,
+                )
+                release_worker_lease(job_id, worker_id, lease_epoch, "worker.completed")
+                return
+            strict_result = run_strict_runtime_closure(job_id, run_dir, plan_path, output_spec)
+            if not strict_result["passed"]:
+                update_job(job_id, status="QA_REJECTED", stage="QA_REJECTED", error=strict_result["failure"], progress=100)
+                release_worker_lease(job_id, worker_id, lease_epoch, "worker.failed", {"error": strict_result["failure"]})
+                return
+            update_job(job_id, status=VERIFICATION_PASSED, stage="VERIFIED_SAMPLE", progress=100,
+                       output_path=_storage_reference(job_id, str(strict_result["output"])),
+                       manifest_path=_storage_reference(job_id, str(strict_result["manifest_path"])),
+                       error=None)
+            release_worker_lease(job_id, worker_id, lease_epoch, "worker.completed")
+            return
         output = run_dir / "preview.mp4"
         if asset["kind"] == "model":
             render_glb_job(job_id, asset, run_dir, output, plan_path, output_spec)
@@ -2957,6 +4817,7 @@ def create_fidelity_policy(product_version_id: str, request: FidelityPolicyReque
         "mode": request.mode,
         "protected_regions": [region.model_dump() for region in request.protected_regions],
         "allowed_operations": list(request.allowed_operations),
+        "background_workflows": [item.model_dump() for item in request.background_workflows],
         "notes": request.notes,
     }
     payload_text = json.dumps(policy, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -2993,6 +4854,228 @@ def list_fidelity_policies(
             (product_version_id,),
         ).fetchall()
     return [fidelity_policy_public(row) for row in rows]
+
+
+def qa_threshold_set_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "owner_id": row["owner_id"],
+        "project_id": row["project_id"],
+        "product_version_id": row["product_version_id"],
+        "threshold_set_version": row["threshold_set_version"],
+        "payload_sha256": row["payload_sha256"],
+        "created_at": row["created_at"],
+        "thresholds": json.loads(row["payload"]),
+    }
+
+
+@app.post("/api/v1/qa-threshold-sets", status_code=201)
+def create_qa_threshold_set(request: QaThresholdSetRequest) -> dict:
+    owner_id, _, project_id = normalize_contract_context(request.owner_id, request.project_id)
+    if request.product_version_id is not None:
+        load_product_version_for_owner(request.product_version_id, owner_id, project_id)
+    payload = _validate_qa_threshold_payload({
+        **request.thresholds,
+        "threshold_set_version": request.threshold_set_version,
+        "threshold_set_id": hashlib.sha256(
+            json.dumps(request.thresholds, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:32],
+    })
+    payload_text = _canonical_json_text(payload)
+    digest = _qa_threshold_payload_sha256(payload)
+    with connect() as db:
+        begin_immediate(db)
+        existing = db.execute(
+            "SELECT id FROM qa_threshold_sets WHERE owner_id = ? AND project_id = ? AND product_version_id IS ? AND threshold_set_version = ?",
+            (owner_id, project_id, request.product_version_id, request.threshold_set_version),
+        ).fetchone()
+        if existing:
+            raise HTTPException(409, "同名 QA 阈值集已冻结，请使用新版本号")
+        db.execute(
+            "INSERT INTO qa_threshold_sets(id, owner_id, project_id, product_version_id, threshold_set_version, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                payload["threshold_set_id"], owner_id, project_id, request.product_version_id,
+                request.threshold_set_version, payload_text, digest, utc_now(),
+            ),
+        )
+        row = db.execute("SELECT * FROM qa_threshold_sets WHERE id = ?", (payload["threshold_set_id"],)).fetchone()
+    return qa_threshold_set_public(row)
+
+
+@app.get("/api/v1/qa-threshold-sets")
+def list_qa_threshold_sets(
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+    product_version_id: str | None = None,
+) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        if product_version_id is None:
+            rows = db.execute(
+                "SELECT * FROM qa_threshold_sets WHERE owner_id = ? AND project_id = ? ORDER BY created_at DESC",
+                (owner_id, project_id),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM qa_threshold_sets WHERE owner_id = ? AND project_id = ? AND (product_version_id IS NULL OR product_version_id = ?) ORDER BY created_at DESC",
+                (owner_id, project_id, product_version_id),
+            ).fetchall()
+    return [qa_threshold_set_public(row) for row in rows]
+
+
+def qa_report_public(row, db=None) -> dict:
+    payload = {
+        "id": row["id"],
+        "run_id": row["run_id"],
+        "job_id": row["job_id"],
+        "threshold_set_id": row["threshold_set_id"],
+        "threshold_set_version": row["threshold_set_version"],
+        "payload_sha256": row["payload_sha256"],
+        "status": row["status"],
+        "manifest_sha256": row["manifest_sha256"],
+        "binding_sha256": row["binding_sha256"],
+        "decision": row["decision"],
+        "decision_notes": row["decision_notes"],
+        "decision_manifest_sha256": row["decision_manifest_sha256"],
+        "decided_at": row["decided_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "report": json.loads(row["payload"]),
+    }
+    if db is None:
+        payload["decision_valid"] = None
+        payload["effective_decision"] = row["decision"]
+        payload["decision_invalid_reason"] = None
+    else:
+        validity = _qa_report_decision_validity(db, row)
+        payload["decision_valid"] = validity["decision_valid"]
+        payload["effective_decision"] = validity["effective_decision"]
+        payload["decision_invalid_reason"] = validity["reason"]
+    return payload
+
+
+@app.post("/api/v1/runs/{run_id}/qa")
+def run_qa_for_run(run_id: str, request: QaRunRequest | None = None) -> dict:
+    request = request or QaRunRequest()
+    resolve_run_owner_scope(run_id)
+    with connect() as db:
+        context = _qa_run_context(db, run_id)
+        threshold_set = load_qa_threshold_set(
+            db,
+            context["run"]["owner_id"],
+            context["run"].get("project_id") or DEFAULT_PROJECT_ID,
+            request.threshold_set_id,
+            request.threshold_set_version,
+            context["snapshot"].get("product_version_id"),
+        )
+    run_dir = RUNS / context["job_id"]
+    strict_root = run_dir / "strict"
+    output = run_dir / "strict_preview.mp4"
+    media_report = None
+    if output.exists() and FFMPEG:
+        media_report = media_quality_report(output, context["plan_payload"], context["output_spec"], run_dir / "qa_strict_api")
+        media_report["computed_by"] = "productdirector.media_quality_report"
+        media_report["source_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
+    qa_report = strict_qa.run_strict_qa(
+        strict_root,
+        context["plan_payload"],
+        context["output_spec"],
+        context["snapshot"],
+        context["policy_payload"],
+        context["review_payload"],
+        threshold_set["payload"],
+        controlled_evidence=context["controlled_evidence"],
+        media_report=media_report,
+        media_file=output if output.exists() else None,
+        asset_path=context["asset_path"],
+    )
+    (strict_root / "qa_report.json").write_text(json.dumps(qa_report, ensure_ascii=False, indent=2), encoding="utf-8")
+    job = get_job(context["job_id"])
+    manifest = _job_manifest_payload(context["job_id"], job.get("manifest_path"))
+    if not isinstance(manifest, dict):
+        raise HTTPException(409, "Run 尚未生成可信 manifest，不能绑定 QA 审批")
+    manifest_sha256 = hashlib.sha256(_canonical_json_text(manifest).encode("utf-8")).hexdigest()
+    with connect() as db:
+        report_id = _persist_qa_report(db, run_id, context["job_id"], qa_report, threshold_set, manifest_sha256)
+    if qa_report["fatal_failures"]:
+        update_job(context["job_id"], status="QA_REJECTED", stage="QA_REJECTED", error="；".join(qa_report["fatal_failures"][:12]), progress=100)
+    return {
+        "run_id": run_id,
+        "job_id": context["job_id"],
+        "qa_report_id": report_id,
+        "manifest_sha256": manifest_sha256,
+        "status": qa_report["status"],
+        "fatal_failures": qa_report["fatal_failures"],
+        "not_verified": qa_report["not_verified"],
+    }
+
+
+@app.get("/api/v1/qa-reports/{report_id}")
+def get_qa_report(report_id: str) -> dict:
+    with connect() as db:
+        row = db.execute("SELECT * FROM qa_reports WHERE id = ?", (report_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "QA 报告不存在")
+        resolve_run_owner_scope(row["run_id"])
+        return qa_report_public(row, db)
+
+
+@app.post("/api/v1/qa-reports/{report_id}/decisions")
+def decide_qa_report(report_id: str, request: QaDecisionRequest) -> dict:
+    with connect() as db:
+        row = db.execute("SELECT * FROM qa_reports WHERE id = ?", (report_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "QA 报告不存在")
+    with connect() as db:
+        latest = db.execute(
+            "SELECT id FROM qa_reports WHERE job_id = ? ORDER BY created_at DESC, updated_at DESC LIMIT 1",
+            (row["job_id"],),
+        ).fetchone()
+        if not latest or latest["id"] != report_id:
+            raise HTTPException(409, "已有更新的 QA 报告，旧报告不能审批")
+    resolve_run_owner_scope(row["run_id"])
+    with connect() as db:
+        context = _qa_run_context(db, row["run_id"])
+    job = get_job(context["job_id"])
+    manifest = _job_manifest_payload(context["job_id"], job.get("manifest_path"))
+    if not isinstance(manifest, dict):
+        raise HTTPException(409, "当前 Job 缺少可信 manifest 文件，不能批准")
+    current_manifest_sha256 = hashlib.sha256(_canonical_json_text(manifest).encode("utf-8")).hexdigest()
+    if request.manifest_hash.lower() != current_manifest_sha256:
+        raise HTTPException(409, "manifest_hash 与 QA 报告绑定清单不一致")
+    if request.manifest_hash.lower() != (row["manifest_sha256"] or "").lower():
+        raise HTTPException(409, "manifest_hash 与 QA 报告当前清单不一致")
+    manifest_qa_report = manifest.get("qa_report")
+    if not isinstance(manifest_qa_report, dict):
+        raise HTTPException(409, "Manifest 缺少 QA 报告，不能批准")
+    if hashlib.sha256(_canonical_json_text(manifest_qa_report).encode("utf-8")).hexdigest() != row["payload_sha256"]:
+        raise HTTPException(409, "Manifest 中的 QA 报告与已冻结报告不一致")
+    bound_failures = _verify_manifest_bound_files(context["job_id"], manifest, context["output_spec"])
+    if bound_failures:
+        raise HTTPException(409, "Strict 输入/产物已变化: " + "；".join(bound_failures[:8]))
+    if request.decision == "APPROVED":
+        if row["status"] != "PASS":
+            raise HTTPException(409, "QA 状态不是 PASS，不能批准为 Strict 成果")
+    with connect() as db:
+        begin_immediate(db)
+        latest = db.execute("SELECT * FROM qa_reports WHERE id = ?", (report_id,)).fetchone()
+        current_binding = _qa_binding_sha256(
+            db,
+            latest["run_id"],
+            current_manifest_sha256,
+            db.execute("SELECT payload_sha256 FROM qa_threshold_sets WHERE id = ?", (latest["threshold_set_id"],)).fetchone()["payload_sha256"],
+            latest["payload_sha256"],
+        )
+        if current_binding != latest["binding_sha256"]:
+            raise HTTPException(409, "QA 绑定输入已变化，旧批准/决策失效")
+        now = utc_now()
+        db.execute(
+            "UPDATE qa_reports SET decision = ?, decision_notes = ?, decision_manifest_sha256 = ?, decided_at = ?, updated_at = ? WHERE id = ?",
+            (request.decision, request.notes, request.manifest_hash.lower(), now, now, report_id),
+        )
+        updated = db.execute("SELECT * FROM qa_reports WHERE id = ?", (report_id,)).fetchone()
+    return qa_report_public(updated, db)
 
 
 @app.post("/api/v1/product-versions/{product_version_id}/approve")
@@ -3073,13 +5156,22 @@ def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
         asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan["product_asset_id"],)).fetchone()
         if not asset:
             raise HTTPException(409, "计划绑定的产品素材不存在")
-        run_hash = plan_contract_payload_hash(json.loads(plan["payload"]))[1]
-        run_id, job_id, created_new = create_run_record(
+        run_hash = fidelity_run_request_hash(plan_contract_payload_hash(json.loads(plan["payload"]))[1], request)
+        run_id, job_id, created_new, fidelity_snapshot = create_run_record(
             plan,
             owner_id,
             project_id,
             request.idempotency_key,
             run_hash,
+            plan_contract_id=request.plan_contract_id,
+            product_review_id=request.product_review_id,
+            product_review_sha256=request.product_review_sha256,
+            fidelity_policy_id=request.fidelity_policy_id,
+            fidelity_policy_sha256=request.fidelity_policy_sha256,
+            require_fidelity_snapshot=request.require_fidelity_snapshot,
+            background_workflow=request.background_workflow,
+            background_source_mode=request.background_source_mode,
+            required_strict_layers=_required_strict_layers_from_plan(plan_snapshot),
         )
         if created_new:
             run_dir = RUNS / job_id
@@ -3095,10 +5187,133 @@ def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
         "run_id": run_id,
         "status": "QUEUED",
         "status_url": f"/api/v1/jobs/{job_id}",
+        "fidelity_snapshot": fidelity_snapshot,
         "reused_idempotent": not created_new,
         "created": created_new,
     }
 
+
+
+@app.post("/api/v1/runs/{run_id}/strict-source-manifest")
+def register_strict_sources(
+    run_id: str,
+    request: StrictSourceManifestRequest,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> dict:
+    """在 Run 执行前冻结真实 Strict 层来源；只验证文件与身份，不升级发布资格。"""
+    resolve_run_owner_scope(run_id, owner_id=owner_id, project_id=project_id)
+    with connect() as db:
+        begin_immediate(db)
+        run = db.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(404, "Run 不存在")
+        if run["status"] != "QUEUED":
+            raise HTTPException(409, "Strict 输入来源只能在 Run 领取/执行前冻结")
+        if run["strict_source_manifest_json"]:
+            raise HTTPException(409, "Strict 输入来源已冻结")
+        if not run["fidelity_snapshot_json"]:
+            raise HTTPException(409, "非 Strict Run 不能注册 Strict 输入来源")
+        snapshot = json.loads(run["fidelity_snapshot_json"])
+        contract = db.execute(
+            """
+            SELECT pc.*, pv.product_asset_id, pv.owner_id, pv.project_id
+            FROM plan_contracts pc
+            JOIN product_versions pv ON pv.id = pc.product_version_id
+            WHERE pc.id = ? AND pc.plan_id = ?
+            """,
+            (run["plan_contract_id"], run["plan_id"]),
+        ).fetchone()
+        if not contract:
+            raise HTTPException(404, "冻结合同不存在或不属于该计划")
+        if contract["owner_id"] != run["owner_id"] or contract["project_id"] != project_id:
+            raise HTTPException(403, "越权访问冻结合同")
+        latest = get_default_contract(run["plan_id"], db, run["owner_id"], contract["project_id"])
+        if not latest or latest["id"] != contract["id"]:
+            raise HTTPException(409, "计划已更新，旧保真审批已失效，请引用最新冻结合同")
+        frozen = freeze_fidelity_binding(
+            db, contract, snapshot["product_review_id"], snapshot["product_review_sha256"],
+            snapshot["fidelity_policy_id"], snapshot["fidelity_policy_sha256"], run["owner_id"],
+        )
+        if frozen["product_review_sha256"] != snapshot["product_review_sha256"]:
+            raise HTTPException(409, "产品审核 hash 与 Run 快照不一致")
+        if frozen["fidelity_policy_sha256"] != snapshot["fidelity_policy_sha256"]:
+            raise HTTPException(409, "保真策略 hash 与 Run 快照不一致")
+        policy_row = db.execute(
+            "SELECT payload, payload_sha256 FROM fidelity_policies WHERE id = ?", (snapshot["fidelity_policy_id"],),
+        ).fetchone()
+        if not policy_row:
+            raise HTTPException(404, "冻结保真策略不存在")
+        policy_payload = json.loads(policy_row["payload"])
+        if policy_payload.get("mode") != "STRICT":
+            raise HTTPException(409, "Strict Run 仅接受 STRICT 保真策略")
+        background = request.background_workflow.model_dump()
+        background["output_ref"] = "strict/background"
+        if not _approved_background_workflow(policy_payload, background):
+            raise HTTPException(409, "背景工作流未出现在已冻结 STRICT 保真策略的批准列表")
+        plan_row = db.execute("SELECT payload FROM plans WHERE id = ?", (run["plan_id"],)).fetchone()
+        if not plan_row:
+            raise HTTPException(404, "计划不存在")
+        plan_snapshot = json.loads(plan_row["payload"])
+        output_spec = OutputSpec.model_validate(plan_snapshot.get("output", {}))
+        job_id = run["job_id"]
+        strict_root = RUNS / job_id / "strict"
+        for folder in ("passes", "product", "mask", "background"):
+            if not (strict_root / folder).exists():
+                raise HTTPException(409, f"缺少 Strict 层目录 strict/{folder}")
+        layers = _collect_strict_layer_files(strict_root)
+        required_layer_frames, plan_contract_failures = _required_layer_frame_contracts(
+            plan_snapshot, output_spec.frame_count
+        )
+        layer_contract_failures = _strict_layer_contract_failures(
+            layers, policy_payload, snapshot.get("required_strict_layers"), required_layer_frames,
+            set(range(1, output_spec.frame_count + 1)),
+        )
+        if plan_contract_failures or layer_contract_failures:
+            raise HTTPException(409, "Strict 图层合同与冻结策略不一致: " + "；".join((plan_contract_failures + layer_contract_failures)[:12]))
+        source_report, source_error = _run_strict_source_validator(strict_root, output_spec)
+        if source_report is None:
+            raise HTTPException(409, source_error or "Strict 来源一致性校验失败")
+        if not source_report.get("passed"):
+            failures = source_report.get("failures", ["Strict 来源一致性校验未通过"])
+            raise HTTPException(409, "Strict 来源一致性校验未通过: " + "；".join(failures[:12]))
+        manifest = {
+            "schema_version": "1.0",
+            "run_id": run_id,
+            "job_id": job_id,
+            "plan_id": run["plan_id"],
+            "plan_contract_id": contract["id"],
+            "product_version_id": snapshot["product_version_id"],
+            "asset_id": contract["product_asset_id"],
+            "owner_id": run["owner_id"],
+            "fidelity_policy_id": snapshot["fidelity_policy_id"],
+            "fidelity_complete": False,
+            "input_trust": "REGISTERED_LOCAL_SAMPLE",
+            "render_evidence": request.render_evidence.model_dump(),
+            "background_workflow": background,
+            "frames": {"start_frame": 1, "frame_count": output_spec.frame_count},
+            "background_frame_offset": 0,
+            "layers": layers,
+        }
+        manifest_text = _canonical_json_text(manifest)
+        manifest_sha256 = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
+        (strict_root / "source_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        now = utc_now()
+        db.execute(
+            "UPDATE runs SET strict_source_manifest_json = ?, strict_source_manifest_sha256 = ?, updated_at = ? WHERE id = ?",
+            (manifest_text, manifest_sha256, now, run_id),
+        )
+        append_job_event(db, job_id, "strict.sources.registered", {"manifest_sha256": manifest_sha256})
+    return {
+        "run_id": run_id,
+        "job_id": job_id,
+        "manifest_sha256": manifest_sha256,
+        "source_report": source_report,
+        "fidelity_complete": False,
+        "status_url": f"/api/v1/jobs/{job_id}",
+    }
 
 @app.get("/api/v1/jobs")
 def list_jobs(owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJECT_ID) -> list[dict]:
@@ -3127,9 +5342,29 @@ def job_detail(
     project_id: str = DEFAULT_PROJECT_ID,
 ) -> dict:
     resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
-    return get_job(job_id)
+    job = get_job(job_id)
+    eligibility = job_release_eligibility(job)
+    job["release_eligible"] = eligibility["eligible"]
+    job["release_status"] = eligibility
+    return job
 
 
+
+
+@app.get("/api/v1/jobs/{job_id}/release-status")
+def job_release_status(
+    job_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> dict:
+    """下游聚合/发布前必须查询的资格门；资格 false 时不提供可发布成果引用。"""
+    resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
+    job = get_job(job_id)
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        **job_release_eligibility(job),
+    }
 @app.post("/api/v1/jobs/{job_id}/cancel")
 def cancel_job(
     job_id: str,
@@ -3138,7 +5373,7 @@ def cancel_job(
 ) -> dict:
     resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
     job = get_job(job_id)
-    if job["status"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+    if job["status"] in TERMINAL_JOB_STATUSES:
         return job
     update_job(job_id, cancel_requested=1, status="CANCEL_REQUESTED")
     with process_lock:
@@ -3396,7 +5631,7 @@ def job_video(
 ):
     resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
     job = get_job(job_id)
-    if job["status"] != "SUCCEEDED" or not job["output_path"]:
+    if job["status"] not in {"SUCCEEDED", VERIFICATION_PASSED} or not job["output_path"]:
         raise HTTPException(409, "视频尚未准备完成")
     return FileResponse(
         _resolve_job_artifact_path(job_id, job["output_path"]),
@@ -3413,7 +5648,7 @@ def job_manifest(
 ):
     resolve_job_owner_scope(job_id, owner_id=owner_id, project_id=project_id)
     job = get_job(job_id)
-    if job["status"] != "SUCCEEDED" or not job["manifest_path"]:
+    if job["status"] not in {"SUCCEEDED", VERIFICATION_PASSED} or not job["manifest_path"]:
         raise HTTPException(409, "清单尚未准备完成")
     return FileResponse(
         _resolve_job_artifact_path(job_id, job["manifest_path"]),

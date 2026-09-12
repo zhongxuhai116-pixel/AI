@@ -102,6 +102,16 @@ CREATE TABLE IF NOT EXISTS runs (
   progress INTEGER NOT NULL,
   job_id TEXT NOT NULL REFERENCES jobs(id),
   attempt_count INTEGER NOT NULL DEFAULT 1,
+  product_review_id TEXT,
+  product_review_sha256 TEXT,
+  fidelity_policy_id TEXT,
+  fidelity_policy_version INTEGER,
+  fidelity_policy_sha256 TEXT,
+  fidelity_snapshot_json TEXT,
+  strict_source_manifest_json TEXT,
+  strict_source_manifest_sha256 TEXT,
+  controlled_render_evidence_json TEXT,
+  controlled_render_evidence_sha256 TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -202,4 +212,35 @@ CREATE TABLE IF NOT EXISTS product_reviews (
   payload_sha256 TEXT NOT NULL,
   reviewer TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS qa_threshold_sets (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  product_version_id TEXT REFERENCES product_versions(id),
+  threshold_set_version TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (owner_id, project_id, product_version_id, threshold_set_version)
+);
+
+CREATE TABLE IF NOT EXISTS qa_reports (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  threshold_set_id TEXT NOT NULL REFERENCES qa_threshold_sets(id),
+  threshold_set_version TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  status TEXT NOT NULL,
+  manifest_sha256 TEXT,
+  binding_sha256 TEXT,
+  decision TEXT,
+  decision_notes TEXT,
+  decision_manifest_sha256 TEXT,
+  decided_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );

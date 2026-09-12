@@ -45,7 +45,8 @@ function Pill({ status = "DRAFT" }) {
   const map = {
     DRAFT: ["草稿", "neutral"], QUEUED: ["排队中", "queued"], RUNNING: ["生成中", "running"],
     CANCEL_REQUESTED: ["取消中", "warning"], CANCELLED: ["已取消", "neutral"],
-    FAILED: ["失败", "danger"], SUCCEEDED: ["已完成", "success"],
+    FAILED: ["失败", "danger"], QA_REJECTED: ["质检驳回", "danger"],
+    SUCCEEDED: ["已完成", "success"], VERIFICATION_PASSED: ["验证通过·不可发布", "warning"],
   };
   const [text, tone] = map[status] || [status, "neutral"];
   return <span className={`pill ${tone}`}><i />{text}</span>;
@@ -108,11 +109,12 @@ function Header({ connected, onSearch }) {
 }
 
 function Steps({ asset, plan, job }) {
+  const verifiedOnly = job?.status === "VERIFICATION_PASSED";
   const list = [
     ["1", "产品素材", asset ? "已选择" : "图片 / GLB", Image, !!asset],
     ["2", "生成分镜", plan ? "3 个 Shot" : "模板导演", FilmSlate, !!plan],
-    ["3", "生成预演", job?.stage || "等待执行", Camera, job?.status === "SUCCEEDED"],
-    ["4", "技术检查", job?.status === "SUCCEEDED" ? "已通过" : "自动校验", ListChecks, job?.status === "SUCCEEDED"],
+    ["3", "生成预演", job?.stage || "等待执行", Camera, job?.status === "SUCCEEDED" || verifiedOnly],
+    ["4", "技术检查", job?.status === "SUCCEEDED" ? "已通过" : verifiedOnly ? "验证通过·不可发布" : "自动校验", ListChecks, job?.status === "SUCCEEDED" || verifiedOnly],
   ];
   return <div className="steps">{list.map(([n, title, sub, Icon, done], index) => <div className={done ? "done" : ""} key={title}><em>{done ? <Check /> : <Icon />}</em><p><b>{n} {title}</b><small>{sub}</small></p>{index < 3 && <CaretRight className="arrow" />}</div>)}</div>;
 }
@@ -171,14 +173,16 @@ function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnc
 function RenderCard({ health, plan, job, onRender, onCancel, onRetry }) {
   const active = ["QUEUED", "RUNNING", "CANCEL_REQUESTED"].includes(job?.status);
   const retryable = ["FAILED", "CANCELLED", "CANCEL_REQUESTED"].includes(job?.status);
+  const verificationOnly = job?.status === "VERIFICATION_PASSED";
+  const releaseReason = job?.release_status?.reason;
   return <section className="card render-card">
     <div className="card-head"><div><h2>执行与检查</h2><i>?</i></div>{job && <Pill status={job.status} />}</div>
     <div className="env">{[["Blender", health?.blender, Cube], ["FFmpeg", health?.ffmpeg, FilmSlate]].map(([name, value, Icon]) => <div key={name}><em className={value?.available ? "ok" : "off"}><Icon /></em><p><strong>{name}</strong><small>{value?.available ? "本机已就绪" : "未连接"}</small></p></div>)}</div>
-    {job ? <div className="job-box"><div><span>{job.stage}</span><strong>{job.progress}%</strong></div><div className="progress"><i style={{ width: `${job.progress}%` }} /></div><small>{job.status === "FAILED" ? job.error : job.status === "SUCCEEDED" ? "视频与 metadata 已完成基础检查" : "任务在后台执行，刷新页面也不会丢失。"}</small></div> : <div className="empty-job"><Clock /><span>确认分镜后创建第一条预演任务</span></div>}
+    {job ? <div className="job-box"><div><span>{job.stage}</span><strong>{job.progress}%</strong></div><div className="progress"><i style={{ width: `${job.progress}%` }} /></div><small>{job.status === "FAILED" ? job.error : verificationOnly ? (releaseReason || "验证小样已完成，但不可发布或继承 Strict PASS") : job.status === "SUCCEEDED" ? "视频与 metadata 已完成基础检查" : "任务在后台执行，刷新页面也不会丢失。"}</small></div> : <div className="empty-job"><Clock /><span>确认分镜后创建第一条预演任务</span></div>}
     <div className="render-actions">
       {active ? <button className="danger" onClick={onCancel}><StopCircle />取消任务</button> : <button className="primary" disabled={!plan} onClick={onRender}><Play weight="fill" />确认计划并生成预演</button>}
       {retryable && <button onClick={onRetry}><ArrowClockwise />重试任务</button>}
-      {job?.status === "SUCCEEDED" && <><a href={`${API}/jobs/${job.id}/video`} target="_blank"><DownloadSimple />下载 MP4</a><a className="icon-link" title="下载 metadata" href={`${API}/jobs/${job.id}/manifest`} target="_blank"><BoxArrowDown /></a></>}
+      {(job?.status === "SUCCEEDED" || verificationOnly) && <><a href={`${API}/jobs/${job.id}/video`} target="_blank"><DownloadSimple />{verificationOnly ? "下载验证 MP4" : "下载 MP4"}</a><a className="icon-link" title={verificationOnly ? "下载验证小样 metadata（不可发布）" : "下载 metadata"} href={`${API}/jobs/${job.id}/manifest`} target="_blank"><BoxArrowDown /></a></>}
     </div>
   </section>;
 }

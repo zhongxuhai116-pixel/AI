@@ -4,3 +4,6 @@ python-multipart==0.0.20
 pydantic==2.11.7
 pillow==11.3.0
 cryptography==46.0.3
+
+numpy==2.2.6
+OpenEXR==3.4.15
