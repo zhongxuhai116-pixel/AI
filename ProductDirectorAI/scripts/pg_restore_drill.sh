@@ -18,7 +18,7 @@ WORK_DIR="${PD_DRILL_DIR:-/home/ubuntu/pd-pg-drill}"
 SRC_DB="${PD_SRC_DB:-productdirector_drill}"
 DST_DB="productdirector_drill_restore"
 
-TABLES=(owners workspaces projects assets product_versions plans plan_contracts jobs runs run_jobs job_attempts job_events auth_sessions provider_credentials)
+TABLES=(owners workspaces projects assets product_versions plans plan_contracts jobs runs run_jobs job_attempts job_events auth_sessions provider_credentials provider_jobs)
 
 if [ -z "$SQLITE_SOURCE" ]; then
   echo "用法: $0 <sqlite 源库路径>" >&2

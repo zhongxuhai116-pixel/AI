@@ -38,6 +38,7 @@ TABLES = [
     "job_events",
     "auth_sessions",
     "provider_credentials",
+    "provider_jobs",
 ]
 
 # SQLite 没有 BOOLEAN/BYTEA，拷贝时按列名转换，避免驱动报类型错误。
