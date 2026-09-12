@@ -39,4 +39,44 @@
 5. 老数据库自动增加素材 Owner 列默认归属原单 Owner；真实数据库切换前仍需私密备份和迁移演练。Linux 分支本轮通过模拟平台的单元测试，不代替真实 Linux 凭证保存验收。
 6. V1 完整合同、PostgreSQL/恢复、用户素材、质量和 A06/A07 门均未结清。用户已授权 V6，但不能越级验收。
 
+---
+
+## 远程 Worker 受限输入/输出通道（2026-09-12 追加）
+
+上面第 3 条已处理：Worker 不再必须与 API 同机读写数据库和文件系统。
+
+### 新增接口（全部要求 Worker 令牌 + 有效租约）
+
+| 方法 | 路由 | 作用 |
+| --- | --- | --- |
+| GET | `/internal/v1/workers/jobs/{id}/input` | 返回冻结的 DirectorPlan、输出规格与素材**下载地址**（不暴露文件系统路径） |
+| GET | `/internal/v1/workers/jobs/{id}/input/asset` | 流式返回该任务的输入素材（需有效租约） |
+| POST | `/internal/v1/workers/jobs/{id}/artifact` | 回传产物：文件名白名单（`preview.mp4` / `metadata.json`）、大小上限（400MB / 8MB）、且只允许写进该任务自己的目录 |
+
+回传成功后返回 `storage_reference`，Worker 用它调用既有的 `complete` 接口即可。
+
+### 测试（`tests/test_worker_remote_channel.py`，4 项）
+
+Worker 令牌与租约校验、素材字节与文件名、白名单/空文件/超限拒绝、过期租约拒绝、以及"**新接口最初漏了 worker 令牌依赖**"这个真实缺陷（匿名请求返回 200 被测试当场抓到，现已修复）。
+
+后端回归：本地与云端 **128/128**。
+
+### 云端真实往返
+
+```
+claim            : 200  任务被 Worker 领取（lease_epoch 正常返回）
+input            : 200  3 个镜头 + 素材下载地址（无 path 字段）
+asset download   : 200  5,460 字节  sha 3d590f7fe5bdabd5（与仓库夹具一致）
+artifact upload  : 200  preview.mp4（2,060 字节）与 metadata.json
+complete         : 200  SUCCEEDED（使用回传的 storage_reference）
+owner downloads  : 200  2,060 字节 —— 与 Worker 上传的字节一致
+```
+
+即：只持有 Worker 令牌的一方，**不需要数据库或文件系统权限**就能完成"取输入 → 本地渲染 → 回传产物 → 结单"的全流程；产物仍由 Owner 侧受鉴权下载。
+
+### 仍未完成
+
+- 本次验证在同一台机器上通过回环 HTTP 完成；跨机（真正远程）部署未做——通道本身与位置无关，但未在第二台机器上实测。
+- 未做上传内容的深度校验（例如视频必须能被 ffprobe 解码），当前只做文件名、大小与租约边界。
+
 本报告随源码提交；准确代码版本以包含本文件的 Git 提交为准。GitHub 推送结果由交接时远端 HEAD 校验，未包含私钥、凭证、数据库、模型或成片。
