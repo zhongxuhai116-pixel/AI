@@ -72,12 +72,19 @@ def main() -> int:
     args = parse_args()
     root = Path(args.passes)
     report: dict = {"root": str(root), "frames_expected": args.frames, "failures": [], "frames": []}
-    exr_files = sorted(root.glob("*.exr"))
+    exr_root = sorted(root.glob("*.exr"))  # 旧布局：根目录多层 EXR
+    channels = ("beauty", "alpha", "depth", "normal")
+    per_channel = {name: sorted((root / name).glob("*.exr")) for name in channels}
+    exr_files = exr_root or per_channel["beauty"]
     mask_files = sorted((root / "mask").glob("frame_*.png"))
-    report["exr_frames"] = len(exr_files)
+    report["layout"] = "per-channel" if not exr_root else "single-multilayer"
+    report["exr_frames"] = {name: len(files) for name, files in per_channel.items()} if not exr_root else len(exr_files)
     report["mask_frames"] = len(mask_files)
     if len(exr_files) != args.frames:
         report["failures"].append(f"EXR 帧数 {len(exr_files)} != {args.frames}")
+    for name, files in per_channel.items():
+        if len(files) != args.frames:
+            report["failures"].append(f"{name} 通道帧数 {len(files)} != {args.frames}")
     if len(mask_files) != args.frames:
         report["failures"].append(f"遮罩帧数 {len(mask_files)} != {args.frames}")
     if not exr_files or not mask_files:
@@ -87,12 +94,23 @@ def main() -> int:
 
     sample = sorted({0, len(exr_files) // 2, len(exr_files) - 1})
     for index in sample:
-        exr = read_exr(exr_files[index])
+        if exr_root:
+            exr = read_exr(exr_files[index])
+            planes = exr["planes"]
+            channel_names = exr["names"]
+        else:
+            planes = {}
+            channel_names = {}
+            for name, files in per_channel.items():
+                part = read_exr(files[index])
+                channel_names[name] = part["names"]
+                for suffix, plane in part["planes"].items():
+                    planes[f"{name}.{suffix}"] = plane
         mask = read_mask(mask_files[index])
-        alpha = pick(exr["planes"], "Alpha")
-        depth = pick(exr["planes"], "Depth") or pick(exr["planes"], ".Z")
-        normal_x = pick(exr["planes"], "Normal.X")
-        entry: dict = {"frame_index": index, "exr_channels": exr["names"][:12]}
+        alpha = pick(planes, "alpha") or pick(planes, "Alpha")
+        depth = pick(planes, "depth") or pick(planes, "Depth") or pick(planes, ".Z")
+        normal_x = pick(planes, "normal.X") or pick(planes, "Normal.X")
+        entry: dict = {"frame_index": index, "exr_channels": channel_names}
         if alpha is not None:
             entry["alpha_coverage"] = round(float((alpha > 0.5).mean()), 4)
         entry["mask_coverage"] = round(float((mask > 0.5).mean()), 4)
@@ -103,8 +121,8 @@ def main() -> int:
             entry["depth_product_min"] = round(float(np.nanmin(product_depth)), 4)
             entry["depth_product_max"] = round(float(np.nanmax(product_depth)), 4)
         if normal_x is not None and product.any():
-            normal_y = pick(exr["planes"], "Normal.Y")
-            normal_z = pick(exr["planes"], "Normal.Z")
+            normal_y = pick(planes, "normal.Y") or pick(planes, "Normal.Y")
+            normal_z = pick(planes, "normal.Z") or pick(planes, "Normal.Z")
             if normal_y is not None and normal_z is not None:
                 magnitude = np.sqrt(normal_x[product] ** 2 + normal_y[product] ** 2 + normal_z[product] ** 2)
                 entry["normal_mean_magnitude"] = round(float(magnitude.mean()), 4)

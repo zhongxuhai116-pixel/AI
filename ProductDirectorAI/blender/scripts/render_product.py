@@ -204,37 +204,31 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
             tree.links.new(layers.outputs[socket], extra_node.inputs[0])
         layout = "per-channel"
     else:
-        # Blender 5 只提供多层 EXR：每帧一个 .exr，内含全部 pass 槽位。
-        # 关键：必须显式创建 file_output_items，否则该节点不会写出任何文件
-        # （实测：不加 items 时 72 帧渲染完成但 passes/ 目录为空）。
-        node.directory = str(pass_root)
-        node.file_name = "frame_"
-        node.format.file_format = "OPEN_EXR_MULTILAYER"
-        plan = [
+        # Blender 5：只支持 OPEN_EXR_MULTILAYER，而且**每个通道必须各用一个输出节点**
+        # （实测：单个节点挂多个 item 时只有第一个会落盘；每通道一个节点则全部写出）。
+        node = None
+        created: list[str] = []
+        for name, socket, socket_type in [
             ("beauty", "Image", "RGBA"),
             ("alpha", "Alpha", "FLOAT"),
             ("depth", "Depth", "FLOAT"),
             ("normal", "Normal", "VECTOR"),
-        ]
-        # 先把所有 item 建好，再统一连线：item 创建过程中 node.inputs 才逐项出现，
-        # 边建边连会把连线挂到错误的输入上（实测导致 EXR 里只有 beauty 一层）。
-        created: list[str] = []
-        for name, _socket, socket_type in plan:
+        ]:
+            channel_node = tree.nodes.new("CompositorNodeOutputFile")
+            channel_node.directory = str(pass_root / name)
+            channel_node.file_name = "frame_"
+            channel_node.format.file_format = "OPEN_EXR_MULTILAYER"
             try:
-                node.file_output_items.new(socket_type, name)
+                channel_node.file_output_items.new(socket_type, name)
+                tree.links.new(layers.outputs[socket], channel_node.inputs[0])
                 created.append(name)
             except Exception as exc:  # 单个通道不支持时不影响其余通道
                 print(f"DIRECTOR_PASS_SKIPPED {name}: {exc}", flush=True)
-        for index, (name, socket, _socket_type) in enumerate(plan):
-            if name not in created:
-                continue
-            try:
-                tree.links.new(layers.outputs[socket], node.inputs[index])
-            except Exception as exc:
-                print(f"DIRECTOR_PASS_LINK_FAILED {name}: {exc}", flush=True)
+                tree.nodes.remove(channel_node)
         print(f"DIRECTOR_PASS_CHANNELS {','.join(created)}", flush=True)
-        layout = "multilayer-exr"
-    tree.links.new(layers.outputs["Image"], node.inputs[0])
+        layout = "per-channel-exr"
+    if node is not None:
+        tree.links.new(layers.outputs["Image"], node.inputs[0])
     print(f"DIRECTOR_PASSES root={pass_root} layout={layout}", flush=True)
 
 
