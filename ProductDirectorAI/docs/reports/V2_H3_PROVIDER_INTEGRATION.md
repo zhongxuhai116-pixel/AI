@@ -71,3 +71,55 @@ library entry  : "H3 重建 · user-product-02.glb"  kind=model  已出现在素
 3. **官方视频/重建接口**：主规格要求的 MiniMax 官方视频接口与重建路径真实测试未做。
 4. **取消与失败语义**：ComfyUI 的全局中断不能当单任务取消，本次未实现取消；任务只能查询与失败标记。
 5. **并发与容量**：未测多任务并发、显存占用与排队策略。
+
+---
+
+## 7. H3 视频生成接入（2026-09-12 追加）
+
+第 6.1 条已处理：现在项目自己就能生成 H3 视频，不再需要人工开 ComfyUI 界面。
+
+### 7.1 实现
+
+`comfyui.build_h3_video_graph()` 按现场已验证工作流的视频子图接线：
+
+```
+UNETLoader → LoraLoaderModelOnly(turbo 4 步) → MiniMaxH3SigmaShift(12.0 / 3.0)
+LoadVideo → GetVideoComponents ─┐
+LoadImage → ImageCrop ──────────┴→ MiniMaxH3ReferenceToVideo(prompt, 576×1024, 124 帧)
+                                        ├→ BasicGuider ─┐
+RandomNoise + KSamplerSelect + BasicScheduler ──────────┴→ SamplerCustomAdvanced
+    → VAEDecode(视频 VAE) + VAEDecodeAudio(音频 VAE) → CreateVideo → SaveVideo
+```
+
+接口 `POST /api/v1/providers/h3/video` 接受产品素材 + 参考视频名 + 提示词与尺寸参数；任务状态接口按 `operation` 分流回收：
+
+- `RECONSTRUCT_3D` → 下载 GLB、`inspect_glb` 校验、登记为素材库 model 资产；
+- `GENERATE_VIDEO` → 下载视频、`ffprobe` 校验、存到 `var/providers/<job_id>/`，通过 `GET /api/v1/providers/h3/jobs/{id}/artifact` 下载（不塞进素材库，避免出现界面尚不支持的资产类型）。
+
+与现场工作流的差别：**不含** `ProductBlenderRender` 的多视图渲染（属于 V3 产品保真链路），当前只提供"参考视频 + 产品图"这一条已实现能力。
+
+### 7.2 真实云端验证
+
+通过真实 API 提交（产品图 = 用户的机器人产品图裁切，参考视频 = 拳击靶-人物击打参考.mp4，124 帧 / 576×1024 / 4 步）：
+
+```
+submit  : 202  operation=GENERATE_VIDEO  external=86526b7f-…
+poll    : RUNNING ×31（约 7.5 分钟）→ SUCCEEDED / ARTIFACT
+artifact: mp4 1,070,456 字节  h264 576×1024 124 帧 5.167 秒
+          sha256 28797f73a31cb7f36b1be463898ea26caffbe302d324c4a28cd8f8a82de3777b
+download: GET …/artifact → 200，1,070,456 字节
+```
+
+### 7.3 人工视觉复核
+
+抽取第 91 帧查看：**产品替换确实生效**——机器人被放到木墙上原本拳击靶的位置，人物的击打动作、房间、木墙、地面与光影都保留，机器人外观（镜头穹顶、扬声器栅格）与参考图一致。
+
+同时发现一个真实瑕疵：参考图里**含底座**，因此画面中机器人的底座既出现在墙面产品上也单独出现在地板上。这是参考图取景问题（应裁到不含底座的主体）或 V3 保真链路要解决的合成问题，已记录。
+
+### 7.4 仍然未完成
+
+1. **多视图产品渲染**：现场工作流里的 `ProductBlenderRender`（正面/背面/45°）尚未接入，产品保真度依赖单张参考图。
+2. **AI 导演计划**：LLM 生成可编辑 DirectorPlan 未实现。
+3. **取消语义**：ComfyUI 全局中断不能当单任务取消。
+4. **成本与并发**：单次 124 帧生成约 7.5 分钟；未测并发排队、显存占用与批量产能。
+5. **官方接口**：主规格要求的 MiniMax 官方视频接口真实测试未做。
