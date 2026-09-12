@@ -104,7 +104,9 @@ class SecurityAcceptanceTests(unittest.TestCase):
         own.mkdir(); other.mkdir()
         (own / "preview.mp4").write_bytes(b"fixture")
         (other / "preview.mp4").write_bytes(b"other fixture")
-        self.assertEqual(main._resolve_job_artifact_path("job-a", "job-a/preview.mp4"), own / "preview.mp4")
+        # 解析结果会做 realpath 规范化；Windows 临时目录可能是 ADMINI~1 短路径，
+        # 因此期望值也要 resolve 后再比较，避免同一路径的两种写法被判为不等。
+        self.assertEqual(main._resolve_job_artifact_path("job-a", "job-a/preview.mp4"), (own / "preview.mp4").resolve())
         for path in [str(other / "preview.mp4"), "job-a/../job-b/preview.mp4", "job-b/preview.mp4"]:
             with self.assertRaises(HTTPException) as caught:
                 main._resolve_job_artifact_path("job-a", path)

@@ -4,7 +4,7 @@
 
 ## 先读这四份
 
-**本次换电脑先读 [NEXT_COMPUTER_START.md](NEXT_COMPUTER_START.md)**，其中包含最新恢复步骤和继续指令。[A05 交接报告](reports/A05_SECURITY_HANDOFF.md) 记录本地 23 项后端测试与待完成项。
+**本次换电脑先读 [NEXT_COMPUTER_START.md](NEXT_COMPUTER_START.md)**，其中包含最新恢复步骤和继续指令。[A05 交接报告](reports/A05_SECURITY_HANDOFF.md) 与 [A04 恢复加固报告](reports/A04_RECOVERY_HARDENING.md) 记录本地 28 项后端测试与待完成项。
 
 1. [换电脑接手手册](HANDOFF_NEW_COMPUTER.md)：克隆、恢复环境、私人数据、凭证与接手提示。
 2. [当前阶段](CURRENT_PHASE.md)：当前范围、阻断与下一步。
@@ -20,6 +20,7 @@
 | [A01 环境与记录基线](reports/A01_ENVIRONMENT_BASELINE.md) | V1 收尾第一包：环境版本、构建复核、云端基线记录与变更约束 |
 | [A02 / A03 验收](reports/A02_A03_ACCEPTANCE.md) | 合同不可变与幂等/重入访问验收记录 |
 | [A04 验收](reports/A04_ACCEPTANCE.md) | Worker 租约、事件恢复与旧 epoch 拒绝的第一段验收记录 |
+| [A04 恢复加固](reports/A04_RECOVERY_HARDENING.md) | 换电脑后复跑 28/28；事务内租约、长任务续租、取消竞争与租约时间缺陷修复 |
 | [执行指令](../CODEX_SOL56_START_HERE.md) | 给下一台电脑上的 Codex/SOL 5.6；先审计、复验、保留已有代码 |
 | [工程约束](../AGENTS.md) | 版本、安全、测试与用户工作保护 |
 | [项目 README](../README.md) | 当前项目和本机启动入口 |

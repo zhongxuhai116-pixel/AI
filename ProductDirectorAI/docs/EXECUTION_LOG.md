@@ -79,3 +79,17 @@
 - 拳击产品仅为演示文件；默认文案、API、数据模型与渲染逻辑不绑定产品类别。
 - MiniMax V1 仅做安全配置和连通测试；生成式 DirectorPlan Provider 编排留到 V2。
 - 本机优先：素材、SQLite、帧、视频和清单全部保存在 `var/`，该目录不提交 Git。
+
+## 2026-09-11（新电脑 · A04 恢复加固）
+
+本节为换电脑后的首次真实执行记录，证据见 [A04 恢复加固与新电脑复验](reports/A04_RECOVERY_HARDENING.md)。A04 状态仍为 **PARTIAL**。
+
+- 环境复验：Python 3.12.10、Node 24.14.0、npm 11.9.0、FFmpeg/ffprobe 8.0.1；本机无 Blender，渲染用例为明确 mock。
+- 依赖恢复：新建 `.venv` 并安装 `requirements-test.txt`；`npm ci` 安装 67 个包，与交接记录一致。
+- 回归结果：`compileall` PASS、`unittest discover` **28/28** PASS、Vite build PASS、Sites worker 4/4 PASS。
+- 修复真实缺陷：租约到期时间按整秒写入却与带微秒的当前时间做字符串比较，会在同一秒内被误判过期；现统一保留微秒（`lease_expiry_text()`）。
+- 关闭竞争窗口：抽出 `_apply_job_update()`，新增 `update_job_with_lease()`；完成/失败的状态写入、租约释放与事件写入合并为单一 `BEGIN IMMEDIATE` 事务；`claim_job()` 同样使用写事务。
+- 长任务续租：新增 `HeartbeatKeeper`，`execute_claimed_job()` 执行期间按租约 1/3 的间隔续租，避免真实长渲染被其他 worker 抢走并重复执行。
+- 取消与终态：取消胜出（迟到的完成回报改判 `CANCELLED`）；终态记录不可回退；失去租约的执行器不再改写任务与产物。
+- 新增 5 个 A04 回归用例，含“有心跳不被抢 / 无心跳被抢”的正负对照，以及进程被杀后由新 worker 完成的恢复链路。
+- 未完成：真实 Blender/FFmpeg 长任务中断恢复、远程任务输入下载与成果回收、编码失败自动重试、SSE 推送仍未实现；云端部署与出片验收仍 BLOCKED（未登录服务器）。

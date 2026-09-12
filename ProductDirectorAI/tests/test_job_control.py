@@ -6,11 +6,14 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -313,6 +316,242 @@ class JobControlAcceptanceTests(unittest.TestCase):
         self.assertEqual(video.status_code, 200)
         self.assertEqual(video.content, b"0" * 2048)
         self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}/manifest").json()["job_id"], job_id)
+
+
+    # --- A04 真实中断与恢复：竞争窗口、长任务续租、进程被杀后重领 ---
+
+    def _create_queued_job(self, idempotency_key: str) -> str:
+        plan = self._create_plan()
+        self.client.post(f"/api/v1/plans/{plan['id']}/approve", json={"approved": True})
+        with patch("productdirector_api.main.execute_job"):
+            created = self.client.post(
+                "/api/v1/runs", json={"plan_id": plan["id"], "idempotency_key": idempotency_key}
+            )
+        self.assertEqual(created.status_code, 202)
+        return created.json()["job_id"]
+
+    def _expire_lease(self, job_id: str, seconds: int = 5) -> None:
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+        with main.connect() as db:
+            db.execute("UPDATE run_jobs SET lease_expires_at = ? WHERE job_id = ?", (expired, job_id))
+
+    def _lease_row(self, job_id: str) -> sqlite3.Row:
+        with main.connect() as db:
+            return db.execute(
+                "SELECT * FROM run_jobs WHERE job_id = ? ORDER BY created_at DESC, attempt DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+
+    def _fake_render_tools(self, delay: float = 0.0, started: threading.Event | None = None):
+        """mock 渲染与 ffprobe，避免把本地测试写进真实 Blender 依赖。"""
+
+        def fake_render(job_id_arg, asset, run_dir_arg, output, plan_path, output_spec):
+            if started is not None:
+                started.set()
+            if delay:
+                time.sleep(delay)
+            output.write_bytes(b"0" * 2048)
+
+        fake_probe = Mock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "streams": [{"width": 540, "height": 960, "r_frame_rate": "24/1", "nb_frames": "144"}],
+                    "format": {"duration": "6.000"},
+                }
+            ),
+            stderr="",
+        )
+        return fake_render, fake_probe
+
+    def test_a04_cancel_wins_over_late_completion(self) -> None:
+        job_id = self._create_queued_job("a04-cancel-race")
+        claim = self.client.post("/internal/v1/workers/claim", json={"worker_id": "worker-a", "job_id": job_id})
+        self.assertTrue(claim.json()["claimed"])
+
+        cancelled = self.client.post(f"/api/v1/jobs/{job_id}/cancel")
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["status"], "CANCEL_REQUESTED")
+
+        # 渲染刚结束的迟到完成回报不能把用户已取消的任务改回成功。
+        late = self.client.post(
+            f"/internal/v1/workers/jobs/{job_id}/complete",
+            json={"worker_id": "worker-a", "lease_epoch": claim.json()["lease_epoch"], "output_path": "preview.mp4"},
+        )
+        self.assertEqual(late.status_code, 200)
+        self.assertEqual(late.json()["status"], "CANCELLED")
+        self.assertEqual(late.json()["progress"], 0)
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}/video").status_code, 409)
+
+        # 终态之后迟到的进度写入同样不能把任务改回运行中。
+        main.update_job(job_id, status="RUNNING", stage="RENDER", progress=50)
+        job = self.client.get(f"/api/v1/jobs/{job_id}").json()
+        self.assertEqual(job["status"], "CANCELLED")
+        self.assertEqual(job["progress"], 0)
+
+    def test_a04_reclaimed_job_ignores_stale_worker_writes(self) -> None:
+        job_id = self._create_queued_job("a04-stale-writes")
+        first = self.client.post("/internal/v1/workers/claim", json={"worker_id": "worker-a", "job_id": job_id}).json()
+        self.assertTrue(first["claimed"])
+        self._expire_lease(job_id)
+        second = self.client.post("/internal/v1/workers/claim", json={"worker_id": "worker-b", "job_id": job_id}).json()
+        self.assertTrue(second["claimed"])
+        lease_before = self._lease_row(job_id)
+
+        stale_complete = self.client.post(
+            f"/internal/v1/workers/jobs/{job_id}/complete",
+            json={"worker_id": "worker-a", "lease_epoch": first["lease_epoch"], "output_path": "preview.mp4"},
+        )
+        self.assertEqual(stale_complete.status_code, 409)
+        stale_heartbeat = self.client.post(
+            f"/internal/v1/workers/jobs/{job_id}/heartbeat",
+            json={"worker_id": "worker-a", "lease_epoch": first["lease_epoch"]},
+        )
+        self.assertEqual(stale_heartbeat.status_code, 409)
+
+        # 直接调用内部更新路径也必须拒绝旧 epoch，且不能顺带释放新 worker 的租约。
+        with self.assertRaises(HTTPException) as caught:
+            main.update_job_with_lease(job_id, "worker-a", first["lease_epoch"], progress=99)
+        self.assertEqual(caught.exception.status_code, 409)
+        main.release_worker_lease(job_id, "worker-a", first["lease_epoch"], "worker.failed")
+
+        lease_after = self._lease_row(job_id)
+        self.assertEqual(lease_after["lease_owner"], "worker-b")
+        self.assertEqual(lease_after["lease_epoch"], lease_before["lease_epoch"])
+        self.assertEqual(lease_after["lease_expires_at"], lease_before["lease_expires_at"])
+        job = self.client.get(f"/api/v1/jobs/{job_id}").json()
+        self.assertEqual(job["status"], "RUNNING")
+        self.assertEqual(job["progress"], 0)
+        heartbeat = self.client.post(
+            f"/internal/v1/workers/jobs/{job_id}/heartbeat",
+            json={"worker_id": "worker-b", "lease_epoch": second["lease_epoch"]},
+        )
+        self.assertEqual(heartbeat.status_code, 200)
+
+    def test_a04_long_render_renews_lease_and_blocks_rival_claim(self) -> None:
+        job_id = self._create_queued_job("a04-long-render")
+        original_ffprobe = main.FFPROBE
+        original_lease_seconds = main.LEASE_SECONDS
+        original_heartbeat = main.HEARTBEAT_SECONDS
+        main.FFPROBE = "ffprobe"
+        main.LEASE_SECONDS = 1
+        main.HEARTBEAT_SECONDS = 0.2
+        started = threading.Event()
+        fake_render, fake_probe = self._fake_render_tools(delay=2.0, started=started)
+        worker: threading.Thread | None = None
+        try:
+            claim = main.claim_job("worker-long", job_id)
+            self.assertTrue(claim["claimed"])
+            worker = threading.Thread(
+                target=main.execute_claimed_job,
+                args=(job_id, "worker-long", int(claim["lease_epoch"])),
+                daemon=True,
+            )
+            with patch("productdirector_api.main.render_glb_job", side_effect=fake_render), patch(
+                "productdirector_api.main.subprocess.run", return_value=fake_probe
+            ):
+                worker.start()
+                self.assertTrue(started.wait(5), "mock 渲染未启动")
+                # 已超过一个 LEASE_SECONDS：心跳缺失时第二个 worker 会合法抢走任务。
+                time.sleep(1.4)
+                rival = main.claim_job("worker-rival", job_id)
+                self.assertFalse(rival.get("claimed"))
+                worker.join(timeout=15)
+        finally:
+            main.FFPROBE = original_ffprobe
+            main.LEASE_SECONDS = original_lease_seconds
+            main.HEARTBEAT_SECONDS = original_heartbeat
+        if worker is not None:
+            self.assertFalse(worker.is_alive(), "worker 线程未结束")
+        job = self.client.get(f"/api/v1/jobs/{job_id}").json()
+        self.assertEqual(job["status"], "SUCCEEDED")
+        self.assertEqual(job["progress"], 100)
+        self.assertIsNone(self._lease_row(job_id)["lease_owner"])
+
+    def test_a04_render_without_heartbeat_loses_lease_to_rival(self) -> None:
+        """负向对照：证明上面的续租断言确实由心跳线程带来。"""
+        job_id = self._create_queued_job("a04-no-heartbeat")
+        original_ffprobe = main.FFPROBE
+        original_lease_seconds = main.LEASE_SECONDS
+        main.FFPROBE = "ffprobe"
+        main.LEASE_SECONDS = 1
+        started = threading.Event()
+        fake_render, fake_probe = self._fake_render_tools(delay=2.0, started=started)
+        worker: threading.Thread | None = None
+
+        class NoHeartbeat:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def start(self) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+        try:
+            claim = main.claim_job("worker-slow", job_id)
+            self.assertTrue(claim["claimed"])
+            worker = threading.Thread(
+                target=main.execute_claimed_job,
+                args=(job_id, "worker-slow", int(claim["lease_epoch"])),
+                daemon=True,
+            )
+            with patch.object(main, "HeartbeatKeeper", NoHeartbeat), patch(
+                "productdirector_api.main.render_glb_job", side_effect=fake_render
+            ), patch("productdirector_api.main.subprocess.run", return_value=fake_probe):
+                worker.start()
+                self.assertTrue(started.wait(5), "mock 渲染未启动")
+                time.sleep(1.4)
+                rival = main.claim_job("worker-rival", job_id)
+                self.assertTrue(rival.get("claimed"), "无心跳时租约应已过期并可被重领")
+                worker.join(timeout=15)
+        finally:
+            main.FFPROBE = original_ffprobe
+            main.LEASE_SECONDS = original_lease_seconds
+        if worker is not None:
+            self.assertFalse(worker.is_alive(), "worker 线程未结束")
+        # 失去租约的旧 worker 不得覆盖由新 worker 持有的任务。
+        job = self.client.get(f"/api/v1/jobs/{job_id}").json()
+        self.assertEqual(job["status"], "RUNNING")
+        self.assertEqual(self._lease_row(job_id)["lease_owner"], "worker-rival")
+
+    def test_a04_killed_worker_is_reconciled_and_finished_by_new_worker(self) -> None:
+        job_id = self._create_queued_job("a04-kill-recover")
+        first = self.client.post("/internal/v1/workers/claim", json={"worker_id": "worker-a", "job_id": job_id}).json()
+        self.assertTrue(first["claimed"])
+
+        # 模拟 worker 进程被杀：没有任何完成/失败回报，租约自然过期。
+        self._expire_lease(job_id)
+        reconciled = self.client.post("/internal/v1/workers/reconcile")
+        self.assertEqual(reconciled.status_code, 200)
+        self.assertEqual(reconciled.json()["reconciled"], 1)
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}").json()["status"], "QUEUED")
+
+        fake_render, fake_probe = self._fake_render_tools()
+        original_ffprobe = main.FFPROBE
+        main.FFPROBE = "ffprobe"
+        try:
+            with patch("productdirector_api.main.render_glb_job", side_effect=fake_render), patch(
+                "productdirector_api.main.subprocess.run", return_value=fake_probe
+            ):
+                result = main.run_worker_once("worker-b")
+        finally:
+            main.FFPROBE = original_ffprobe
+        self.assertTrue(result["claimed"])
+        self.assertEqual(result["status"], "SUCCEEDED")
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}/video").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}/manifest").json()["job_id"], job_id)
+
+        # 被替换的旧 worker 迟到回报必须被拒绝，且不能把已完成任务改回失败。
+        stale = self.client.post(
+            f"/internal/v1/workers/jobs/{job_id}/fail",
+            json={"worker_id": "worker-a", "lease_epoch": first["lease_epoch"], "error": "stale worker"},
+        )
+        self.assertEqual(stale.status_code, 409)
+        final = self.client.get(f"/api/v1/jobs/{job_id}").json()
+        self.assertEqual(final["status"], "SUCCEEDED")
+        self.assertIsNone(final["error"])
 
 
 if __name__ == "__main__":

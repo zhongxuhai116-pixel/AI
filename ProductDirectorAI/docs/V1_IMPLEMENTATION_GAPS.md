@@ -9,7 +9,7 @@
 
 - 前端：React JSX + Vite + Three.js；不是已迁移到 TypeScript 的实现。
 - 后端：FastAPI + SQLite；数据库表为 assets、plans、jobs、provider_credentials。
-- 执行器：FastAPI BackgroundTasks、进程内线程锁/子进程表；不是独立、持久、带租约的 Worker 系统。
+- 执行器：FastAPI BackgroundTasks、进程内线程锁/子进程表；已有 SQLite 租约、epoch、事件续读与独立 worker CLI，但仍是同机数据库/文件系统，不是主规划要求的独立持久 Worker 系统。
 - 素材：单文件图片/GLB 上传；本机 var/ 存放原件、数据库和成果。
 - 模板：固定 6 秒、24fps、9:16，默认 540×960 三镜头。
 - 预演：图片 FFmpeg，GLB Blender + FFmpeg；每次 Run 在作业目录冻结 DirectorPlan。GLB 将三段 `camera`、`focal_length_mm`、`duration_frames` 编译为 Blender 相机关键帧；图片将同一快照编译为 2D 平移/缩放片段。
@@ -23,7 +23,7 @@
 | 项目与产品版本 | 当前围绕 asset/plan/job；无完整 Project/ProductVersion 审核与不可变版本模型 | 主规划第 4、7 章实体与授权校验 |
 | 计划合同 | Pydantic 简化请求与根目录 JSON Schema 不是同一全量合同；未统一验证 | 明确迁移/兼容方案，正负例与语义校验 |
 | 分镜编辑影响真实片 | GLB 与图片均已通过真实云端验收：冻结计划、相机模板、焦距和三段时长会进入对应渲染器；图片 `hero_orbit` 是可见的 2D 视差近似 | 保留 GLB/图片快照回归；物理 3D 环绕仅适用于 GLB 或后续多视图资产 |
-| 状态与恢复 | 已有状态、取消、SQLite 保存；无租约/事件 Outbox/SSE、可靠重启恢复 | 故障、重试幂等、取消竞争、重启对账测试 |
+| 状态与恢复 | 已有状态、取消、SQLite 保存、租约/epoch/事件续读与过期对账；完成/失败已在写事务内校验租约，长任务会续租，取消胜出且终态不可回退（见 [A04 恢复加固](reports/A04_RECOVERY_HARDENING.md)）；仍无 Outbox/SSE 与编码失败自动重试，真实云端中断未测 | 真实中断、重试幂等、取消竞争、重启对账的云端验收 |
 | 输出与 QA | 540×960 与 1080×1920 基础云端验收已通过；存在性检查不等于全量质量门 | 黑帧/可见性/用户真实素材复验与持续稳定性 |
 | 远程节点 | 新云节点已本机部署并通过 GLB 全链路；尚无受鉴权的远程 Renderer/Worker 调度 | 远程存储、权限、调度、真实任务与恢复 |
 | Linux 密钥存储 | Windows ctypes/DPAPI 调用不能直接在 Linux 保存/解密凭证 | 平台安全存储适配；禁止明文回退 |

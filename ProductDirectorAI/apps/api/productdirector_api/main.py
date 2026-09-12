@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import hashlib
 import hmac
 import json
@@ -18,7 +19,9 @@ import urllib.error
 import urllib.request
 import ctypes
 from ctypes import wintypes
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -42,6 +45,9 @@ DEFAULT_OWNER_ID = "owner-default"
 DEFAULT_WORKSPACE_ID = "workspace-default"
 DEFAULT_PROJECT_ID = "project-default"
 LEASE_SECONDS = 60
+TERMINAL_JOB_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
+# 长任务续租间隔：至少每 1 秒一次，且不小于租约的三分之一，避免渲染期间租约失效。
+HEARTBEAT_SECONDS = max(1.0, LEASE_SECONDS / 3)
 MINIMAX_API_BASE_URL = os.getenv("MINIMAX_API_BASE_URL", "https://api.minimaxi.com").rstrip("/")
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -61,6 +67,17 @@ def utc_now() -> str:
 
 def parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def lease_expiry_text(seconds: float | None = None) -> str:
+    """租约到期时间。
+
+    必须保留微秒：SQL 里用 ISO 字符串直接比较到期时间，而当前时间带微秒；
+    若到期时间被截断到整秒，同一秒内会因 "+00:00" 与 ".123456+00:00" 的
+    字符差异被误判为已过期。
+    """
+    span = LEASE_SECONDS if seconds is None else seconds
+    return (datetime.now(timezone.utc) + timedelta(seconds=span)).isoformat()
 
 
 def find_executable(name: str, candidates: list[str]) -> str | None:
@@ -112,6 +129,32 @@ def connect() -> sqlite3.Connection:
     connection = sqlite3.connect(DB_PATH, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def begin_immediate(db: sqlite3.Connection) -> None:
+    """升级为写事务，确保读取租约状态与写入结果在同一事务内完成。"""
+    db.execute("BEGIN IMMEDIATE")
+
+
+@dataclass(frozen=True)
+class LeaseContext:
+    """当前执行线程持有的租约；用于把状态写入绑定到具体 worker 与 epoch。"""
+
+    job_id: str
+    worker_id: str
+    lease_epoch: int
+
+
+CURRENT_LEASE: contextvars.ContextVar[LeaseContext | None] = contextvars.ContextVar("current_lease", default=None)
+
+
+@contextmanager
+def lease_scope(lease: LeaseContext):
+    token = CURRENT_LEASE.set(lease)
+    try:
+        yield lease
+    finally:
+        CURRENT_LEASE.reset(token)
 
 
 def ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -859,9 +902,9 @@ def require_active_lease(db: sqlite3.Connection, job_id: str, worker_id: str, le
 
 def claim_job(worker_id: str, job_id: str | None = None) -> dict:
     now = utc_now()
-    lease_expires_at = (datetime.now(timezone.utc).replace(microsecond=0).timestamp() + LEASE_SECONDS)
-    lease_expires_text = datetime.fromtimestamp(lease_expires_at, timezone.utc).isoformat()
+    lease_expires_text = lease_expiry_text()
     with connect() as db:
+        begin_immediate(db)
         params: list[object] = []
         filter_sql = ""
         if job_id:
@@ -930,10 +973,7 @@ def claim_job(worker_id: str, job_id: str | None = None) -> dict:
 
 def heartbeat_job(job_id: str, worker_id: str, lease_epoch: int) -> dict:
     now = utc_now()
-    lease_expires_text = datetime.fromtimestamp(
-        datetime.now(timezone.utc).replace(microsecond=0).timestamp() + LEASE_SECONDS,
-        timezone.utc,
-    ).isoformat()
+    lease_expires_text = lease_expiry_text()
     with connect() as db:
         run_job = require_active_lease(db, job_id, worker_id, lease_epoch)
         db.execute(
@@ -950,15 +990,15 @@ def heartbeat_job(job_id: str, worker_id: str, lease_epoch: int) -> dict:
 
 
 def complete_leased_job(job_id: str, request: WorkerCompleteRequest) -> dict:
-    with connect() as db:
-        run_job = require_active_lease(db, job_id, request.worker_id, request.lease_epoch)
     values: dict[str, object] = {"status": "SUCCEEDED", "stage": "ARTIFACT", "progress": 100, "error": None}
     if request.output_path:
         values["output_path"] = _storage_reference(job_id, request.output_path)
     if request.manifest_path:
         values["manifest_path"] = _storage_reference(job_id, request.manifest_path)
-    update_job(job_id, **values)
     with connect() as db:
+        begin_immediate(db)
+        run_job = require_active_lease(db, job_id, request.worker_id, request.lease_epoch)
+        _apply_job_update(db, job_id, values)
         db.execute(
             "UPDATE run_jobs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?",
             (utc_now(), run_job["id"]),
@@ -974,9 +1014,9 @@ def complete_leased_job(job_id: str, request: WorkerCompleteRequest) -> dict:
 
 def fail_leased_job(job_id: str, request: WorkerFailRequest) -> dict:
     with connect() as db:
+        begin_immediate(db)
         run_job = require_active_lease(db, job_id, request.worker_id, request.lease_epoch)
-    update_job(job_id, status="FAILED", stage="FAILED", error=request.error[-4000:])
-    with connect() as db:
+        _apply_job_update(job_id=job_id, db=db, values={"status": "FAILED", "stage": "FAILED", "error": request.error[-4000:]})
         db.execute(
             "UPDATE run_jobs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?",
             (utc_now(), run_job["id"]),
@@ -1003,6 +1043,43 @@ def release_worker_lease(job_id: str, worker_id: str, lease_epoch: int, event_ty
         if payload:
             event_payload.update(payload)
         append_job_event(db, job_id, event_type, event_payload)
+
+
+def is_lease_conflict(exc: BaseException) -> bool:
+    """识别“租约已不属于当前 worker”的错误，避免接管后仍改写任务状态。"""
+    return isinstance(exc, HTTPException) and exc.status_code in {404, 409}
+
+
+class HeartbeatKeeper(threading.Thread):
+    """长任务执行期间的续租线程。
+
+    真实 Blender/FFmpeg 渲染可能远超 LEASE_SECONDS；没有周期性心跳时，
+    其他 worker 会在渲染中途合法抢走租约，导致同一任务被执行两次。
+    """
+
+    def __init__(self, job_id: str, worker_id: str, lease_epoch: int, interval: float | None = None) -> None:
+        super().__init__(name=f"heartbeat-{job_id}", daemon=True)
+        self.job_id = job_id
+        self.worker_id = worker_id
+        self.lease_epoch = lease_epoch
+        self.interval = float(interval if interval is not None else HEARTBEAT_SECONDS)
+        self.lease_lost = threading.Event()
+        self.last_error: str | None = None
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop_event.wait(self.interval):
+            try:
+                heartbeat_job(self.job_id, self.worker_id, self.lease_epoch)
+            except Exception as exc:  # noqa: BLE001 - 续租失败必须停止而不是重试抢占
+                self.last_error = str(exc)
+                self.lease_lost.set()
+                return
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self.is_alive():
+            self.join(timeout=5)
 
 
 def reconcile_stale_jobs() -> dict:
@@ -1046,7 +1123,35 @@ def reconcile_stale_jobs() -> dict:
     return {"reconciled": len(reconciled), "job_ids": reconciled}
 
 
-def update_job(job_id: str, **values) -> None:
+def _apply_job_update(db: sqlite3.Connection, job_id: str, values: dict) -> None:
+    """把一次任务字段变更写入 jobs/runs/run_jobs/job_attempts 与事件表。
+
+    该函数只负责写入，事务由调用方控制，便于在租约校验后原子落库。
+    """
+    values = dict(values)
+    reopen = bool(values.pop("_reopen_terminal", False))
+    values.pop("updated_at", None)
+    current = db.execute(
+        "SELECT status, cancel_requested FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    if current is None:
+        raise HTTPException(404, "任务不存在")
+    if not reopen:
+        if current["status"] in TERMINAL_JOB_STATUSES:
+            # 终态是最终事实：迟到的心跳/进度/完成回报不能把任务改回进行中。
+            values = {
+                key: value
+                for key, value in values.items()
+                if key not in {"status", "stage", "progress", "cancel_requested"}
+            }
+        if values.get("status") == "SUCCEEDED" and (
+            current["cancel_requested"] or current["status"] == "CANCEL_REQUESTED"
+        ):
+            # 取消与完成竞争：取消胜出，不把用户已取消的任务改回成功。
+            values = {
+                key: value for key, value in values.items() if key not in {"output_path", "manifest_path"}
+            }
+            values.update({"status": "CANCELLED", "stage": "CANCELLED", "progress": 0, "error": None})
     if not values:
         return
     values["updated_at"] = utc_now()
@@ -1057,69 +1162,90 @@ def update_job(job_id: str, **values) -> None:
         for key, value in (("status", values.get("status")), ("stage", values.get("stage")), ("error", values.get("error")))
         if value is not None
     }
-    status_terminal = {"SUCCEEDED", "FAILED", "CANCELLED"}
+    status_terminal = TERMINAL_JOB_STATUSES
     latest_run_status = None
     latest_run = None
-    with connect() as db:
-        db.execute("UPDATE jobs SET " + ", ".join(f"{key} = ?" for key in values) + " WHERE id = ?", [*values.values(), job_id])
-        if run_updates:
-            run_assignments = ", ".join(f"{key} = ?" for key in run_updates)
-            row = db.execute(
-                "SELECT run_id FROM run_jobs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
-                (job_id,),
-            ).fetchone()
-            if row:
-                latest_run = row["run_id"]
-                latest_run_job = db.execute(
-                    """
-                    SELECT id AS run_job_id, status, attempt
-                    FROM run_jobs
-                    WHERE run_id = ?
-                    ORDER BY created_at DESC, attempt DESC
-                    LIMIT 1
-                    """,
-                    (latest_run,),
-                ).fetchone()
-                latest_run_status = latest_run_job["status"] if latest_run_job else None
-                run_job = db.execute(
-                    """
-                    SELECT rj.id AS run_job_id, rj.attempt
-                    FROM run_jobs rj
-                    WHERE rj.run_id = ?
-                    ORDER BY rj.created_at DESC, rj.attempt DESC
-                    LIMIT 1
-                    """,
-                    (latest_run,),
-                ).fetchone()
-                now = utc_now()
-                db.execute(
-                    f"UPDATE runs SET {run_assignments}, updated_at = ? WHERE id = ?",
-                    [*run_updates.values(), now, latest_run],
-                )
-                if run_job:
-                    if run_job_updates:
-                        db.execute(
-                            "UPDATE run_jobs SET " + ", ".join(f"{key} = ?" for key in run_job_updates) + ", updated_at = ? WHERE id = ?",
-                            [*run_job_updates.values(), now, run_job["run_job_id"]],
-                        )
-                    if "status" in run_updates and run_job:
-                        status = run_updates["status"]
-                        if status == "RUNNING":
-                            db.execute(
-                                "UPDATE job_attempts SET status = ?, completed_at = NULL WHERE run_job_id = ? AND attempt = ?",
-                                ("RUNNING", run_job["run_job_id"], run_job["attempt"]),
-                            )
-                        elif status in status_terminal and latest_run_status not in status_terminal:
-                            db.execute(
-                                "UPDATE job_attempts SET status = ?, error = ?, completed_at = ? WHERE run_job_id = ? AND attempt = ?",
-                                (status, run_updates.get("error"), now, run_job["run_job_id"], run_job["attempt"]),
-                            )
-        if "status" in values and values["status"] in status_terminal and latest_run and latest_run_status not in status_terminal:
-            db.execute(
-                "UPDATE runs SET attempt_count = COALESCE(attempt_count, 0) + 1 WHERE id = ?",
+    db.execute("UPDATE jobs SET " + ", ".join(f"{key} = ?" for key in values) + " WHERE id = ?", [*values.values(), job_id])
+    if run_updates:
+        run_assignments = ", ".join(f"{key} = ?" for key in run_updates)
+        row = db.execute(
+            "SELECT run_id FROM run_jobs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        if row:
+            latest_run = row["run_id"]
+            latest_run_job = db.execute(
+                """
+                SELECT id AS run_job_id, status, attempt
+                FROM run_jobs
+                WHERE run_id = ?
+                ORDER BY created_at DESC, attempt DESC
+                LIMIT 1
+                """,
                 (latest_run,),
+            ).fetchone()
+            latest_run_status = latest_run_job["status"] if latest_run_job else None
+            run_job = db.execute(
+                """
+                SELECT rj.id AS run_job_id, rj.attempt
+                FROM run_jobs rj
+                WHERE rj.run_id = ?
+                ORDER BY rj.created_at DESC, rj.attempt DESC
+                LIMIT 1
+                """,
+                (latest_run,),
+            ).fetchone()
+            now = utc_now()
+            db.execute(
+                f"UPDATE runs SET {run_assignments}, updated_at = ? WHERE id = ?",
+                [*run_updates.values(), now, latest_run],
             )
-        append_job_event(db, job_id, "job.updated", {key: value for key, value in values.items() if key != "updated_at"})
+            if run_job:
+                if run_job_updates:
+                    db.execute(
+                        "UPDATE run_jobs SET " + ", ".join(f"{key} = ?" for key in run_job_updates) + ", updated_at = ? WHERE id = ?",
+                        [*run_job_updates.values(), now, run_job["run_job_id"]],
+                    )
+                if "status" in run_updates:
+                    status = run_updates["status"]
+                    if status == "RUNNING":
+                        db.execute(
+                            "UPDATE job_attempts SET status = ?, completed_at = NULL WHERE run_job_id = ? AND attempt = ?",
+                            ("RUNNING", run_job["run_job_id"], run_job["attempt"]),
+                        )
+                    elif status in status_terminal and latest_run_status not in status_terminal:
+                        db.execute(
+                            "UPDATE job_attempts SET status = ?, error = ?, completed_at = ? WHERE run_job_id = ? AND attempt = ?",
+                            (status, run_updates.get("error"), now, run_job["run_job_id"], run_job["attempt"]),
+                        )
+    if "status" in values and values["status"] in status_terminal and latest_run and latest_run_status not in status_terminal:
+        db.execute(
+            "UPDATE runs SET attempt_count = COALESCE(attempt_count, 0) + 1 WHERE id = ?",
+            (latest_run,),
+        )
+    append_job_event(db, job_id, "job.updated", {key: value for key, value in values.items() if key != "updated_at"})
+
+
+def update_job(job_id: str, **values) -> None:
+    """更新任务字段；若当前线程持有该任务的租约，则在同一写事务内校验租约。"""
+    lease = CURRENT_LEASE.get()
+    if lease is not None and lease.job_id == job_id:
+        update_job_with_lease(job_id, lease.worker_id, lease.lease_epoch, **values)
+        return
+    if not values:
+        return
+    with connect() as db:
+        _apply_job_update(db, job_id, values)
+
+
+def update_job_with_lease(job_id: str, worker_id: str, lease_epoch: int, **values) -> None:
+    """先在校验租约的同一事务里确认 epoch 仍有效，再落库，关闭校验与写入间的竞争窗口。"""
+    if not values:
+        return
+    with connect() as db:
+        begin_immediate(db)
+        require_active_lease(db, job_id, worker_id, lease_epoch)
+        _apply_job_update(db, job_id, values)
 
 
 def get_job(job_id: str) -> dict:
@@ -1348,9 +1474,13 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_p
     if encode.returncode != 0:
         raise RuntimeError(encode.stderr[-2000:])
 def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
+    lease = LeaseContext(job_id=job_id, worker_id=worker_id, lease_epoch=lease_epoch)
+    keeper = HeartbeatKeeper(job_id, worker_id, lease_epoch)
+    lease_token = CURRENT_LEASE.set(lease)
     try:
         with connect() as db:
             require_active_lease(db, job_id, worker_id, lease_epoch)
+        keeper.start()
         job = get_job(job_id)
         with connect() as db:
             asset_row = db.execute("SELECT * FROM assets WHERE id = ?", (job["asset_id"],)).fetchone()
@@ -1436,9 +1566,18 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
         )
         release_worker_lease(job_id, worker_id, lease_epoch, "worker.completed")
     except Exception as exc:
-        if get_job(job_id)["status"] != "CANCELLED":
-            update_job(job_id, status="FAILED", stage="FAILED", error=str(exc)[-4000:])
+        if is_lease_conflict(exc):
+            # 租约已被其他 worker 接管：不得再改写任务状态或产物引用。
+            return
+        try:
+            if get_job(job_id)["status"] != "CANCELLED":
+                update_job(job_id, status="FAILED", stage="FAILED", error=str(exc)[-4000:])
+        except HTTPException:
+            pass
         release_worker_lease(job_id, worker_id, lease_epoch, "worker.failed", {"error": str(exc)[-4000:]})
+    finally:
+        keeper.stop()
+        CURRENT_LEASE.reset(lease_token)
 
 
 def execute_job(job_id: str) -> None:

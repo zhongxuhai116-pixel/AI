@@ -1,6 +1,6 @@
 # A04 验收记录
 
-> 2026-09-11 交接修正：整包状态为 **PARTIAL**。下面 16 项是历史本地合同测试，当前后端增至 23 项通过，build/Sites 阻塞已解除。长任务续租、事务内租约检查、取消/完成竞争和真实杀 Worker 恢复尚未完成，见 [A05 交接报告](A05_SECURITY_HANDOFF.md)。
+> 2026-09-11 交接修正：整包状态为 **PARTIAL**。下面 16 项是历史本地合同测试；换电脑后后端增至 **28 项通过**，长任务续租、事务内租约检查、取消/完成竞争与租约时间缺陷已加固，见 [A04 恢复加固](A04_RECOVERY_HARDENING.md)。真实杀 Worker 进程恢复仍需云端验收，另见 [A05 交接报告](A05_SECURITY_HANDOFF.md)。
 
 验收日期：2026-09-11  
 范围：`A04 独立执行与恢复`：持久任务事件、Worker 领取/心跳/完成/失败接口、租约 epoch、断线续读、过期租约对账与独立 worker 命令入口。
@@ -53,9 +53,7 @@ $env:PYTHONPATH='apps/api'; .\.venv\Scripts\python.exe -m productdirector_api.ma
 
 - 本轮已提供独立 worker 命令入口；原本的本机 BackgroundTasks 仍作为兼容执行入口。
 - 还未在真实 Blender/FFmpeg 长任务上做“杀 worker 进程后自动重领并完成”的云端实测；本地用 mock 渲染路径完成了合同级回归。
-- 前端 build 与 Sites worker 测试仍受本机 `npm` 不在 PATH 阻塞，命令未通过：
-  - `npm run build`
-  - `npm run test:sites`
+- 前端 build 与 Sites worker 测试的 `npm` 阻塞已解除：`npm ci` 安装 67 个包，Vite build 与 Sites 4/4 均通过（换电脑后复跑）。受限沙箱下 Vite 需读取上级目录，此时在允许该读取的环境中执行构建。
 
 ## 下一步
 
