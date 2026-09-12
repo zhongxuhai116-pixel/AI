@@ -146,14 +146,16 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
     if hasattr(bpy.types, "CompositorNodeComposite"):
         composite = tree.nodes.new("CompositorNodeComposite")
         tree.links.new(layers.outputs["Image"], composite.inputs["Image"])
+    # Blender 5 的 File Output 只支持 EXR，因此所有通道统一用 32 位 EXR：
+    # 对 Depth/Normal/Index 本来就需要浮点，Beauty/Alpha 用 EXR 也无损。
     channels = {
-        "beauty": ("Image", "PNG", "8"),
-        "alpha": ("Alpha", "PNG", "8"),
-        "depth": ("Depth", "OPEN_EXR", "32"),
-        "normal": ("Normal", "OPEN_EXR", "16"),
-        "index": ("IndexOB", "OPEN_EXR", "16"),
+        "beauty": ("Image", "RGBA"),
+        "alpha": ("Alpha", "BW"),
+        "depth": ("Depth", "BW"),
+        "normal": ("Normal", "RGBA"),
+        "index": ("IndexOB", "BW"),
     }
-    for name, (socket, file_format, depth) in channels.items():
+    for name, (socket, color_mode) in channels.items():
         node = tree.nodes.new("CompositorNodeOutputFile")
         if hasattr(node, "base_path"):
             # Blender 4：base_path + file_slots
@@ -163,15 +165,9 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
             # Blender 5：directory + file_name（帧号由渲染器追加）
             node.directory = str(pass_root / name)
             node.file_name = "frame_"
-        try:
-            node.format.file_format = file_format
-            node.format.color_depth = depth
-        except TypeError:
-            # Blender 5 的 File Output 只接受 EXR；全部通道用 32 位 EXR 输出。
-            node.format.file_format = "OPEN_EXR"
-            node.format.color_depth = "32"
-        if node.format.file_format == "OPEN_EXR":
-            node.format.color_mode = "RGBA" if name == "normal" else "BW"
+        node.format.file_format = "OPEN_EXR"
+        node.format.color_depth = "32"
+        node.format.color_mode = color_mode
         tree.links.new(layers.outputs[socket], node.inputs[0])
     print(f"DIRECTOR_PASSES root={pass_root} channels={','.join(channels)}", flush=True)
 
