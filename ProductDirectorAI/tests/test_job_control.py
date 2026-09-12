@@ -22,6 +22,10 @@ sys.path.insert(0, str(PROJECT / "apps" / "api"))
 
 from productdirector_api import main  # noqa: E402
 
+# 租约/恢复用例聚焦调度语义，质量门在这里显式 mock；媒体质量门本身由
+# test_media_quality.py 用真实 FFmpeg 产物验证。
+QA_PASS = {"passed": True, "failures": [], "samples": [], "black_seconds_ratio": 0.0}
+
 
 class JobControlAcceptanceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -303,7 +307,7 @@ class JobControlAcceptanceTests(unittest.TestCase):
         try:
             with patch("productdirector_api.main.render_glb_job", side_effect=fake_render), patch(
                 "productdirector_api.main.subprocess.run", return_value=fake_probe
-            ):
+            ), patch("productdirector_api.main.media_quality_report", return_value=dict(QA_PASS)):
                 result = main.run_worker_once("worker-cli-test")
         finally:
             main.FFPROBE = original_ffprobe
@@ -449,7 +453,7 @@ class JobControlAcceptanceTests(unittest.TestCase):
             )
             with patch("productdirector_api.main.render_glb_job", side_effect=fake_render), patch(
                 "productdirector_api.main.subprocess.run", return_value=fake_probe
-            ):
+            ), patch("productdirector_api.main.media_quality_report", return_value=dict(QA_PASS)):
                 worker.start()
                 self.assertTrue(started.wait(5), "mock 渲染未启动")
                 # 已超过一个 LEASE_SECONDS：心跳缺失时第二个 worker 会合法抢走任务。
@@ -499,7 +503,9 @@ class JobControlAcceptanceTests(unittest.TestCase):
             )
             with patch.object(main, "HeartbeatKeeper", NoHeartbeat), patch(
                 "productdirector_api.main.render_glb_job", side_effect=fake_render
-            ), patch("productdirector_api.main.subprocess.run", return_value=fake_probe):
+            ), patch("productdirector_api.main.subprocess.run", return_value=fake_probe), patch(
+                "productdirector_api.main.media_quality_report", return_value=dict(QA_PASS)
+            ):
                 worker.start()
                 self.assertTrue(started.wait(5), "mock 渲染未启动")
                 time.sleep(1.4)
@@ -534,7 +540,7 @@ class JobControlAcceptanceTests(unittest.TestCase):
         try:
             with patch("productdirector_api.main.render_glb_job", side_effect=fake_render), patch(
                 "productdirector_api.main.subprocess.run", return_value=fake_probe
-            ):
+            ), patch("productdirector_api.main.media_quality_report", return_value=dict(QA_PASS)):
                 result = main.run_worker_once("worker-b")
         finally:
             main.FFPROBE = original_ffprobe

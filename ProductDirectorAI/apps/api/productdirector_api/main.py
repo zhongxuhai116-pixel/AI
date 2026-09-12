@@ -31,6 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from cryptography.fernet import Fernet, InvalidToken
+from PIL import Image, ImageStat
 from . import security
 
 
@@ -48,6 +49,11 @@ LEASE_SECONDS = 60
 TERMINAL_JOB_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 # 长任务续租间隔：至少每 1 秒一次，且不小于租约的三分之一，避免渲染期间租约失效。
 HEARTBEAT_SECONDS = max(1.0, LEASE_SECONDS / 3)
+# A06 媒体质量门：只拦截“明显坏了”的成片，避免把低对比度的正常产品画面误判为失败。
+QA_MIN_STDDEV = float(os.getenv("PRODUCTDIRECTOR_QA_MIN_STDDEV", "2.0"))
+QA_MIN_MEAN = float(os.getenv("PRODUCTDIRECTOR_QA_MIN_MEAN", "6.0"))
+QA_MAX_BLACK_RATIO = float(os.getenv("PRODUCTDIRECTOR_QA_MAX_BLACK_RATIO", "0.35"))
+QA_BLACK_PIXEL_LEVEL = 16
 MINIMAX_API_BASE_URL = os.getenv("MINIMAX_API_BASE_URL", "https://api.minimaxi.com").rstrip("/")
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -1381,6 +1387,93 @@ def parse_r_frame_rate(value: str) -> float:
         return 0.0
 
 
+def qa_sample_frames(plan_snapshot: dict, frame_count: int) -> list[int]:
+    """按冻结计划的三段镜头边界取检查帧：每段首帧 + 整片末帧。"""
+    frames = {1}
+    total = 0
+    for shot in plan_snapshot.get("shots", []):
+        try:
+            total += int(shot.get("duration_frames", 0))
+        except (TypeError, ValueError):
+            continue
+        frames.add(min(frame_count, max(1, total)))
+    frames.add(min(frame_count, max(1, total or frame_count)))
+    return sorted(frames)
+
+
+def measure_black_ratio(video: Path, duration: float) -> float:
+    """用 ffmpeg blackdetect 统计黑屏时长占比。"""
+    if not FFMPEG or duration <= 0:
+        return 0.0
+    result = subprocess.run(
+        [FFMPEG, "-v", "info", "-i", str(video), "-vf", "blackdetect=d=0.05:pix_th=0.10",
+         "-an", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    black_seconds = 0.0
+    for line in result.stderr.splitlines():
+        match = re.search(r"black_start:([0-9.]+)\s+black_end:([0-9.]+)", line)
+        if match:
+            black_seconds += max(0.0, float(match.group(2)) - float(match.group(1)))
+    return min(1.0, black_seconds / duration)
+
+
+def media_quality_report(video: Path, plan_snapshot: dict, output_spec: OutputSpec, workdir: Path) -> dict:
+    """A06 质量门：黑帧、近乎单色（不可见）与整体黑屏占比检查。
+
+    只拦截明显故障（全黑/几乎无内容），不替代人工审美与产品保真审核。
+    """
+    if not FFMPEG:
+        raise RuntimeError("FFmpeg 未安装或未找到")
+    workdir.mkdir(parents=True, exist_ok=True)
+    failures: list[str] = []
+    samples: list[dict] = []
+    for frame in qa_sample_frames(plan_snapshot, output_spec.frame_count):
+        target = workdir / f"qa-{frame:04d}.png"
+        result = subprocess.run(
+            [FFMPEG, "-y", "-v", "error", "-i", str(video),
+             "-vf", f"select=eq(n\\,{frame - 1})", "-frames:v", "1", str(target)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not target.exists():
+            failures.append(f"帧 {frame} 无法解码: {result.stderr[-200:]}")
+            continue
+        with Image.open(target) as image:
+            grey = image.convert("L")
+            stats = ImageStat.Stat(grey)
+            mean = float(stats.mean[0])
+            stddev = float(stats.stddev[0])
+            histogram = grey.histogram()
+            total_pixels = sum(histogram) or 1
+            black_ratio = sum(histogram[:QA_BLACK_PIXEL_LEVEL]) / total_pixels
+        samples.append({
+            "frame": frame,
+            "mean": round(mean, 2),
+            "stddev": round(stddev, 2),
+            "black_pixel_ratio": round(black_ratio, 4),
+        })
+        if stddev < QA_MIN_STDDEV:
+            failures.append(f"帧 {frame} 近乎单色，可能不可见 (stddev={stddev:.2f})")
+        if mean < QA_MIN_MEAN:
+            failures.append(f"帧 {frame} 接近全黑 (mean={mean:.2f})")
+
+    duration = float(output_spec.duration_seconds)
+    black_ratio = measure_black_ratio(video, duration)
+    if black_ratio > QA_MAX_BLACK_RATIO:
+        failures.append(f"黑屏时长占比过高 ({black_ratio:.2%})")
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "samples": samples,
+        "black_seconds_ratio": round(black_ratio, 4),
+        "thresholds": {
+            "min_stddev": QA_MIN_STDDEV,
+            "min_mean": QA_MIN_MEAN,
+            "max_black_ratio": QA_MAX_BLACK_RATIO,
+        },
+    }
+
+
 def render_image_job(job_id: str, asset: dict, output: Path, plan_snapshot: dict, output_spec: OutputSpec) -> None:
     if not FFMPEG:
         raise RuntimeError("FFmpeg 未安装或未找到")
@@ -1534,6 +1627,9 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             )
         if not 5.8 <= duration <= 6.2:
             raise RuntimeError(f"视频技术检查失败: 时长不满足 6 秒: {duration:.3f}s")
+        qa_report = media_quality_report(output, plan_snapshot, output_spec, run_dir / "qa")
+        if not qa_report["passed"]:
+            raise RuntimeError("媒体质量检查失败: " + "；".join(qa_report["failures"]))
         manifest = {
             "schema_version": "1.0",
             "job_id": job_id,
@@ -1547,6 +1643,7 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             "frame_count": output_spec.frame_count,
             "duration_seconds": output_spec.duration_seconds,
             "ffprobe": {"duration": duration, "video_stream": stream},
+            "qa": qa_report,
             "director_plan": plan_snapshot,
             "director_plan_snapshot_sha256": hashlib.sha256(plan_snapshot_bytes).hexdigest(),
             "blender": Path(BLENDER).name if BLENDER else None,
