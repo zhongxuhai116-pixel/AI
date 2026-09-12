@@ -113,6 +113,41 @@ def add_lighting(scene_spec: dict | None = None):
 ALLOWED_CAMERAS = {"dolly_in", "side_track", "hero_orbit", "static"}
 
 
+def render_mask_pass(product_meshes, output: Path, args) -> None:
+    """V3-01：额外渲染一遍"只显示产品网格"的画面，其 Alpha 即纯净产品遮罩。
+
+    Blender 5.2 的合成器不提供 Object Index 输出，因此用这一遍渲染替代
+    "Product ID/Mask" 通道。代价是渲染时间接近翻倍。
+    """
+    scene = bpy.context.scene
+    mask_dir = output / "passes" / "mask"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+    product = set(product_meshes)
+    hidden: list = []
+    for obj in scene.objects:
+        if obj in product or obj.type != "MESH":
+            continue
+        if obj.hide_render is False:
+            obj.hide_render = True
+            hidden.append(obj)
+    previous = (
+        scene.render.filepath,
+        scene.render.image_settings.file_format,
+        scene.render.image_settings.color_mode,
+        scene.use_nodes,
+    )
+    scene.use_nodes = False
+    scene.render.filepath = str(mask_dir / "frame_")
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.film_transparent = True
+    bpy.ops.render.render(animation=True)
+    scene.render.filepath, scene.render.image_settings.file_format, scene.render.image_settings.color_mode, scene.use_nodes = previous
+    for obj in hidden:
+        obj.hide_render = False
+    print(f"DIRECTOR_MASK dir={mask_dir} frames={len(list(mask_dir.glob('frame_*.png')))}", flush=True)
+
+
 def configure_passes(product_meshes, pass_root: Path) -> None:
     """V3-01：为每帧额外输出 Beauty / Alpha / Depth / Normal / ProductIndex。
 
@@ -333,6 +368,8 @@ def main():
     scene.render.fps = 24
     bpy.ops.wm.save_as_mainfile(filepath=str(output.parent / "scene.blend"))
     bpy.ops.render.render(animation=True)
+    if args.passes:
+        render_mask_pass(meshes, output, args)
 
 
 if __name__ == "__main__":
