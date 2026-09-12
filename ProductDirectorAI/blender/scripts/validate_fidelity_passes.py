@@ -76,6 +76,15 @@ def pick(planes: dict, needle: str):
     return None
 
 
+def pick_first(planes: dict, *needles: str):
+    """按顺序返回第一个命中的通道（不能用 or，numpy 数组的真值判断会报错）。"""
+    for needle in needles:
+        found = pick(planes, needle)
+        if found is not None:
+            return found
+    return None
+
+
 def main() -> int:
     args = parse_args()
     root = Path(args.passes)
@@ -115,9 +124,9 @@ def main() -> int:
                 for suffix, plane in part["planes"].items():
                     planes[f"{name}.{suffix}"] = plane
         mask = read_mask(mask_files[index])
-        alpha = pick(planes, "alpha") or pick(planes, "Alpha")
-        depth = pick(planes, "depth") or pick(planes, "Depth") or pick(planes, ".Z")
-        normal_x = pick(planes, "normal.X") or pick(planes, "Normal.X")
+        alpha = pick_first(planes, "alpha", "Alpha")
+        depth = pick_first(planes, "depth", "Depth", ".Z")
+        normal_x = pick_first(planes, "normal.X", "Normal.X")
         entry: dict = {"frame_index": index, "exr_channels": channel_names}
         if alpha is not None:
             entry["alpha_coverage"] = round(float((alpha > 0.5).mean()), 4)
@@ -129,8 +138,8 @@ def main() -> int:
             entry["depth_product_min"] = round(float(np.nanmin(product_depth)), 4)
             entry["depth_product_max"] = round(float(np.nanmax(product_depth)), 4)
         if normal_x is not None and product.any():
-            normal_y = pick(planes, "normal.Y") or pick(planes, "Normal.Y")
-            normal_z = pick(planes, "normal.Z") or pick(planes, "Normal.Z")
+            normal_y = pick_first(planes, "normal.Y", "Normal.Y")
+            normal_z = pick_first(planes, "normal.Z", "Normal.Z")
             if normal_y is not None and normal_z is not None:
                 magnitude = np.sqrt(normal_x[product] ** 2 + normal_y[product] ** 2 + normal_z[product] ** 2)
                 entry["normal_mean_magnitude"] = round(float(magnitude.mean()), 4)
