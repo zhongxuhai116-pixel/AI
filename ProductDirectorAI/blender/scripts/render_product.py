@@ -163,9 +163,14 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
             # Blender 5：directory + file_name（帧号由渲染器追加）
             node.directory = str(pass_root / name)
             node.file_name = "frame_"
-        node.format.file_format = file_format
-        node.format.color_depth = depth
-        if file_format == "OPEN_EXR":
+        try:
+            node.format.file_format = file_format
+            node.format.color_depth = depth
+        except TypeError:
+            # Blender 5 的 File Output 只接受 EXR；全部通道用 32 位 EXR 输出。
+            node.format.file_format = "OPEN_EXR"
+            node.format.color_depth = "32"
+        if node.format.file_format == "OPEN_EXR":
             node.format.color_mode = "RGBA" if name == "normal" else "BW"
         tree.links.new(layers.outputs[socket], node.inputs[0])
     print(f"DIRECTOR_PASSES root={pass_root} channels={','.join(channels)}", flush=True)
