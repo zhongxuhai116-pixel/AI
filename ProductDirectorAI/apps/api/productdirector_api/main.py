@@ -371,6 +371,7 @@ def initialize_db() -> None:
         ensure_column(db, "provider_jobs", "artifact_path", "TEXT")
         ensure_column(db, "provider_jobs", "artifact_sha256", "TEXT")
         ensure_column(db, "provider_jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(db, "product_versions", "approved_at", "TEXT")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
         if not storage.is_postgres():
             legacy_index = db.execute(
@@ -2658,9 +2659,84 @@ def approve_plan(plan_id: str, request: PlanApproval) -> dict:
         current = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
         if not current:
             raise HTTPException(404, "计划不存在")
-        ensure_plan_contract(db, current, owner_id, project_id)
+        contract = ensure_plan_contract(db, current, owner_id, project_id)
         db.execute("UPDATE plans SET approved = ? WHERE id = ?", (int(request.approved), plan_id))
-    return {"id": plan_id, "approved": request.approved}
+        version = None
+        if request.approved:
+            # 批准计划即批准它对应的产品版本：版本从此不可改写，后续编辑生成新版本。
+            version = approve_product_version_row(db, contract["product_version_id"])
+    return {
+        "id": plan_id,
+        "approved": request.approved,
+        "product_version_id": contract["product_version_id"],
+        "product_version_status": version["status"] if version else None,
+        "product_version_approved_at": version["approved_at"] if version else None,
+    }
+
+
+def approve_product_version_row(db, product_version_id: str):
+    row = db.execute("SELECT * FROM product_versions WHERE id = ?", (product_version_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "产品版本不存在")
+    if row["status"] != "APPROVED":
+        db.execute(
+            "UPDATE product_versions SET status = 'APPROVED', approved_at = ? WHERE id = ?",
+            (utc_now(), product_version_id),
+        )
+    return db.execute("SELECT * FROM product_versions WHERE id = ?", (product_version_id,)).fetchone()
+
+
+def product_version_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "product_asset_id": row["product_asset_id"],
+        "version": row["version"],
+        "status": row["status"],
+        "schema_version": row["schema_version"],
+        "snapshot_sha256": row["snapshot_sha256"],
+        "approved_at": row["approved_at"] if "approved_at" in row.keys() else None,
+        "created_at": row["created_at"],
+    }
+
+
+@app.get("/api/v1/product-versions")
+def list_product_versions(
+    product_asset_id: str | None = None,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        if product_asset_id:
+            rows = db.execute(
+                "SELECT * FROM product_versions WHERE product_asset_id = ? AND owner_id = ? AND project_id = ? "
+                "ORDER BY version DESC",
+                (product_asset_id, owner_id, project_id),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM product_versions WHERE owner_id = ? AND project_id = ? ORDER BY created_at DESC",
+                (owner_id, project_id),
+            ).fetchall()
+    return [product_version_public(row) for row in rows]
+
+
+@app.post("/api/v1/product-versions/{product_version_id}/approve")
+def approve_product_version(
+    product_version_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> dict:
+    """批准一个产品版本：批准后不可改写，后续变更会生成新版本。"""
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        row = db.execute("SELECT * FROM product_versions WHERE id = ?", (product_version_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "产品版本不存在")
+        if row["owner_id"] != owner_id or row["project_id"] != project_id:
+            raise HTTPException(403, "越权访问产品版本")
+        approved = approve_product_version_row(db, product_version_id)
+    return product_version_public(approved)
 
 
 @app.patch("/api/v1/plans/{plan_id}")

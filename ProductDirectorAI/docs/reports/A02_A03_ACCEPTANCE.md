@@ -124,3 +124,37 @@ OK
 - 主规格的时长边界（除固定 6 秒外）未实现。
 - 目标合同把 `scale` 固定为 1、`sensor_width_mm` 固定为 36；放开需要用带版本号的 Schema 迁移，不能直接改现有合同。
 - 前端尚未暴露相机轨迹/位姿/场景编辑控件（当前通过 API 与合同驱动）。
+
+---
+
+## 2026-09-12 追加：产品版本审核工作流（A02 增量）
+
+上一节第 1 条的产品版本审核部分已处理。
+
+### 实现
+
+| 能力 | 行为 |
+| --- | --- |
+| `POST /api/v1/plans/{id}/approve` | 批准计划时**同时批准其产品版本**，响应返回 `product_version_id` / `product_version_status` / `product_version_approved_at` |
+| `POST /api/v1/product-versions/{id}/approve` | 显式批准某一版本；**幂等**（重复批准不改变 `approved_at`），越权返回 403，不存在返回 404 |
+| `GET /api/v1/product-versions` | 按素材或项目列出历史版本（版本号、状态、快照哈希、批准时间） |
+| `product_versions.approved_at` | 新增列（SQLite `ensure_column` 与 PostgreSQL schema 同步） |
+
+### 验证证据（`tests/test_product_versions.py`，5 项）
+
+| 用例 | 覆盖 |
+| --- | --- |
+| `test_approving_a_plan_approves_its_product_version` | 批准计划后版本状态为 `APPROVED` 且有批准时间 |
+| `test_editing_after_approval_creates_a_new_active_version` | 编辑后 **版本 1 保持 APPROVED、版本 2 为 ACTIVE**，两个版本快照哈希不同 |
+| `test_explicit_version_approval_is_idempotent` | 重复批准不改变 `approved_at` |
+| `test_unknown_version_is_rejected` | 未知版本 404 |
+| `test_versions_are_scoped_to_the_project` | 未知项目 404（不泄露存在性），已存在的其他项目返回空列表 |
+
+后端回归：本地 **133/133**。
+
+### A02 仍未完成
+
+- 多 Owner/Workspace 管理接口（现为单 Owner 部署）。
+- 主规格的非 6 秒时长边界。
+- 目标合同的 `scale` / `sensor_width_mm` 放开（需要带版本号的 Schema 迁移）。
+- 前端尚未暴露相机轨迹/位姿/场景编辑控件。

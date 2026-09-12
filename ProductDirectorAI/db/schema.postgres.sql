@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS product_versions (
   version INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'ACTIVE',
   created_at TEXT NOT NULL,
+  approved_at TEXT,
   snapshot_sha256 TEXT,
   UNIQUE (product_asset_id, owner_id, project_id, version)
 );
