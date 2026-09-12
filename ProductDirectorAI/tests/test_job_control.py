@@ -637,6 +637,35 @@ class JobControlAcceptanceTests(unittest.TestCase):
         self.assertEqual(rejected.status_code, 409)
         self.assertEqual(self.client.get(f"/api/v1/jobs/{job_id}").json()["status"], "QUEUED")
 
+    def test_a06_crop_anchor_is_frozen_into_the_run_snapshot(self) -> None:
+        plan = self._create_plan()
+        shots = [
+            {"id": "shot_01", "name": "正面推近", "duration_frames": 24, "camera": "static", "focal_length_mm": 85},
+            {"id": "shot_02", "name": "侧向观察", "duration_frames": 72, "camera": "side_track", "focal_length_mm": 24},
+            {"id": "shot_03", "name": "细节定格", "duration_frames": 48, "camera": "hero_orbit", "focal_length_mm": 55},
+        ]
+        updated = self.client.patch(
+            f"/api/v1/plans/{plan['id']}",
+            json={"intent": "构图锚点验收", "shots": shots, "crop_anchor": "right"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["crop_anchor"], "right")
+
+        self.client.post(f"/api/v1/plans/{plan['id']}/approve", json={"approved": True})
+        with patch("productdirector_api.main.execute_job"):
+            created = self.client.post("/api/v1/runs", json={"plan_id": plan["id"]})
+        job_id = created.json()["job_id"]
+        snapshot = json.loads((main.RUNS / job_id / "director_plan.json").read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["crop_anchor"], "right")
+
+    def test_a06_crop_anchor_rejects_unknown_value(self) -> None:
+        plan = self._create_plan()
+        rejected = self.client.patch(
+            f"/api/v1/plans/{plan['id']}",
+            json={"intent": "非法锚点", "shots": [], "crop_anchor": "diagonal"},
+        )
+        self.assertEqual(rejected.status_code, 422)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,9 @@ const outputPresets = [
   { label: "540 × 960（快出）", width: 540, height: 960 },
   { label: "1080 × 1920（高清）", width: 1080, height: 1920 },
 ];
+const cropAnchorLabels = [
+  ["center", "居中"], ["top", "顶部"], ["bottom", "底部"], ["left", "左侧"], ["right", "右侧"],
+];
 const cameraLabels = {
   dolly_in: "Dolly In · 推近", side_track: "Side Track · 侧移",
   hero_orbit: "Hero Orbit · 环绕", static: "Static · 定格",
@@ -128,7 +131,7 @@ function AssetCard({ asset, assetUrl, onUpload, onDemo, busy }) {
   </section>;
 }
 
-function DirectorCard({ intent, setIntent, plan, output, onOutputChange, onGenerate, busy }) {
+function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnchor, onCropAnchorChange, assetUrl, onGenerate, busy }) {
   return <section className="card director-card">
     <div className="card-head"><div><h2>导演描述</h2><span>V1 模板导演</span></div><button>高级设置 <CaretRight /></button></div>
     <textarea value={intent} onChange={(e) => setIntent(e.target.value)} />
@@ -141,6 +144,18 @@ function DirectorCard({ intent, setIntent, plan, output, onOutputChange, onGener
           {outputPresets.map((item) => <option key={`${item.width}x${item.height}`} value={`${item.width}x${item.height}`}>{item.label}</option>)}
         </select>
       </label>
+      <label>
+        <span>裁切锚点（横/竖素材进 9:16 保留哪一侧）</span>
+        <select value={cropAnchor} onChange={(event) => onCropAnchorChange(event.target.value)}>
+          {cropAnchorLabels.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+      </label>
+      <div className="crop-preview">
+        <div className="crop-frame">
+          {assetUrl ? <img src={assetUrl} alt="裁切区域预览" style={{ objectPosition: cropAnchor }} /> : <Cube weight="duotone" />}
+        </div>
+        <small>9:16 裁切区域预览 —— 成片会在这个区域内做推近/侧移，不会用到框外内容。</small>
+      </div>
     </div>
     <button className="primary wide" disabled={busy} onClick={onGenerate}><Sparkle weight="fill" />{busy ? "正在生成..." : plan ? "重新生成三镜头" : "生成三镜头计划"}</button>
   </section>;
@@ -224,6 +239,7 @@ export function App() {
   const [assetUrl, setAssetUrl] = useState("");
   const [intent, setIntent] = useState("在干净的现代工作室中，用三个清晰镜头展示产品外观、侧面结构与整体比例。");
   const [output, setOutput] = useState(outputPresets[0]);
+  const [cropAnchor, setCropAnchor] = useState("center");
   const [plan, setPlan] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [provider, setProvider] = useState(null);
@@ -286,10 +302,12 @@ export function App() {
       const response = await apiRequest("/plans/template", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ product_asset_id: asset.id, intent, ratio: "9:16", duration_seconds: 6, output }),
+        body: JSON.stringify({ product_asset_id: asset.id, intent, ratio: "9:16", duration_seconds: 6, output, crop_anchor: cropAnchor }),
       });
       if (!response.ok) throw new Error((await response.json()).detail || "计划生成失败");
-      setPlan(await response.json()); setToast(["success", "三镜头计划已生成，可以继续调整。"]);
+      const created = await response.json();
+      setPlan(created); setCropAnchor(created.crop_anchor || "center");
+      setToast(["success", "三镜头计划已生成，可以继续调整。"]);
     } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
   }
   async function run() {
@@ -298,7 +316,7 @@ export function App() {
       const saved = await apiRequest(`/plans/${plan.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ intent, shots: plan.shots }),
+        body: JSON.stringify({ intent, shots: plan.shots, crop_anchor: cropAnchor }),
       });
       if (!saved.ok) throw new Error("分镜保存失败");
       const approval = await apiRequest(`/plans/${plan.id}/approve`, {
@@ -386,6 +404,9 @@ export function App() {
             plan={plan}
             output={output}
             onOutputChange={updateOutput}
+            cropAnchor={cropAnchor}
+            onCropAnchorChange={setCropAnchor}
+            assetUrl={asset?.kind === "image" ? assetUrl : ""}
             onGenerate={generatePlan}
             busy={busy}
           />

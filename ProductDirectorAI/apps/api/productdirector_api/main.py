@@ -22,6 +22,7 @@ from ctypes import wintypes
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -383,6 +384,26 @@ class Shot(BaseModel):
     focal_length_mm: int = Field(ge=15, le=120)
 
 
+class CropAnchor(str, Enum):
+    """横向/纵向素材裁切到 9:16 时保留哪一侧（对应 CSS object-position 语义）。"""
+
+    center = "center"
+    top = "top"
+    bottom = "bottom"
+    left = "left"
+    right = "right"
+
+
+# FFmpeg crop 的 x/y 偏移表达式；图片路径先用它把源素材裁进 9:16 画布。
+CROP_ANCHOR_OFFSETS: dict[str, tuple[str, str]] = {
+    "center": ("(iw-ow)/2", "(ih-oh)/2"),
+    "top": ("(iw-ow)/2", "0"),
+    "bottom": ("(iw-ow)/2", "ih-oh"),
+    "left": ("0", "(ih-oh)/2"),
+    "right": ("iw-ow", "(ih-oh)/2"),
+}
+
+
 class OutputSpec(BaseModel):
     width: Literal[540, 1080] = DEFAULT_OUTPUT_WIDTH
     height: Literal[960, 1920] = DEFAULT_OUTPUT_HEIGHT
@@ -406,6 +427,7 @@ class PlanRequest(BaseModel):
     ratio: Literal["9:16"] = "9:16"
     duration_seconds: Literal[6] = 6
     output: OutputSpec = Field(default_factory=OutputSpec)
+    crop_anchor: CropAnchor = CropAnchor.center
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
@@ -425,6 +447,7 @@ class PlanApproval(BaseModel):
 class PlanUpdate(BaseModel):
     intent: str = Field(min_length=1, max_length=4000)
     shots: list[Shot] = Field(min_length=3, max_length=3)
+    crop_anchor: CropAnchor = CropAnchor.center
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
@@ -1359,14 +1382,22 @@ def image_shot_filter(shot: Shot, index: int, fps: int, size: str) -> str:
 def build_image_filtergraph(plan_snapshot: dict, output: OutputSpec) -> str:
     """Turn the persisted DirectorPlan snapshot into a fixed 144-frame edit."""
     validated = PlanUpdate.model_validate(
-        {"intent": plan_snapshot.get("intent"), "shots": plan_snapshot.get("shots")}
+        {
+            "intent": plan_snapshot.get("intent"),
+            "shots": plan_snapshot.get("shots"),
+            "crop_anchor": plan_snapshot.get("crop_anchor", CropAnchor.center.value),
+        }
     )
     sources = "".join(f"[source_{index}]" for index in range(3))
     preview_width = int(round(output.width * 64 / 27))
     preview_height = int(round(output.height * 64 / 27))
+    # 横向素材在 cover 缩放后会比画布宽，纵向素材则会比画布高；
+    # 锚点决定先保留源素材的哪一部分，之后的镜头运动会在这个区域内进行。
+    anchor = validated.crop_anchor.value
+    offset_x, offset_y = CROP_ANCHOR_OFFSETS.get(anchor, CROP_ANCHOR_OFFSETS["center"])
     filters = [
         f"[0:v]scale={preview_width}:{preview_height}:force_original_aspect_ratio=increase,"
-        f"crop={preview_width}:{preview_height}:(iw-ow)/2:(ih-oh)/2,split=3" + sources,
+        f"crop={preview_width}:{preview_height}:{offset_x}:{offset_y},split=3" + sources,
     ]
     filters.extend(image_shot_filter(shot, index, output.fps, f"{output.width}x{output.height}") for index, shot in enumerate(validated.shots))
     filters.append("[shot_0][shot_1][shot_2]concat=n=3:v=1:a=0,format=yuv420p[video]")
@@ -1916,6 +1947,7 @@ def create_plan(request: PlanRequest) -> dict:
             "intent": request.intent,
             "output": request.output.model_dump(),
             "fidelity_mode": "STRICT_REQUESTED",
+            "crop_anchor": request.crop_anchor.value,
             "shots": [shot.model_dump() for shot in shots],
         }
         _, payload_sha256 = plan_contract_payload_hash(payload)
@@ -1937,6 +1969,7 @@ def create_plan(request: PlanRequest) -> dict:
         "intent": request.intent,
         "output": request.output.model_dump(),
         "fidelity_mode": "STRICT_REQUESTED",
+        "crop_anchor": request.crop_anchor.value,
         "shots": payload["shots"],
     }
 
@@ -1964,6 +1997,7 @@ def update_plan(plan_id: str, request: PlanUpdate) -> dict:
         payload = json.loads(current["payload"])
         payload["intent"] = request.intent
         payload["shots"] = [shot.model_dump() for shot in request.shots]
+        payload["crop_anchor"] = request.crop_anchor.value
         _, payload_sha256 = plan_contract_payload_hash(payload)
         contract_version_id = create_product_version(
             current["product_asset_id"],
@@ -1997,7 +2031,13 @@ def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
             raise HTTPException(409, "请先确认分镜计划")
         plan_snapshot = json.loads(plan["payload"])
         try:
-            PlanUpdate.model_validate({"intent": plan_snapshot["intent"], "shots": plan_snapshot["shots"]})
+            PlanUpdate.model_validate(
+                {
+                    "intent": plan_snapshot["intent"],
+                    "shots": plan_snapshot["shots"],
+                    "crop_anchor": plan_snapshot.get("crop_anchor", CropAnchor.center.value),
+                }
+            )
         except (KeyError, json.JSONDecodeError, ValueError) as exc:
             raise HTTPException(409, f"计划快照无效，无法启动任务: {exc}") from exc
         asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan["product_asset_id"],)).fetchone()

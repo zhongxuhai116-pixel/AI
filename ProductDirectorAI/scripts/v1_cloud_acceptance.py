@@ -41,6 +41,7 @@ GLB_FIXTURE = REPO / "tests" / "fixtures" / "generic-product.glb"
 JOB_TIMEOUT = int(os.environ.get("PD_JOB_TIMEOUT", "1200"))
 # 可选：用用户提供的真实产品图替换程序生成的夹具图（该文件不进入 Git）。
 IMAGE_OVERRIDE = os.environ.get("PD_IMAGE_PATH", "")
+CROP_ANCHOR = os.environ.get("PD_CROP_ANCHOR", "center")
 
 SHOTS = [
     {"id": "shot_01", "name": "正面推近", "duration_frames": 24, "camera": "static", "focal_length_mm": 85},
@@ -131,6 +132,7 @@ class Acceptance:
                 "intent": f"V1 云端验收（{label}）",
                 "duration_seconds": 6,
                 "output": {"width": 1080, "height": 1920, "fps": 24, "duration_seconds": 6},
+                "crop_anchor": CROP_ANCHOR,
             },
         )
         plan.raise_for_status()
@@ -142,7 +144,11 @@ class Acceptance:
         edited = self.client.patch(
             f"/api/v1/plans/{plan_id}",
             headers=self.headers,
-            json={"intent": f"V1 云端验收（{label}，三段分镜已编辑）", "shots": shots},
+            json={
+                "intent": f"V1 云端验收（{label}，三段分镜已编辑）",
+                "shots": shots,
+                "crop_anchor": CROP_ANCHOR,
+            },
         )
         edited.raise_for_status()
         self.client.post(f"/api/v1/plans/{plan_id}/approve", headers=self.headers, json={"approved": True}).raise_for_status()
@@ -233,6 +239,7 @@ def main() -> int:
             },
             "glb": {"label": GLB_FIXTURE.name, "sha256": sha256(GLB_FIXTURE)},
         },
+        "crop_anchor": CROP_ANCHOR,
         "paths": [],
     }
     summary["paths"].append(

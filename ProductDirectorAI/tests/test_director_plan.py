@@ -100,6 +100,40 @@ class DirectorPlanContractTests(unittest.TestCase):
         self.assertEqual(parse_r_frame_rate("not-a-rate"), 0.0)
         self.assertEqual(parse_r_frame_rate("24/0"), 0.0)
 
+    # --- A06 构图锚点：横向/纵向素材裁进 9:16 时保留哪一侧 ---
+
+    def test_crop_anchor_defaults_to_center(self):
+        self.assertEqual(PlanUpdate.model_validate(plan_payload()).crop_anchor.value, "center")
+        self.assertEqual(PlanRequest.model_validate({"product_asset_id": "a", "intent": "x"}).crop_anchor.value, "center")
+
+    def test_crop_anchor_offsets_change_the_landscape_crop(self):
+        snapshot = plan_payload()
+
+        snapshot["crop_anchor"] = "left"
+        self.assertIn("crop=1280:2276:0:(ih-oh)/2", build_image_filtergraph(snapshot, OutputSpec()))
+        snapshot["crop_anchor"] = "right"
+        self.assertIn("crop=1280:2276:iw-ow:(ih-oh)/2", build_image_filtergraph(snapshot, OutputSpec()))
+        snapshot["crop_anchor"] = "center"
+        self.assertIn("crop=1280:2276:(iw-ow)/2:(ih-oh)/2", build_image_filtergraph(snapshot, OutputSpec()))
+
+    def test_crop_anchor_offsets_change_the_portrait_crop(self):
+        snapshot = plan_payload()
+
+        snapshot["crop_anchor"] = "top"
+        self.assertIn("crop=1280:2276:(iw-ow)/2:0", build_image_filtergraph(snapshot, OutputSpec()))
+        snapshot["crop_anchor"] = "bottom"
+        self.assertIn("crop=1280:2276:(iw-ow)/2:ih-oh", build_image_filtergraph(snapshot, OutputSpec()))
+
+    def test_legacy_snapshot_without_crop_anchor_still_renders_as_center(self):
+        # 旧作业快照没有该字段，必须继续按居中裁切工作。
+        snapshot = plan_payload()
+        self.assertNotIn("crop_anchor", snapshot)
+        self.assertIn("crop=1280:2276:(iw-ow)/2:(ih-oh)/2", build_image_filtergraph(snapshot, OutputSpec()))
+
+    def test_invalid_crop_anchor_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            PlanUpdate.model_validate({**plan_payload(), "crop_anchor": "diagonal"})
+
 
 if __name__ == "__main__":
     unittest.main()
