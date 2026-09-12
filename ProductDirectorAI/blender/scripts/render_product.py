@@ -133,7 +133,12 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
         obj.pass_index = index
     pass_root.mkdir(parents=True, exist_ok=True)
     scene.use_nodes = True
-    tree = scene.node_tree
+    # Blender 4 用 scene.node_tree；Blender 5 改成 scene.compositing_node_group。
+    if hasattr(scene, "node_tree"):
+        tree = scene.node_tree
+    else:
+        tree = scene.compositing_node_group or bpy.data.node_groups.new("DirectorCompositor", "CompositorNodeTree")
+        scene.compositing_node_group = tree
     tree.nodes.clear()
     layers = tree.nodes.new("CompositorNodeRLayers")
     composite = tree.nodes.new("CompositorNodeComposite")
