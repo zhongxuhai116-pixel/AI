@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument("--passes", required=True)
     parser.add_argument("--frames", type=int, default=72)
     parser.add_argument("--json", default="")
-    return parser.parse_args(sys.argv[sys.argv.index("--") + 1 :])
+    return parser.parse_args()
 
 
 def read_mask(path: Path) -> np.ndarray:
