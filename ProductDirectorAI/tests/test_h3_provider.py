@@ -184,6 +184,77 @@ class H3ProviderTests(unittest.TestCase):
     def test_unknown_provider_job_returns_404(self) -> None:
         self.assertEqual(self.client.get("/api/v1/providers/h3/jobs/nope").status_code, 404)
 
+    # --- 取消与队列 ---
+
+    def test_queue_endpoint_reports_comfyui_and_project_state(self) -> None:
+        provider_job_id = self._submitted_job()
+        row = self._provider_rows()[0]
+        with patch.object(comfyui, "queue_snapshot", return_value={
+            "running": [], "pending": [row["external_id"]], "depth": 1
+        }):
+            body = self.client.get("/api/v1/providers/h3/queue").json()
+        self.assertEqual(body["queue_depth"], 1)
+        self.assertTrue(body["single_gpu_serial"])
+        self.assertEqual(body["our_running_jobs"], [
+            {"provider_job_id": provider_job_id, "operation": "RECONSTRUCT_3D", "queue_state": "pending"}
+        ])
+
+    def test_cancel_pending_job_deletes_only_that_prompt(self) -> None:
+        provider_job_id = self._submitted_job()
+        row = self._provider_rows()[0]
+        with patch.object(comfyui, "queue_snapshot", return_value={
+            "running": [], "pending": [row["external_id"]], "depth": 1
+        }), patch.object(comfyui, "delete_pending", return_value=True) as delete, patch.object(
+            comfyui, "interrupt"
+        ) as interrupt:
+            response = self.client.post(f"/api/v1/providers/h3/jobs/{provider_job_id}/cancel")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "CANCELLED")
+        self.assertEqual(response.json()["cancel_requested"], 1)
+        delete.assert_called_once_with(row["external_id"])
+        interrupt.assert_not_called()
+
+    def test_cancel_running_job_is_refused_without_force_and_records_the_request(self) -> None:
+        provider_job_id = self._submitted_job()
+        row = self._provider_rows()[0]
+        with patch.object(comfyui, "queue_snapshot", return_value={
+            "running": [row["external_id"]], "pending": [], "depth": 1
+        }), patch.object(comfyui, "interrupt") as interrupt:
+            response = self.client.post(f"/api/v1/providers/h3/jobs/{provider_job_id}/cancel")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("全局中断", response.json()["detail"])
+        interrupt.assert_not_called()
+        refreshed = self._provider_rows()[0]
+        self.assertEqual(refreshed["status"], "RUNNING")
+        self.assertEqual(refreshed["cancel_requested"], 1)
+
+    def test_cancel_running_job_with_force_interrupts(self) -> None:
+        provider_job_id = self._submitted_job()
+        row = self._provider_rows()[0]
+        with patch.object(comfyui, "queue_snapshot", return_value={
+            "running": [row["external_id"]], "pending": [], "depth": 1
+        }), patch.object(comfyui, "interrupt") as interrupt:
+            response = self.client.post(
+                f"/api/v1/providers/h3/jobs/{provider_job_id}/cancel", params={"force": "true"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "CANCELLED")
+        interrupt.assert_called_once()
+
+    def test_cancel_after_completion_is_a_no_op(self) -> None:
+        provider_job_id = self._submitted_job()
+        record = {"status": {"completed": True, "status_str": "success"},
+                  "outputs": {"10": {"3d": [{"filename": "out.glb", "subfolder": "", "type": "output"}]}}}
+        with patch.object(comfyui, "history", return_value=record), patch.object(
+            comfyui, "download", return_value=FIXTURE_GLB.read_bytes()
+        ):
+            self.client.get(f"/api/v1/providers/h3/jobs/{provider_job_id}")
+        with patch.object(comfyui, "queue_snapshot") as snapshot:
+            response = self.client.post(f"/api/v1/providers/h3/jobs/{provider_job_id}/cancel")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "SUCCEEDED")
+        snapshot.assert_not_called()
+
     # --- 视频生成 ---
 
     def _submit_video(self, **overrides):

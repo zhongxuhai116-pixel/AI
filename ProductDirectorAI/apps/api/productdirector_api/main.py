@@ -368,6 +368,7 @@ def initialize_db() -> None:
         ensure_column(db, "assets", "owner_id", "TEXT NOT NULL DEFAULT 'owner-default'")
         ensure_column(db, "provider_jobs", "artifact_path", "TEXT")
         ensure_column(db, "provider_jobs", "artifact_sha256", "TEXT")
+        ensure_column(db, "provider_jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
         if not storage.is_postgres():
             legacy_index = db.execute(
@@ -1963,6 +1964,7 @@ def provider_job_public(row) -> dict:
         "artifact_asset_id": row["artifact_asset_id"],
         "artifact_sha256": row["artifact_sha256"] if "artifact_sha256" in row.keys() else None,
         "artifact_ready": bool(row["artifact_asset_id"] or (row["artifact_path"] if "artifact_path" in row.keys() else None)),
+        "cancel_requested": int(row["cancel_requested"]) if "cancel_requested" in row.keys() and row["cancel_requested"] is not None else 0,
         "error": row["error"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -2329,6 +2331,94 @@ def h3_job_status(
     if row["operation"] == "GENERATE_VIDEO":
         return collect_video_artifact(row, record, owner_id)
     return collect_mesh_artifact(row, record, owner_id)
+
+
+@app.get("/api/v1/providers/h3/queue")
+def h3_queue() -> dict:
+    """队列与单卡产能视图：ComfyUI 全局队列 + 本项目的任务分布。"""
+    try:
+        snapshot = comfyui.queue_snapshot()
+    except comfyui.ComfyUIError as exc:
+        raise HTTPException(503, f"无法读取 H3 队列: {exc}") from exc
+    with connect() as db:
+        rows = db.execute(
+            "SELECT id, external_id, operation, status FROM provider_jobs "
+            "WHERE status = 'RUNNING' ORDER BY created_at"
+        ).fetchall()
+    running_ids = set(snapshot["running"])
+    pending_ids = set(snapshot["pending"])
+    ours = []
+    for row in rows:
+        state = "unknown"
+        if row["external_id"] in running_ids:
+            state = "running"
+        elif row["external_id"] in pending_ids:
+            state = "pending"
+        ours.append({"provider_job_id": row["id"], "operation": row["operation"], "queue_state": state})
+    return {
+        "comfyui_running": len(snapshot["running"]),
+        "comfyui_pending": len(snapshot["pending"]),
+        "queue_depth": snapshot["depth"],
+        "single_gpu_serial": True,
+        "our_running_jobs": ours,
+    }
+
+
+@app.post("/api/v1/providers/h3/jobs/{provider_job_id}/cancel")
+def h3_job_cancel(
+    provider_job_id: str,
+    force: bool = False,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> dict:
+    """取消 Provider 任务。
+
+    - 仍在排队：通过 `/queue` 精确删除该 prompt，**不影响其他任务**。
+    - 已在执行：ComfyUI 只有全局 `/interrupt`，会影响该实例上正在运行的所有任务，
+      因此默认拒绝并记录取消请求；私有单租户部署可显式 `?force=true` 中断。
+    """
+    normalize_contract_context(owner_id, project_id)
+    row = load_provider_job(provider_job_id)
+    if row["status"] in TERMINAL_JOB_STATUSES:
+        return provider_job_public(row)
+    if not row["external_id"]:
+        update_provider_job(provider_job_id, status="CANCELLED", stage="SUBMIT",
+                            cancel_requested=1, error="提交阶段取消")
+        return provider_job_public(load_provider_job(provider_job_id))
+
+    try:
+        snapshot = comfyui.queue_snapshot()
+    except comfyui.ComfyUIError as exc:
+        raise HTTPException(503, f"无法读取 H3 队列: {exc}") from exc
+
+    if row["external_id"] in snapshot["pending"]:
+        try:
+            removed = comfyui.delete_pending(row["external_id"])
+        except comfyui.ComfyUIError as exc:
+            raise HTTPException(503, f"队列删除失败: {exc}") from exc
+        if not removed:
+            raise HTTPException(409, "队列删除未生效，任务可能已开始执行，请重新查询状态")
+        update_provider_job(provider_job_id, status="CANCELLED", stage="GENERATE",
+                            cancel_requested=1, error="用户在排队阶段取消")
+        return provider_job_public(load_provider_job(provider_job_id))
+
+    if row["external_id"] in snapshot["running"]:
+        if not force:
+            update_provider_job(provider_job_id, cancel_requested=1)
+            raise HTTPException(
+                409,
+                "任务已在执行。ComfyUI 的 /interrupt 是全局中断，会影响该实例上正在运行的所有任务，"
+                "因此默认不代为中断；私有单租户部署可显式使用 force=true。取消请求已记录。",
+            )
+        try:
+            comfyui.interrupt()
+        except comfyui.ComfyUIError as exc:
+            raise HTTPException(503, f"中断失败: {exc}") from exc
+        update_provider_job(provider_job_id, status="CANCELLED", stage="GENERATE",
+                            cancel_requested=1, error="用户强制中断（全局 interrupt）")
+        return provider_job_public(load_provider_job(provider_job_id))
+
+    raise HTTPException(409, "任务既不在运行也不在排队，请重新查询状态后再决定")
 
 
 @app.get("/api/v1/providers/h3/jobs/{provider_job_id}/artifact")

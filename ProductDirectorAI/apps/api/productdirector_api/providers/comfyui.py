@@ -114,6 +114,33 @@ def download(item: dict) -> bytes:
     return _request(f"/view?{query}", timeout=300)
 
 
+def queue_snapshot(timeout: int = 15) -> dict:
+    """当前队列：运行中与排队中的 prompt。"""
+    try:
+        payload = json.loads(_request("/queue", timeout=timeout).decode("utf-8"))
+    except (ComfyUIError, json.JSONDecodeError) as exc:
+        raise ComfyUIError(f"无法读取 ComfyUI 队列: {exc}") from exc
+    running = [str(entry[1]) for entry in payload.get("queue_running", []) if len(entry) > 1]
+    pending = [str(entry[1]) for entry in payload.get("queue_pending", []) if len(entry) > 1]
+    return {"running": running, "pending": pending, "depth": len(running) + len(pending)}
+
+
+def delete_pending(prompt_id: str, timeout: int = 15) -> bool:
+    """从队列里删除一个**尚未开始**的 prompt；返回是否已不在队列中。"""
+    _request("/queue", {"delete": [prompt_id]}, timeout=timeout)
+    snapshot = queue_snapshot(timeout=timeout)
+    return prompt_id not in snapshot["pending"] and prompt_id not in snapshot["running"]
+
+
+def interrupt(timeout: int = 15) -> None:
+    """中断当前正在执行的 prompt。
+
+    注意：这是 ComfyUI 的**全局**中断，会影响该实例上当前运行的任务，
+    因此只能在私有单租户部署里由调用方显式要求时使用。
+    """
+    _request("/interrupt", {}, timeout=timeout)
+
+
 def upload_image(filename: str, data: bytes, timeout: int = 120) -> str:
     """把图片上传到 ComfyUI 的 input 目录，返回它在 LoadImage 里可用的名字。"""
     boundary = "----productdirectorboundary"

@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS provider_jobs (
   artifact_asset_id TEXT,
   artifact_path TEXT,
   artifact_sha256 TEXT,
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
   error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
