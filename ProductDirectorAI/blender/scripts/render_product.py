@@ -155,8 +155,14 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
     }
     for name, (socket, file_format, depth) in channels.items():
         node = tree.nodes.new("CompositorNodeOutputFile")
-        node.base_path = str(pass_root / name)
-        node.file_slots[0].path = "frame_"
+        if hasattr(node, "base_path"):
+            # Blender 4：base_path + file_slots
+            node.base_path = str(pass_root / name)
+            node.file_slots[0].path = "frame_"
+        else:
+            # Blender 5：directory + file_name（帧号由渲染器追加）
+            node.directory = str(pass_root / name)
+            node.file_name = "frame_"
         node.format.file_format = file_format
         node.format.color_depth = depth
         if file_format == "OPEN_EXR":
