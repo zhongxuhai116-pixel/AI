@@ -102,13 +102,14 @@ def main_check() -> int:
             patch_body["scene"] = scene
         client.patch(f"/api/v1/plans/{plan_id}", json=patch_body).raise_for_status()
         client.post(f"/api/v1/plans/{plan_id}/approve", json={"approved": True}).raise_for_status()
+        # TestClient 会等后台任务跑完才返回，所以计时必须包住这次请求本身。
+        started = time.time()
         run = client.post("/api/v1/runs", json={"plan_id": plan_id})
         run.raise_for_status()
         job_id = run.json()["job_id"]
 
         deadline = time.time() + 600
         job: dict = {}
-        started = time.time()
         while time.time() < deadline:
             job = client.get(f"/api/v1/jobs/{job_id}").json()
             if job["status"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
