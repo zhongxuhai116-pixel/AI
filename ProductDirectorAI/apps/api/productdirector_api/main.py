@@ -2345,6 +2345,17 @@ def h3_job_status(
     return collect_mesh_artifact(row, record, owner_id)
 
 
+@app.get("/api/v1/providers/h3/jobs")
+def list_provider_jobs(limit: int = 20) -> list[dict]:
+    """最近的 Provider 任务，供工作台展示与取消。"""
+    capped = max(1, min(limit, 100))
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM provider_jobs ORDER BY created_at DESC LIMIT ?", (capped,)
+        ).fetchall()
+    return [provider_job_public(row) for row in rows]
+
+
 @app.get("/api/v1/providers/h3/queue")
 def h3_queue() -> dict:
     """队列与单卡产能视图：ComfyUI 全局队列 + 本项目的任务分布。"""

@@ -184,6 +184,18 @@ class H3ProviderTests(unittest.TestCase):
     def test_unknown_provider_job_returns_404(self) -> None:
         self.assertEqual(self.client.get("/api/v1/providers/h3/jobs/nope").status_code, 404)
 
+    def test_provider_job_list_covers_both_operations_without_leaking_payloads(self) -> None:
+        self._submitted_job()
+        with patch.object(comfyui, "upload_image", return_value="remote.png"), patch.object(
+            comfyui, "submit", return_value="prompt-video"
+        ):
+            self._submit_video()
+        listing = self.client.get("/api/v1/providers/h3/jobs").json()
+        self.assertEqual({item["operation"] for item in listing}, {"RECONSTRUCT_3D", "GENERATE_VIDEO"})
+        for item in listing:
+            self.assertIn("artifact_ready", item)
+            self.assertNotIn("request_payload", item)
+
     # --- 取消与队列 ---
 
     def test_queue_endpoint_reports_comfyui_and_project_state(self) -> None:
