@@ -83,10 +83,20 @@ def _focal_for(camera: str, index: int) -> int:
     return 55
 
 
-def rule_based_plan(intent: str, asset_kind: str = "image", seed: int = 0) -> dict:
-    """本地规则生成器：按关键词选择机位与时长组合。"""
+def _scale_mix(mix: tuple[int, int, int], duration_seconds: int) -> tuple[int, int, int]:
+    """把 6 秒基准组合按比例缩放到目标总帧数（每段 ≥24，合计精确）。"""
+    total = 24 * duration_seconds
+    if duration_seconds == 6:
+        return mix
+    scaled = [max(24, round(value * duration_seconds / 6)) for value in mix]
+    scaled[2] = max(24, total - scaled[0] - scaled[1])
+    return tuple(scaled)  # type: ignore[return-value]
+
+
+def rule_based_plan(intent: str, asset_kind: str = "image", seed: int = 0, duration_seconds: int = 6) -> dict:
+    """本地规则生成器：按关键词选择机位与时长组合（总时长 5–8 秒）。"""
     cameras = _pick_cameras(intent, asset_kind)
-    durations = _pick_durations(intent)
+    durations = _scale_mix(_pick_durations(intent), duration_seconds)
     shots = []
     for index, (camera, duration) in enumerate(zip(cameras, durations), start=1):
         shots.append({
@@ -100,9 +110,9 @@ def rule_based_plan(intent: str, asset_kind: str = "image", seed: int = 0) -> di
     return {"intent": intent, "shots": shots}
 
 
-def _repair(candidate: dict, intent: str, asset_kind: str, reason: str) -> tuple[dict, str]:
+def _repair(candidate: dict, intent: str, asset_kind: str, reason: str, duration_seconds: int = 6) -> tuple[dict, str]:
     """把非法候选修回合法形状：保留能用的镜头，其余退回模板。"""
-    template = rule_based_plan(intent, asset_kind)
+    template = rule_based_plan(intent, asset_kind, duration_seconds=duration_seconds)
     shots = candidate.get("shots")
     repaired = {"intent": candidate.get("intent") or intent, "shots": []}
     if isinstance(shots, list) and len(shots) == 3:
@@ -126,12 +136,13 @@ def _repair(candidate: dict, intent: str, asset_kind: str, reason: str) -> tuple
     return repaired, reason
 
 
-def validate_candidate(candidate: dict, validator) -> str | None:
+def validate_candidate(candidate: dict, validator, duration_seconds: int = 6) -> str | None:
     """返回 None 表示合法；否则返回可读原因。"""
     try:
         validator.model_validate({
             "intent": candidate.get("intent"),
             "shots": candidate.get("shots"),
+            "duration_seconds": duration_seconds,
         })
     except ValidationError as exc:
         first = exc.errors()[0]
@@ -157,7 +168,7 @@ def parse_llm_content(content: str) -> dict:
     return json.loads(match.group(0))
 
 
-def build_plan(intent: str, asset_kind: str = "image", validator=None, llm=None) -> DirectorResult:
+def build_plan(intent: str, asset_kind: str = "image", validator=None, llm=None, duration_seconds: int = 6) -> DirectorResult:
     """生成 → 校验 → 最多修复两次，返回合法计划与过程记录。"""
     repairs: list[str] = []
     rejected = 0
@@ -165,29 +176,29 @@ def build_plan(intent: str, asset_kind: str = "image", validator=None, llm=None)
         producer = lambda: llm(intent, asset_kind)  # noqa: E731
         provider = "llm"
     else:
-        producer = lambda: rule_based_plan(intent, asset_kind)  # noqa: E731
+        producer = lambda: rule_based_plan(intent, asset_kind, duration_seconds=duration_seconds)  # noqa: E731
         provider = "rules"
 
     try:
         candidate = producer()
     except Exception as exc:  # Provider 失败直接退模板，不阻塞用户
         repairs.append(f"provider failed: {exc}")
-        candidate = rule_based_plan(intent, asset_kind)
+        candidate = rule_based_plan(intent, asset_kind, duration_seconds=duration_seconds)
         provider = "rules"
 
     attempts = 1
     while True:
-        problem = validate_candidate(candidate, validator) if validator is not None else None
+        problem = validate_candidate(candidate, validator, duration_seconds) if validator is not None else None
         if problem is None:
             return DirectorResult(plan=candidate, provider=provider, attempts=attempts,
                                   repairs=repairs, rejected_candidates=rejected)
         rejected += 1
         if attempts > MAX_REPAIRS:
-            candidate = rule_based_plan(intent, asset_kind)
+            candidate = rule_based_plan(intent, asset_kind, duration_seconds=duration_seconds)
             repairs.append(f"fallback to template after {attempts} attempts: {problem}")
             return DirectorResult(plan=candidate, provider="rules", attempts=attempts,
                                   repairs=repairs, rejected_candidates=rejected)
-        candidate, reason = _repair(candidate, intent, asset_kind, problem)
+        candidate, reason = _repair(candidate, intent, asset_kind, problem, duration_seconds)
         repairs.append(f"repair {attempts}: {reason}")
         attempts += 1
 

@@ -405,6 +405,8 @@ DEFAULT_OUTPUT_WIDTH = 540
 DEFAULT_OUTPUT_HEIGHT = 960
 DEFAULT_FPS = 24
 DEFAULT_DURATION_SECONDS = 6
+# 主规划 V1 约束：三个镜头、总时长 5–8 秒、固定 24fps（即 120–192 帧）。
+ALLOWED_DURATION_SECONDS = (5, 6, 7, 8)
 
 
 class Shot(BaseModel):
@@ -443,7 +445,7 @@ class OutputSpec(BaseModel):
     width: Literal[540, 1080] = DEFAULT_OUTPUT_WIDTH
     height: Literal[960, 1920] = DEFAULT_OUTPUT_HEIGHT
     fps: Literal[24] = DEFAULT_FPS
-    duration_seconds: Literal[6] = DEFAULT_DURATION_SECONDS
+    duration_seconds: Literal[5, 6, 7, 8] = DEFAULT_DURATION_SECONDS
 
     @model_validator(mode="after")
     def validate_output_ratio(self):
@@ -460,7 +462,7 @@ class PlanRequest(BaseModel):
     product_asset_id: str
     intent: str = Field(min_length=1, max_length=4000)
     ratio: Literal["9:16"] = "9:16"
-    duration_seconds: Literal[6] = 6
+    duration_seconds: Literal[5, 6, 7, 8] = 6
     output: OutputSpec = Field(default_factory=OutputSpec)
     crop_anchor: CropAnchor = CropAnchor.center
     product_pose: ProductPose = Field(default_factory=ProductPose)
@@ -487,13 +489,15 @@ class PlanUpdate(BaseModel):
     crop_anchor: CropAnchor = CropAnchor.center
     product_pose: ProductPose = Field(default_factory=ProductPose)
     scene: SceneSpec = Field(default_factory=SceneSpec)
+    duration_seconds: Literal[5, 6, 7, 8] = 6
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
     @model_validator(mode="after")
     def validate_total_duration(self):
-        if sum(shot.duration_frames for shot in self.shots) != 144:
-            raise ValueError("三个镜头的总时长必须恰好为 144 帧（6 秒）")
+        expected = DEFAULT_FPS * self.duration_seconds
+        if sum(shot.duration_frames for shot in self.shots) != expected:
+            raise ValueError(f"三个镜头的总帧数必须恰好为 {expected} 帧（{self.duration_seconds} 秒 × 24fps）")
         return self
 
 
@@ -549,6 +553,7 @@ class DirectorPlanRequest(BaseModel):
     intent: str = Field(min_length=1, max_length=4000)
     product_asset_id: str | None = None
     asset_kind: Literal["image", "model"] = "image"
+    duration_seconds: Literal[5, 6, 7, 8] = 6
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
@@ -1474,6 +1479,7 @@ def build_image_filtergraph(plan_snapshot: dict, output: OutputSpec) -> str:
             "intent": plan_snapshot.get("intent"),
             "shots": plan_snapshot.get("shots"),
             "crop_anchor": plan_snapshot.get("crop_anchor", CropAnchor.center.value),
+            "duration_seconds": (plan_snapshot.get("output") or {}).get("duration_seconds", 6),
         }
     )
     sources = "".join(f"[source_{index}]" for index in range(3))
@@ -1645,7 +1651,7 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_p
         "--output", str(frames),
         "--width", str(output_spec.width),
         "--height", str(output_spec.height),
-        "--frames", "144",
+        "--frames", str(output_spec.frame_count),
         "--plan", str(plan_path),
     ]
     update_job(job_id, status="RUNNING", stage="RENDER", progress=12)
@@ -1658,9 +1664,9 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_p
     for line in process.stdout:
         output_lines.append(line)
         if "Saved:" in line or "Time:" in line and "Rendering" not in line:
-            rendered = min(144, rendered + 1)
+            rendered = min(output_spec.frame_count, rendered + 1)
             if rendered % 4 == 0:
-                update_job(job_id, progress=12 + int(rendered / 144 * 70))
+                update_job(job_id, progress=12 + int(rendered / output_spec.frame_count * 70))
         if get_job(job_id)["cancel_requested"]:
             process.terminate()
             break
@@ -1746,8 +1752,11 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
                 f"视频技术检查失败: fps={framerate}, frames={frame_count}, "
                 f"duration={duration:.3f}s"
             )
-        if not 5.8 <= duration <= 6.2:
-            raise RuntimeError(f"视频技术检查失败: 时长不满足 6 秒: {duration:.3f}s")
+        expected_duration = float(output_spec.duration_seconds)
+        if abs(duration - expected_duration) > 0.2:
+            raise RuntimeError(
+                f"视频技术检查失败: 时长 {duration:.3f}s 与计划要求的 {expected_duration:.1f}s 不符"
+            )
         qa_report = media_quality_report(output, plan_snapshot, output_spec, run_dir / "qa")
         if not qa_report["passed"]:
             raise RuntimeError("媒体质量检查失败: " + "；".join(qa_report["failures"]))
@@ -2067,6 +2076,7 @@ def generate_director_plan(request: DirectorPlanRequest) -> dict:
         asset_kind,
         validator=PlanUpdate,
         llm=build_director_llm(),
+        duration_seconds=request.duration_seconds,
     )
     public = result.public()
     public["asset_kind"] = asset_kind
@@ -2607,11 +2617,15 @@ def create_plan(request: PlanRequest) -> dict:
             raise HTTPException(404, "产品素材不存在")
         if asset["owner_id"] != owner_id:
             raise HTTPException(403, "越权使用素材")
+        total_frames = DEFAULT_FPS * request.duration_seconds
+        # 三段均分总帧数，余数补给最后一段，保证每段 ≥24 且合计等于总帧数。
+        base = total_frames // 3
+        shares = [base, base, total_frames - base * 2]
         shots = [
             Shot(
                 id=f"shot_0{index + 1}",
                 name=["正面推近", "侧向观察", "立体环绕展示" if asset["kind"] == "model" else "细节定格"][index],
-                duration_frames=48,
+                duration_frames=max(24, shares[index]),
                 camera=["dolly_in", "side_track", "hero_orbit" if asset["kind"] == "model" else "static"][index],
                 focal_length_mm=35,
             )
@@ -2791,6 +2805,7 @@ def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
                     "intent": plan_snapshot["intent"],
                     "shots": plan_snapshot["shots"],
                     "crop_anchor": plan_snapshot.get("crop_anchor", CropAnchor.center.value),
+                    "duration_seconds": (plan_snapshot.get("output") or {}).get("duration_seconds", 6),
                 }
             )
         except (KeyError, json.JSONDecodeError, ValueError) as exc:
