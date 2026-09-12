@@ -238,3 +238,38 @@ INPUTS_BEFORE ['']                                  # 新建时只有一个空�
 | V3-01 多通道渲染 | **PASS**（5 通道 + 主帧，72/72） |
 | V3-02 通道校验 | **PASS**（校验器已不依赖 Blender；上述证据） |
 | V3-03…V3-10 | 待开工 |
+
+---
+
+## 11. V3-03 / V3-04 / V3-05 进展（2026-09-12）
+
+### 11.1 V3-03 FidelityPolicy（PASS）
+
+`POST /api/v1/product-versions/{id}/fidelity-policies`：策略带版本（不可改写 + 内容哈希），包含 mode（STRICT/CONTROLLED/CREATIVE）、归一化保护区域、允许操作白名单。硬约束：**STRICT 拒绝背景生成**、保护区域必须落在画面内、未知操作 422、越权 403。
+
+### 11.2 V3-04 审核与约束绑定（PASS）
+
+`POST /api/v1/product-versions/{id}/reviews` 冻结审核并把 `verified_dimensions` / `view_coverage` / `unverified_regions` / `logo_regions` / `camera_visibility_constraints` 绑定到版本。硬约束：**单图来源批准时必须声明未核实区域与相机可见性限制**（不让生成推测变成"已核实事实"）；证据素材必须属于同一 Owner。
+
+### 11.3 V3-05 Strict 合成（核心通过，见"未完成"）
+
+`scripts/strict_composite.py` 实现规格公式 `C = product_alpha × trusted_product + (1 − product_alpha) × generated_background`：
+
+- **线性空间**合成（beauty 来自 EXR 线性浮点；背景按 sRGB 解码到线性；输出再编码回 sRGB）；
+- **掩码外扩**（`--dilate`）保护产品边缘；
+- **像素锁定断言**：未外扩的原始掩码内，输出必须与可信产品逐像素一致。
+
+真实运行（官方模型 72 帧，外扩 3 像素）：
+
+| 指标 | 结果 |
+| --- | --- |
+| 帧数 | 72/72 |
+| **pixel_lock_ok** | **true**（掩码内与可信产品完全一致） |
+| 掩码覆盖 → 外扩后覆盖 | 帧 0：0.5311 → 0.5413；帧 71：0.3884 → 0.4041 |
+| 输出 | 72 张合成 PNG，报告含公式、色彩空间、外扩半径与首末帧哈希 |
+
+**未完成 / 需说明**：
+
+1. 本次"生成背景"用的是**程序化合成图案**（可复现），不是真实 AI 生成背景；H3 背景帧接入后可直接复用同一合成器；
+2. 阴影/反射/人物遮挡仍**未作为独立层**实现（规格要求它们是单独层）；
+3. **双产品检测（V3-06）未做**——背景里若出现多余产品影像，目前不会自动阻断。
