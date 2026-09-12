@@ -145,7 +145,7 @@ function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnc
         </select>
       </label>
       <label>
-        <span>裁切锚点（横/竖素材进 9:16 保留哪一侧）</span>
+        <span>裁切锚点（图片预演：横/竖素材进 9:16 保留哪一侧）</span>
         <select value={cropAnchor} onChange={(event) => onCropAnchorChange(event.target.value)}>
           {cropAnchorLabels.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
         </select>
