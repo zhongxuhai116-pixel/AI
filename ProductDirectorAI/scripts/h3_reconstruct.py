@@ -37,7 +37,10 @@ def api(base: str, path: str, payload: dict | None = None, timeout: int = 60):
     return json.loads(body) if body else {}
 
 
-def build_workflow(image: str, crop: list[int], prefix: str, seed: int, resolution: int, octree: int) -> dict:
+def build_workflow(
+    image: str, crop: list[int], prefix: str, seed: int, resolution: int, octree: int,
+    steps: int = 4, cfg: float = 1.0, threshold: float = 0.6,
+) -> dict:
     x, y, width, height = crop
     return {
         "1": {"class_type": "LoadImage", "inputs": {"image": image}},
@@ -51,8 +54,8 @@ def build_workflow(image: str, crop: list[int], prefix: str, seed: int, resoluti
             "inputs": {
                 "model": ["3", 0],
                 "seed": seed,
-                "steps": 4,
-                "cfg": 1.0,
+                "steps": steps,
+                "cfg": cfg,
                 "sampler_name": "euler",
                 "scheduler": "simple",
                 "positive": ["5", 0],
@@ -65,7 +68,7 @@ def build_workflow(image: str, crop: list[int], prefix: str, seed: int, resoluti
             "class_type": "VAEDecodeHunyuan3D",
             "inputs": {"samples": ["7", 0], "vae": ["3", 2], "num_chunks": 8000, "octree_resolution": octree},
         },
-        "9": {"class_type": "VoxelToMesh", "inputs": {"voxel": ["8", 0], "algorithm": "surface net", "threshold": 0.6}},
+        "9": {"class_type": "VoxelToMesh", "inputs": {"voxel": ["8", 0], "algorithm": "surface net", "threshold": threshold}},
         "10": {"class_type": "SaveGLB", "inputs": {"mesh": ["9", 0], "filename_prefix": prefix}},
     }
 
@@ -113,10 +116,16 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=20260912)
     parser.add_argument("--resolution", type=int, default=3072)
     parser.add_argument("--octree", type=int, default=256)
+    parser.add_argument("--steps", type=int, default=4, help="采样步数（现场工作流为 4）")
+    parser.add_argument("--cfg", type=float, default=1.0)
+    parser.add_argument("--threshold", type=float, default=0.6, help="VoxelToMesh 阈值")
     parser.add_argument("--timeout", type=int, default=1800)
     args = parser.parse_args()
 
-    workflow = build_workflow(args.image, args.crop, args.prefix, args.seed, args.resolution, args.octree)
+    workflow = build_workflow(
+        args.image, args.crop, args.prefix, args.seed, args.resolution, args.octree,
+        steps=args.steps, cfg=args.cfg, threshold=args.threshold,
+    )
     submitted = api(args.base, "/prompt", {"prompt": workflow, "client_id": "productdirector-recon"})
     prompt_id = submitted.get("prompt_id")
     if not prompt_id:
