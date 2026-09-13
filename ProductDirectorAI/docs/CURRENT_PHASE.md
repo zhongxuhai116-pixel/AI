@@ -1,5 +1,7 @@
 # 当前阶段
 
+> **2026-09-13 云端会话更新**：V1/V2 仍为 ACCEPTED。本轮在云端完成两条开发线合并（主线 Strict 运行时 × V3-05 独立层），提交 `b260f1f` + `edc2df7` 已推送 GitHub，全量后端 339/339 OK。**V3-05 的“真实 AI 背景 + 阴影/反射/遮挡独立层”已在云端真实数据上闭环 PASS**（CC0 相机 72 帧：渲染→差分建层→校验→真实 H3 背景→合成 pixel_lock_ok→双产品零误报），证据见 [V3-05 独立层真实闭环证据](reports/V305_LAYERS_REAL_EVIDENCE_2026-09-13.md)。剩余：真实遮挡资产（本轮遮挡层为全零层）、scene-linear 全链路、1080×1920 口径，以及主规划 V3-04/06/07 的剩余阶段门（QA 阈值集与审批绑定 hash 的完整闭环、版本审核界面、完整 V3 验收报告）。V4–V6 未开始。
+
 > **2026-09-13 最新**：用户已确认 V1/V2 ACCEPTED；完整 V3 仍为 IN_PROGRESS，V4–V6 未开始。V3 的 Q01–Q06、Strict 运行/来源、受控 Blender 输出、背景 Worker、QA 与 display-linear 色彩合同已有局部代码和验证报告。真实 Blender 探针已从 24 帧扩到 **72 帧、540×960**；核心区色差、288 个 EXR 通道结构与 576 项文件哈希通过独立复验，Depth/Normal/稳定 ID/跨空间颜色语义仍未验收，见 [P0.1b 控制端报告](reports/V3_P01B_72FRAME_CONTROLLER_ACCEPTANCE_2026-09-13.md)。远端历史 V3-06/V3-07 云端记录见 [任务书](reports/V3_TASK_BRIEF.md)，该编号与[主规划](../ProductDirectorAI_V1-V6_Codex_Development_Plan.md)不同，不能据此宣布主规划任务或完整 V3 PASS。H3 场景校准也不能替代两类产品×至少三镜头×两背景及完整人工审批。本页下方大量分时记录为历史快照；最新验收以 [控制记录](BROKER_V6_CONTROL.md) 和独立报告为准。
 
 > **2026-09-12 历史收尾记录**：当时 V3-01/02 通过，V3-03/04 完成，V3-05 核心通过但仍有未完成项；历史任务书的 V3-06/V3-07 记录了云端真实渲染。后端本地与云端 **152/152**，云端 api / web / postgresql / comfy-h3 四个服务 active。该快照不代表当前完整阶段验收。

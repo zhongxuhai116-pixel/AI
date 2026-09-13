@@ -1,8 +1,8 @@
-# 下一次操作交接说明（2026-09-12 收尾）
+# 下一次操作交接说明（2026-09-13 云端会话后更新）
 
-这份文件是**下次开工的第一入口**。先读它，再按需展开下面的报告。本轮已把全部记录推送到 GitHub，本地工作区干净；具体提交号用 `git log -1 --oneline` 查（就是包含本文件的这一次提交）。
+这份文件是**下次开工的第一入口**。先读它，再按需展开下面的报告。2026-09-13 在云端完成了两条开发线合并与 V3-05 独立层真实闭环，本节第 1/6/8 节已按新状态更新；其余内容沿用 2026-09-12 收尾版。提交：`b260f1f`（合并）、`edc2df7`（build_layers 帧号修复），已推送 GitHub `main`；云端另有本地分支 `wip-v305-layers`。
 
-> 阅读顺序建议：本文件 → [当前阶段](CURRENT_PHASE.md) → [V3 任务书](reports/V3_TASK_BRIEF.md) → [V1 验收确认单](reports/V1_READY_FOR_REVIEW.md)。
+> 阅读顺序建议：本文件 → [当前阶段](CURRENT_PHASE.md) → [V3-05 独立层真实闭环证据](reports/V305_LAYERS_REAL_EVIDENCE_2026-09-13.md) → [V3 任务书](reports/V3_TASK_BRIEF.md)。
 > `NEXT_COMPUTER_START.md` 是 2026-09-11 换电脑时写的，其中"V1 仍为 PARTIAL""云 SSH 超时"等描述**已被本文件取代**，只作历史留档。
 
 ## 1. 当前状态（都已验证，不是计划）
@@ -11,12 +11,12 @@
 | --- | --- |
 | **V1** | **ACCEPTED**（用户 2026-09-12 确认，见 V1 验收确认单） |
 | **V2** | **ACCEPTED**（同日确认） |
-| **V3** | **进行中**：V3-01 / V3-02 通过；V3-03 / V3-04 完成；V3-05 核心通过、有未完成项；V3-06 … V3-10 未开工 |
-| 后端测试 | **152/152**（本地与云端各跑一次，结果一致） |
-| 代码 | 本地与 `origin/main` 一致，工作区干净 |
+| **V3** | **进行中**：V3-01/02 通过；V3-03/04 完成；**V3-05 独立层真实闭环 PASS**（2026-09-13：真实 H3 背景 + 阴影/反射/遮挡三层 + pixel_lock_ok + 双产品零误报；剩余真实遮挡资产与 scene-linear 全链路）；任务书编号 V3-06/V3-07 有云端真实证据，主规划编号下的阶段门（QA 闭环、审核界面、完整验收）仍未完成 |
+| 后端测试 | **339/339**（云端，2026-09-13，合并后全量） |
+| 代码 | GitHub `main` = `edc2df7`，云端工作区干净 |
 | 云端 | api / web / postgresql / comfy-h3 四个 systemd 服务均 active |
 
-明确没有完成的：V3 只做到第 5 项的一半；V4 / V5 / V6 一行代码都没写，不能因为 V1 / V2 已验收就对外说"V6 完成"。
+明确没有完成的：V3 阶段门（版本审核界面、问题帧跳转、完整 V3 验收报告）与 V4 / V5 / V6 一行代码都没写，不能对外说"V3 完成"或"V6 完成"。
 
 ## 2. 本轮推到 GitHub 的东西
 
@@ -77,21 +77,24 @@ ssh -i $env:USERPROFILE\.ssh\pd_ed25519 ubuntu@117.50.44.60 `
 | --- | --- |
 | `scripts/v1_cloud_acceptance.py` | 云端图片 + GLB 双链路真实验收 |
 | `scripts/h3_reconstruct.py` / `glb_repeat_check.py` / `capacity_probe.py` | 3D 重建、三次作业一致性、产能探针 |
-| `scripts/strict_composite.py` | **V3-05 Strict 合成**（线性空间 + 掩码外扩 + 像素锁定断言） |
-| `blender/scripts/render_product.py` | 渲染器；`--passes` 开启多通道（beauty/alpha/depth/normal + 产品遮罩） |
-| `blender/scripts/validate_fidelity_passes.py` | **V3-02 通道校验**（不依赖 Blender，用 venv 的 Pillow + OpenEXR） |
+| `scripts/strict_composite.py` | **V3-05 Strict 合成**（冻结合同 + 可信 Alpha + 预检隔离 + `--layers shadow/reflection/occlusion` 独立层与遮挡豁免） |
+| `scripts/build_layers.py` | **V3-05 独立层构建**（plate_full × plate 差分；输出帧号沿用输入帧号） |
+| `scripts/h3_background.py` | **V3-05 真实 AI 背景**（自托管 ComfyUI，不收费；失败如实 BLOCKED） |
+| `scripts/dual_product_check.py` / `scripts/strict_qa.py` | V3-06 双产品检测 / V3-07 Strict QA（云端真实证据见任务书 §12） |
+| `blender/scripts/render_product.py` | 渲染器；`--passes` 五通道，`--layers` 追加 plate_full/plate/occlusion 独立层素材 |
+| `blender/scripts/validate_fidelity_passes.py` | **V3-02 通道校验** + `--layers` 独立层校验（不依赖 Blender，venv 的 Pillow + OpenEXR） |
 | `scripts/kill_worker_drill.py` | A04 真实杀 Worker 恢复演练 |
+
+V3-05 真实流水线的一次完整执行脚本序列在云端 `/tmp/step{1..7}_*.sh`（证据目录 `/home/ubuntu/pd-v305-layers-20260913/`，不入 Git）。
 
 ## 6. 未完成清单（下次逐项推进）
 
 ### V3（当前重点）
 
-1. **V3-05 剩余**：背景目前是程序化图案，未接真实 AI 生成背景；**阴影 / 反射 / 人物遮挡未做成独立层**。
-2. **V3-06 双产品检测**：背景出现多余产品影像要能检出并阻断（未开工）。
-3. **V3-07 Strict QA**：Logo 缺失、轮廓异常、尺寸变化、Mask/ID 错误、缺帧的自动阻断（未开工）。
-4. **V3-08 版本失效联动**：产品版本变化使旧计划的保真审批失效（未开工）。
-5. **V3-09 审核界面**：版本审核页 + 通道查看器 + 质检页（未开工）。
-6. **V3-10 验收报告**（未开工）。
+1. **V3-05 剩余**：遮挡层只有"全零层"真实证据（场景无遮挡物）——补真实遮挡资产（人物/物体遮挡）负例；shadow/reflection 的 scene-linear 全链路映射；1080×1920 口径复验。
+2. **主规划 V3-04 剩余**：QA 阈值集、问题帧与审批绑定 hash 的完整闭环（已局部实现：`strict_qa.py`、QA 报告与 Run 状态联动，需按主规划逐项核对退出证据）。
+3. **主规划 V3-06 审核界面**：版本审核页 + 通道查看器 + 质检页（Blender 参考、Master、最终视频、热图与问题帧跳转）未开工。
+4. **主规划 V3-07 完整验收**：两类必需产品各至少 3 镜头/2 背景、透明反射明确边界、真机校准、旧版回归、性能/存储，产出完整 `V3_ACCEPTANCE.md`。
 
 ### V2 剩余（非阻塞，不挡 V3）
 
@@ -110,9 +113,9 @@ ssh -i $env:USERPROFILE\.ssh\pd_ed25519 ubuntu@117.50.44.60 `
 
 ## 8. 建议的下一次操作
 
-1. 先确认云防火墙放行了**当前**出口 IP，再跑一次本地测试与云端测试，确认环境没漂移（期望 152/152）。
-2. 从 **V3-06 + V3-07** 继续：把"坏结果自动拦住"做出来。V3-07 的 Logo / 材质类故障必须**用 CC0 相机素材验证**——官方 STEP 转出的 GLB 没有材质，验不了 Logo 缺失。
-3. 如果决定先补 V3-05 的独立层（阴影 / 反射 / 遮挡），顺序是：Blender 输出分层通道 → 合成器按层叠加 → 再回到 V3-06。
+1. 先确认云防火墙放行了**当前**出口 IP，再跑一次云端测试确认环境没漂移（期望 **339/339**）。
+2. 从 **V3-05 剩余**继续：给场景加真实遮挡物（名称以 `Occluder` 开头或带 `pd_occluder` 属性）重渲 72 帧，验证遮挡层非零、合成遮挡区豁免计数与双产品检测不误报。
+3. 然后按主规划编号推进 **V3-04 剩余（QA 闭环与审批绑定）**与 **V3-06（审核界面）**；Logo / 材质类故障必须**用 CC0 相机素材验证**——官方 STEP 转出的 GLB 没有材质，验不了 Logo 缺失。
 4. 每完成一项就更新 `docs/reports/V3_TASK_BRIEF.md` 的状态与证据，并提交推送；不要在没有证据时把任务标成完成。
 
 ## 9. 工程纪律（不要因为赶进度破例）

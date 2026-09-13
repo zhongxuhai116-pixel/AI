@@ -122,3 +122,15 @@
 - 独立服务归档：H3 / ComfyUI 加速那一轮此前只存在于本机，现推送到私有仓库 `comfyui-h3-cloud-records` 的 `optimization/`（加速版工作流、加速节点代码、SageAttention 微基准、全过程耗时、加速前后抽帧对比、优化前工作流快照），提交 `cfdfd7f`。实测原流程 907.728 秒 → 加速 667.537 秒（约 −26.46%，单次同规格对比，非统计结论）。
 - 出口边界：本次只推送源码、合同、脚本、测试与脱敏文档；用户真实素材、官方 STEP、CC0 素材、渲染产物、数据库、模型权重、SSH 私钥与云端登录信息均未入库。
 - 未完成：V3-06…V3-10；V2 非阻塞项（多任务长时压测、费用换算、运行中任务协作式取消）。
+
+### 2026-09-13 云端会话：主线合并 + V3-05 独立层真实闭环
+
+本节记录在云端（117.50.44.60）继续施工的结果；证据报告见 [V3-05 独立层真实闭环证据](reports/V305_LAYERS_REAL_EVIDENCE_2026-09-13.md)。
+
+- 基线：云端 HEAD `9f3c65c` 落后 GitHub `main` 3 个提交，且带未提交的 V3-05 独立层工作（`build_layers.py` / `h3_background.py` / `test_v305_layers.py` 与三个脚本的修改）。云端工作自测 179/179 OK。
+- 合并两条开发线：云端未提交工作先提交到 `wip-v305-layers`，主线快进到 `59e99bd` 后合并，三个冲突文件（`render_product.py` / `validate_fidelity_passes.py` / `strict_composite.py`）以“主线冻结合同为基 + 云端分层语义”重写，层合同统一为：shadow=16 位灰度因子乘算、reflection=sRGB 能量加算、occlusion=RGBA 盖回 + 像素锁定豁免计数；有冻结计划时层可声明部分覆盖，无计划时提供层必须覆盖全部处理帧（fail-closed）。合并提交 `b260f1f`，全量后端 **339/339 OK**（云端 195.7s）。
+- 真实闭环（云端，CC0 相机素材，540×960，72 帧）：`--passes --layers` 真实渲染（288 个五通道文件未被第二遍改写；plate_full/plate/occlusion 各 72）→ `build_layers.py` 差分（shadow 因子 min 0.0714、reflection 能量 max 2.4883、occlusion 全零注明）→ `validate_fidelity_passes.py --layers` **passed**（mask↔alpha IoU≈1、法线模长≈1、五层帧号与全片一致）→ `h3_background.py` 真实 H3 背景（SUCCEEDED，源视频 sha `fbe1cca4…`，72 帧）→ `strict_composite.py`（冻结计划 + 三层全帧必需）**passed**、`pixel_lock_ok=true`、掩码内与可信产品逐像素差 0.0；独立数值复核掩码外 composite↔H3 背景相关 0.9929、掩码内差 0.0。
+- 双产品检测正例回归（真实 H3 背景）：`dual_product_check.py` 72/72 PASS 零误报。
+- 真实缺陷与修复：`build_layers.py` 输出帧号从 0 起编号，被冻结帧集合合同正确拒绝（fail-closed 生效），修复为沿用输入帧号（提交 `edc2df7`）后重跑通过。
+- 推送：`b260f1f`、`edc2df7` 已推送到 GitHub `main`；云端 `wip-v305-layers` 分支保留本地。
+- 未完成（如实记录）：遮挡层真实遮挡资产（本轮为全零层）；scene-linear 全链路映射；1080×1920 口径；V3 其余阶段门（版本审核界面、问题帧跳转、完整 V3 验收报告）。
