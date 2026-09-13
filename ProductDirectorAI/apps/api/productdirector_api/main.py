@@ -10,6 +10,7 @@ import math
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -58,6 +59,7 @@ from . import batch as batch_rules
 from . import interaction_geometry
 from . import interaction_validation
 from . import automation
+from . import webhooks
 from . import ledger
 from . import localization
 from . import platform_profiles
@@ -774,6 +776,68 @@ def initialize_db() -> None:
               response TEXT NOT NULL,
               created_at TEXT NOT NULL,
               UNIQUE (owner_id, actor, scope, idem_key)
+            );
+            CREATE TABLE IF NOT EXISTS webhook_endpoints (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              url TEXT NOT NULL,
+              event_types TEXT NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              paused_at TEXT,
+              paused_reason TEXT NOT NULL DEFAULT '',
+              secret_current TEXT NOT NULL,
+              secret_previous TEXT,
+              secret_previous_expires_at REAL,
+              revision INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS outbox_events (
+              id TEXT PRIMARY KEY,
+              event_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              aggregate_type TEXT NOT NULL,
+              aggregate_id TEXT NOT NULL,
+              aggregate_revision INTEGER NOT NULL DEFAULT 0,
+              schema_version TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE (event_id)
+            );
+            CREATE TABLE IF NOT EXISTS delivery_attempts (
+              id TEXT PRIMARY KEY,
+              endpoint_id TEXT NOT NULL,
+              event_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              attempt INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              response_status INTEGER,
+              response_excerpt TEXT NOT NULL DEFAULT '',
+              signature TEXT NOT NULL DEFAULT '',
+              error TEXT,
+              next_retry_at TEXT,
+              delivered_at TEXT,
+              created_at TEXT NOT NULL,
+              UNIQUE (endpoint_id, event_id, attempt)
+            );
+            CREATE TABLE IF NOT EXISTS dead_letter_events (
+              id TEXT PRIMARY KEY,
+              endpoint_id TEXT NOT NULL,
+              event_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              attempts INTEGER NOT NULL,
+              last_error TEXT NOT NULL DEFAULT '',
+              reason TEXT NOT NULL DEFAULT '',
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              moved_at TEXT NOT NULL,
+              replayed_at TEXT,
+              UNIQUE (endpoint_id, event_id)
             );
             CREATE TABLE IF NOT EXISTS budgets (
               id TEXT PRIMARY KEY,
@@ -4554,6 +4618,13 @@ def enforce_automation_access(request: Request, identity: dict) -> None:
         with connect() as db:
             spend = _key_period_spend(db, identity["key_id"], identity["budget_period"], now)
         if spend >= float(identity["budget_limit_amount"]):
+            emit_event_standalone(
+                event_type="budget.blocked", aggregate_type="automation_key", aggregate_id=identity["key_id"],
+                aggregate_revision=0,
+                payload={"key_id": identity["key_id"], "key_name": identity["name"], "block_code": "key_budget_exhausted",
+                         "spend": spend, "limit": identity["budget_limit_amount"],
+                         "period": identity["budget_period"], "status": "BLOCKED"},
+            )
             raise HTTPException(409, {
                 "code": "key_budget_exhausted",
                 "detail": (f"该 Key 在 {identity['budget_period']} 周期内已发生 {spend}，"
@@ -9882,6 +9953,7 @@ def reconcile_batch_items(db, batch_id: str) -> None:
             }[job["status"]]
             db.execute("UPDATE batch_items SET status = ?, error = ?, updated_at = ? WHERE id = ?",
                        (new_status, job["error"], utc_now(), item["id"]))
+            _emit_item_terminal_event(db, item, job, new_status)
         elif job["status"] == "RUNNING" and item["status"] != "RUNNING":
             db.execute("UPDATE batch_items SET status = 'RUNNING', updated_at = ? WHERE id = ?",
                        (utc_now(), item["id"]))
@@ -9889,14 +9961,69 @@ def reconcile_batch_items(db, batch_id: str) -> None:
             _requeue_missing_run_job(db, item["run_id"], item["job_id"])
 
 
+def _emit_item_terminal_event(db, item, job, new_status: str) -> None:
+    """批次项进入终态时写 Outbox（与状态回写同一事务）。CANCELLED 不发事件（见报告）。"""
+    batch = db.execute("SELECT * FROM batches WHERE id = ?", (item["batch_id"],)).fetchone()
+    if not batch:
+        return
+    revision = int(batch["revision"] or 0)
+    if new_status == "SUCCEEDED":
+        emit_event(
+            db, event_type="item.completed", aggregate_type="batch_item", aggregate_id=item["id"],
+            aggregate_revision=revision,
+            payload={"batch_id": item["batch_id"], "item_id": item["id"], "item_index": item["item_index"],
+                     "run_id": item["run_id"], "job_id": item["job_id"], "status": "SUCCEEDED",
+                     "cache_key": item["cache_key"]},
+            owner_id=batch["owner_id"], project_id=batch["project_id"],
+        )
+        return
+    if new_status == "FAILED":
+        emit_event(
+            db, event_type="item.failed", aggregate_type="batch_item", aggregate_id=item["id"],
+            aggregate_revision=revision,
+            payload={"batch_id": item["batch_id"], "item_id": item["id"], "item_index": item["item_index"],
+                     "run_id": item["run_id"], "job_id": item["job_id"],
+                     "status": job["status"], "error": (job["error"] or "")[:500]},
+            owner_id=batch["owner_id"], project_id=batch["project_id"],
+        )
+        if job["status"] == "QA_REJECTED":
+            emit_event(
+                db, event_type="review.required", aggregate_type="run", aggregate_id=item["run_id"] or item["job_id"],
+                aggregate_revision=revision,
+                payload={"batch_id": item["batch_id"], "item_id": item["id"], "job_id": item["job_id"],
+                         "run_id": item["run_id"], "status": "QA_REJECTED",
+                         "error": (job["error"] or "")[:500],
+                         "next_action": "需要人工复核后才能进入发布包与发布流程"},
+                owner_id=batch["owner_id"], project_id=batch["project_id"],
+            )
+
+
 def refresh_batch_status(db, batch_id: str) -> sqlite3.Row:
     """对账批次项并重算聚合状态（读取批次/项之前都调用，避免状态滞后）。"""
     reconcile_batch_items(db, batch_id)
     rows = db.execute("SELECT status FROM batch_items WHERE batch_id = ?", (batch_id,)).fetchall()
     batch = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    previous = batch["status"]
     status = batch_rules.aggregate_status([row["status"] for row in rows],
                                          paused=bool(batch["paused"]), cancelled=bool(batch["cancelled"]))
     db.execute("UPDATE batches SET status = ?, updated_at = ? WHERE id = ?", (status, utc_now(), batch_id))
+    if status != previous:
+        if status == "RUNNING":
+            emit_event(db, event_type="batch.started", aggregate_type="batch", aggregate_id=batch_id,
+                       aggregate_revision=int(batch["revision"] or 0),
+                       payload={"batch_id": batch_id, "name": batch["name"],
+                                "status": status, "previous_status": previous,
+                                "paused": bool(batch["paused"])},
+                       owner_id=batch["owner_id"], project_id=batch["project_id"])
+        elif status in ("COMPLETED", "FAILED", "CANCELLED"):
+            summary = batch_rules.summarize([
+                dict(row) for row in db.execute("SELECT * FROM batch_items WHERE batch_id = ?", (batch_id,)).fetchall()
+            ])
+            emit_event(db, event_type="batch.completed", aggregate_type="batch", aggregate_id=batch_id,
+                       aggregate_revision=int(batch["revision"] or 0),
+                       payload={"batch_id": batch_id, "name": batch["name"], "status": status,
+                                "previous_status": previous, "summary": summary},
+                       owner_id=batch["owner_id"], project_id=batch["project_id"])
     return db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
 
 
@@ -10562,6 +10689,16 @@ def approve_publish_package(package_id: str, request: PackageApproveRequest) -> 
         db.execute("UPDATE publish_packages SET status = 'APPROVED', approved_at = ?, "
                    "content_hash = ?, updated_at = ? WHERE id = ?",
                    (now, request.content_hash, now, package_id))
+        # V6-08：审批后包才可发布 → package.ready 与审批同一事务写入 Outbox
+        emit_event(
+            db, event_type="package.ready", aggregate_type="publish_package", aggregate_id=package_id,
+            aggregate_revision=int(row["version"] or 1),
+            payload={"package_id": package_id, "run_id": row["run_id"], "batch_id": row["batch_id"],
+                     "locale": row["locale"], "profile_id": row["profile_id"], "version": row["version"],
+                     "status": "APPROVED", "content_hash": request.content_hash,
+                     "reason": request.reason},
+            owner_id=row["owner_id"], project_id=row["project_id"],
+        )
     return {"id": package_id, "status": "APPROVED", "approved_at": now,
             "content_hash": request.content_hash, "reason": request.reason,
             "note": "审批绑定内容哈希；此后修改任何文件都会使审批失效"}
@@ -11108,6 +11245,16 @@ def reserve_budget(budget_id: str, request: BudgetReserveRequest) -> dict:
         entries = grouped.get(budget_id, [])
         check = ledger.check_budget({"limit_amount": row["limit_amount"]}, entries, request.estimate_upper_bound)
         if not check["allowed"]:
+            # 阻断本身没有业务写入，因此事件用独立事务写（不假装与检查原子）
+            emit_event_standalone(
+                event_type="budget.blocked", aggregate_type="budget", aggregate_id=budget_id,
+                aggregate_revision=int(row["revision"] or 1),
+                payload={"budget_id": budget_id, "block_code": check["code"], "reason": check["reason"],
+                         "estimate_upper_bound": float(request.estimate_upper_bound),
+                         "available": (check.get("snapshot") or {}).get("available"),
+                         "status": "BLOCKED"},
+                owner_id=owner_id, project_id=project_id,
+            )
             raise HTTPException(409, {"code": check["code"], "detail": check["reason"],
                                       "snapshot": check.get("snapshot")})
         reservation_id = _insert_ledger_entry(
@@ -11463,6 +11610,458 @@ def automation_get_job(reference_id: str) -> dict:
         "cache_key": item["cache_key"],
         "updated_at": item["updated_at"],
     }
+
+
+# ---------------------------------------------------------------------------
+# V6-08 事务性 Outbox：业务状态与待投递事件同事务写入；投递 Worker 异步发送
+# ---------------------------------------------------------------------------
+
+def emit_event(db: sqlite3.Connection, *, event_type: str, aggregate_type: str, aggregate_id: str,
+               aggregate_revision: int, payload: dict, owner_id: str | None = None,
+               project_id: str | None = None, occurred_at: str | None = None) -> str:
+    """把事件写进 Outbox（**与业务写入同一事务**）；载荷含凭证或文件内容时直接拒绝。"""
+    owner = owner_id or DEFAULT_OWNER_ID
+    project = project_id or DEFAULT_PROJECT_ID
+    event_id = str(uuid.uuid4())
+    envelope = webhooks.event_envelope(
+        event_id=event_id, event_type=event_type, aggregate_type=aggregate_type,
+        aggregate_id=aggregate_id, aggregate_revision=int(aggregate_revision or 0),
+        payload=payload, occurred_at=occurred_at or utc_now(),
+    )
+    body = webhooks.canonical(envelope)
+    db.execute(
+        "INSERT INTO outbox_events(id, event_id, event_type, owner_id, project_id, aggregate_type, aggregate_id, "
+        "aggregate_revision, schema_version, payload, payload_sha256, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), event_id, event_type, owner, project, aggregate_type, aggregate_id,
+         int(aggregate_revision or 0), webhooks.SCHEMA_VERSION, body,
+         hashlib.sha256(body.encode("utf-8")).hexdigest(), utc_now()),
+    )
+    return event_id
+
+
+def emit_event_standalone(**kwargs) -> str | None:
+    """无业务事务可绑定的场景（如 409 阻断路径）：独立事务写入，失败不影响主流程。"""
+    try:
+        with connect() as db:
+            return emit_event(db, **kwargs)
+    except Exception as exc:  # 事件写入失败不能改变阻断结论，但会被明确打印
+        print(f"[webhooks] 事件写入失败 {kwargs.get('event_type')}: {exc}", file=sys.stderr)
+        return None
+
+
+def _endpoints_for_event(db: sqlite3.Connection, owner_id: str, project_id: str, event_type: str) -> list:
+    rows = db.execute(
+        "SELECT * FROM webhook_endpoints WHERE owner_id = ? AND project_id = ? AND enabled = 1 "
+        "AND paused_at IS NULL ORDER BY created_at ASC",
+        (owner_id, project_id),
+    ).fetchall()
+    return [row for row in rows if event_type in [item for item in (row["event_types"] or "").split(",") if item]]
+
+
+def _pending_deliveries(db: sqlite3.Connection, limit: int, *, force_due: bool = False,
+                        endpoint_id: str | None = None, event_id: str | None = None) -> list[dict]:
+    """待投递队列：Outbox 事件 × 订阅目标，排除已成功、死信与未到重试时间的。"""
+    now = utc_now()
+    pending: list[dict] = []
+    query = "SELECT * FROM outbox_events"
+    params: list = []
+    if event_id:
+        query += " WHERE event_id = ?"
+        params.append(event_id)
+    query += " ORDER BY created_at ASC LIMIT ?"
+    params.append(max(1, limit))
+    events = db.execute(query, tuple(params)).fetchall()
+    for event in events:
+        subscribers = _endpoints_for_event(db, event["owner_id"], event["project_id"], event["event_type"])
+        if endpoint_id:
+            subscribers = [row for row in subscribers if row["id"] == endpoint_id]
+        for endpoint in subscribers:
+            attempts = db.execute(
+                "SELECT * FROM delivery_attempts WHERE endpoint_id = ? AND event_id = ? ORDER BY attempt DESC LIMIT 1",
+                (endpoint["id"], event["event_id"]),
+            ).fetchone()
+            dead = db.execute(
+                "SELECT * FROM dead_letter_events WHERE endpoint_id = ? AND event_id = ? AND replayed_at IS NULL",
+                (endpoint["id"], event["event_id"]),
+            ).fetchone()
+            if dead:
+                continue
+            if attempts and attempts["status"] == "DELIVERED":
+                continue
+            if attempts and attempts["next_retry_at"] and not force_due and attempts["next_retry_at"] > now:
+                continue
+            pending.append({
+                "endpoint": endpoint,
+                "event": event,
+                "attempt": (int(attempts["attempt"]) + 1) if attempts else 1,
+            })
+    return pending
+
+
+def _deliver_once(endpoint, event, attempt: int) -> dict:
+    """投递一次：10 秒超时，签名放两个头，重投使用新时间戳、event_id 不变。"""
+    body = event["payload"].encode("utf-8")
+    timestamp = str(int(time.time()))
+    signature = webhooks.signing_key(endpoint["secret_current"], timestamp, body)
+    request = urllib.request.Request(endpoint["url"], data=body, method="POST")
+    # 直接写入 headers 字典：urllib 的 add_header 会把名字首字母大写，投递头保持规范大小写
+    request.headers["Content-Type"] = "application/json"
+    request.headers[webhooks.TIMESTAMP_HEADER] = timestamp
+    request.headers[webhooks.SIGNATURE_HEADER] = signature
+    request.headers[webhooks.EVENT_ID_HEADER] = event["event_id"]
+    request.headers[webhooks.DELIVERY_HEADER] = str(attempt)
+    started = time.monotonic()
+    status_code = None
+    excerpt = ""
+    error = None
+    try:
+        with urllib.request.urlopen(request, timeout=webhooks.REQUEST_TIMEOUT_SECONDS) as response:
+            status_code = int(response.status)
+            excerpt = response.read(400).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        status_code = int(exc.code)
+        excerpt = (exc.read(400) or b"").decode("utf-8", "replace")
+    except Exception as exc:  # 网络/超时/地址错误都算可重试
+        error = f"{type(exc).__name__}: {exc}"
+    classification = webhooks.classify_response(status_code, error)
+    plan = webhooks.next_attempt_plan(attempt, classification)
+    return {
+        "status_code": status_code,
+        "excerpt": excerpt,
+        "error": error,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+        "signature": signature,
+        "timestamp": timestamp,
+        "classification": classification,
+        "plan": plan,
+    }
+
+
+def dispatch_webhooks(limit: int = 20, *, force_due: bool = False, endpoint_id: str | None = None,
+                      event_id: str | None = None) -> dict:
+    """投递循环：可被内部 Worker 调用；测试投递/死信重放只针对指定事件与目标。"""
+    delivered = retried = dead = 0
+    results: list[dict] = []
+    with connect() as db:
+        pending = _pending_deliveries(db, limit, force_due=force_due, endpoint_id=endpoint_id,
+                                      event_id=event_id)
+    for entry in pending:
+        endpoint, event, attempt = entry["endpoint"], entry["event"], entry["attempt"]
+        outcome = _deliver_once(endpoint, event, attempt)
+        classification, plan = outcome["classification"], outcome["plan"]
+        status = {"delivered": "DELIVERED", "retry": "RETRY", "dead": "DEAD"}[classification["outcome"]]
+        next_retry_at = None
+        if plan["action"] == "retry":
+            next_retry_at = _iso_from_epoch(time.time() + plan["next_retry_in"])
+        with connect() as db:
+            db.execute(
+                "INSERT INTO delivery_attempts(id, endpoint_id, event_id, event_type, attempt, status, "
+                "response_status, response_excerpt, signature, error, next_retry_at, delivered_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), endpoint["id"], event["event_id"], event["event_type"], attempt, status,
+                 outcome["status_code"], webhooks.redact_response(outcome["excerpt"]),
+                 outcome["signature"], outcome["error"], next_retry_at,
+                 utc_now() if status == "DELIVERED" else None, utc_now()),
+            )
+            if plan["dead_letter"]:
+                db.execute(
+                    "INSERT INTO dead_letter_events(id, endpoint_id, event_id, event_type, attempts, last_error, "
+                    "reason, payload, payload_sha256, moved_at, replayed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                    (str(uuid.uuid4()), endpoint["id"], event["event_id"], event["event_type"], attempt,
+                     outcome["error"] or outcome["excerpt"][:200], plan.get("reason", ""),
+                     event["payload"], event["payload_sha256"], utc_now()),
+                )
+                dead += 1
+                if not classification["retryable"]:
+                    db.execute(
+                        "UPDATE webhook_endpoints SET paused_at = ?, paused_reason = ?, updated_at = ? WHERE id = ?",
+                        (utc_now(), f"投递返回 {outcome['status_code']}（非 408/429 的 4xx）：已暂停，修复后可恢复",
+                         utc_now(), endpoint["id"]),
+                    )
+            elif status == "DELIVERED":
+                delivered += 1
+            else:
+                retried += 1
+        results.append({
+            "endpoint_id": endpoint["id"], "event_id": event["event_id"], "event_type": event["event_type"],
+            "attempt": attempt, "status": status, "response_status": outcome["status_code"],
+            "next_retry_at": next_retry_at, "elapsed_ms": outcome["elapsed_ms"],
+            "error": outcome["error"],
+        })
+    return {"attempted": len(results), "delivered": delivered, "retried": retried, "dead_letter": dead,
+            "results": results, "force_due": force_due}
+
+
+# ---------------------------------------------------------------------------
+# V6-08 Webhook 目标管理、测试投递、脱敏投递历史、死信重放、投递 Worker
+# ---------------------------------------------------------------------------
+
+class WebhookCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    url: str = Field(min_length=1, max_length=500)
+    event_types: list[str] = Field(default_factory=list, max_length=len(webhooks.EVENT_TYPES))
+    enabled: bool = True
+    secret: str | None = Field(default=None, min_length=16, max_length=200)
+
+
+class WebhookUpdateRequest(BaseModel):
+    revision: int
+    name: str | None = Field(default=None, max_length=120)
+    url: str | None = Field(default=None, max_length=500)
+    event_types: list[str] | None = None
+    enabled: bool | None = None
+    reason: str = Field(default="", max_length=300)
+
+
+class WebhookRotateRequest(BaseModel):
+    grace_seconds: int = Field(default=86400, ge=0, le=7 * 86400)
+    secret: str | None = Field(default=None, min_length=16, max_length=200)
+
+
+class WebhookPauseRequest(BaseModel):
+    reason: str = Field(default="", max_length=300)
+
+
+def _webhook_row(db: sqlite3.Connection, owner_id: str, project_id: str, endpoint_id: str):
+    row = db.execute(
+        "SELECT * FROM webhook_endpoints WHERE id = ? AND owner_id = ? AND project_id = ?",
+        (endpoint_id, owner_id, project_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Webhook 目标不存在")
+    return row
+
+
+def _webhook_stats(db: sqlite3.Connection, endpoint_id: str) -> dict:
+    rows = db.execute(
+        "SELECT status, count(*) AS n FROM delivery_attempts WHERE endpoint_id = ? GROUP BY status",
+        (endpoint_id,),
+    ).fetchall()
+    by_status = {row["status"]: row["n"] for row in rows}
+    dead = db.execute(
+        "SELECT count(*) AS n FROM dead_letter_events WHERE endpoint_id = ? AND replayed_at IS NULL",
+        (endpoint_id,),
+    ).fetchone()["n"]
+    last = db.execute(
+        "SELECT * FROM delivery_attempts WHERE endpoint_id = ? ORDER BY created_at DESC LIMIT 1",
+        (endpoint_id,),
+    ).fetchone()
+    return {
+        "attempts": sum(by_status.values()),
+        "by_status": by_status,
+        "pending_retry": by_status.get("RETRY", 0),
+        "dead_letter": dead,
+        "last_delivery": webhooks.delivery_public(last) if last else None,
+    }
+
+
+@app.get("/api/v1/webhooks/catalog")
+def webhook_catalog() -> dict:
+    """事件目录与签名/重试约定（投递语义为至少一次，接收方按 event_id 去重）。"""
+    return webhooks.catalog()
+
+
+@app.get("/api/v1/webhooks")
+def list_webhooks() -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM webhook_endpoints WHERE owner_id = ? AND project_id = ? ORDER BY created_at DESC LIMIT 200",
+            (owner_id, project_id),
+        ).fetchall()
+        return [{**webhooks.endpoint_public(row), "stats": _webhook_stats(db, row["id"])} for row in rows]
+
+
+@app.post("/api/v1/webhooks", status_code=201)
+def create_webhook(request: WebhookCreateRequest) -> dict:
+    """注册目标：只接受 HTTPS（本机回环联调允许 http），密钥只在创建时返回一次。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    try:
+        url = webhooks.validate_url(request.url)
+        event_types = webhooks.normalize_event_types(request.event_types)
+    except webhooks.WebhookError as exc:
+        raise HTTPException(exc.status_code, exc.as_detail()) from exc
+    secret = request.secret or secrets.token_urlsafe(32)
+    endpoint_id = str(uuid.uuid4())
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO webhook_endpoints(id, owner_id, project_id, name, url, event_types, enabled, paused_at, "
+            "paused_reason, secret_current, secret_previous, secret_previous_expires_at, revision, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, '', ?, NULL, NULL, 1, ?, ?)",
+            (endpoint_id, owner_id, project_id, request.name, url, ",".join(event_types),
+             1 if request.enabled else 0, secret, now, now),
+        )
+        row = _webhook_row(db, owner_id, project_id, endpoint_id)
+    return {**webhooks.endpoint_public(row, reveal_secret=secret),
+            "note": "密钥只在创建时显示一次；请用它与 X-PDA-Timestamp 一起验签"}
+
+
+@app.patch("/api/v1/webhooks/{endpoint_id}")
+def update_webhook(endpoint_id: str, request: WebhookUpdateRequest) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = _webhook_row(db, owner_id, project_id, endpoint_id)
+        if int(request.revision) != int(row["revision"]):
+            raise HTTPException(409, {"code": "revision_conflict",
+                                      "detail": f"revision 不一致（提交 {request.revision}，当前 {row['revision']}）",
+                                      "current_revision": row["revision"]})
+        url = row["url"]
+        if request.url is not None:
+            try:
+                url = webhooks.validate_url(request.url)
+            except webhooks.WebhookError as exc:
+                raise HTTPException(exc.status_code, exc.as_detail()) from exc
+        event_types = row["event_types"]
+        if request.event_types is not None:
+            try:
+                event_types = ",".join(webhooks.normalize_event_types(request.event_types))
+            except webhooks.WebhookError as exc:
+                raise HTTPException(exc.status_code, exc.as_detail()) from exc
+        db.execute(
+            "UPDATE webhook_endpoints SET name = ?, url = ?, event_types = ?, enabled = ?, revision = revision + 1, "
+            "updated_at = ? WHERE id = ?",
+            (request.name if request.name is not None else row["name"], url, event_types,
+             int(row["enabled"]) if request.enabled is None else (1 if request.enabled else 0),
+             utc_now(), endpoint_id),
+        )
+        updated = _webhook_row(db, owner_id, project_id, endpoint_id)
+    return {**webhooks.endpoint_public(updated), "change_reason": request.reason}
+
+
+@app.post("/api/v1/webhooks/{endpoint_id}/rotate-secret")
+def rotate_webhook_secret(endpoint_id: str, request: WebhookRotateRequest) -> dict:
+    """轮换密钥：旧密钥在 grace 期内仍可验签（短期双密钥），到期由投递循环清除。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = _webhook_row(db, owner_id, project_id, endpoint_id)
+        new_secret = request.secret or secrets.token_urlsafe(32)
+        expires_at = time.time() + request.grace_seconds if request.grace_seconds else None
+        db.execute(
+            "UPDATE webhook_endpoints SET secret_previous = ?, secret_previous_expires_at = ?, "
+            "secret_current = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+            (row["secret_current"], expires_at, new_secret, utc_now(), endpoint_id),
+        )
+        updated = _webhook_row(db, owner_id, project_id, endpoint_id)
+    return {**webhooks.endpoint_public(updated, reveal_secret=new_secret),
+            "rotation": {"grace_seconds": request.grace_seconds,
+                         "previous_valid_until": expires_at,
+                         "note": "宽限期内两个密钥都能验签；到期后只接受新密钥"}}
+
+
+@app.post("/api/v1/webhooks/{endpoint_id}/pause")
+def pause_webhook(endpoint_id: str, request: WebhookPauseRequest) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = _webhook_row(db, owner_id, project_id, endpoint_id)
+        db.execute("UPDATE webhook_endpoints SET paused_at = ?, paused_reason = ?, updated_at = ? WHERE id = ?",
+                   (utc_now(), request.reason or "管理员暂停", utc_now(), endpoint_id))
+        updated = _webhook_row(db, owner_id, project_id, endpoint_id)
+    return {**webhooks.endpoint_public(updated), "paused": True,
+            "note": "暂停只停止新投递；已入队事件保留，恢复后继续（event_id 不变）"}
+
+
+@app.post("/api/v1/webhooks/{endpoint_id}/resume")
+def resume_webhook(endpoint_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        _webhook_row(db, owner_id, project_id, endpoint_id)
+        db.execute("UPDATE webhook_endpoints SET paused_at = NULL, paused_reason = '', updated_at = ? WHERE id = ?",
+                   (utc_now(), endpoint_id))
+        updated = _webhook_row(db, owner_id, project_id, endpoint_id)
+    return {**webhooks.endpoint_public(updated), "paused": False}
+
+
+@app.post("/api/v1/webhooks/{endpoint_id}/test")
+def test_webhook(endpoint_id: str) -> dict:
+    """测试投递：写入一条测试事件并立即投递一次（不受重试计划限制）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = _webhook_row(db, owner_id, project_id, endpoint_id)
+        if not int(row["enabled"]):
+            raise HTTPException(409, {"code": "endpoint_disabled", "detail": "该目标已禁用，测试投递不会发送"})
+        if row["paused_at"]:
+            raise HTTPException(409, {"code": "endpoint_paused", "detail": f"该目标已暂停：{row['paused_reason']}"})
+        event_id = emit_event(
+            db, event_type="webhook.test", aggregate_type="webhook_endpoint", aggregate_id=endpoint_id,
+            aggregate_revision=int(row["revision"]),
+            payload={"endpoint_id": endpoint_id, "endpoint_name": row["name"],
+                     "status": "TEST", "message": "这是一条测试事件：请验证签名与去重逻辑"},
+            owner_id=owner_id, project_id=project_id,
+        )
+    outcome = dispatch_webhooks(limit=5, force_due=True, endpoint_id=endpoint_id, event_id=event_id)
+    delivery = next((item for item in outcome["results"] if item["event_id"] == event_id), None)
+    return {"endpoint_id": endpoint_id, "event_id": event_id, "delivery": delivery,
+            "note": "测试事件与真实事件走同一签名/重试路径；本次立即投递一次，失败仍按计划重试"}
+
+
+@app.get("/api/v1/webhooks/{endpoint_id}/deliveries")
+def list_webhook_deliveries(endpoint_id: str, cursor: int = 0, limit: int = 50, status: str = "") -> dict:
+    """脱敏投递历史：只返回截断并抹除凭证的响应片段，不返回密钥。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    limit = max(1, min(200, limit))
+    with connect() as db:
+        _webhook_row(db, owner_id, project_id, endpoint_id)
+        query = "SELECT * FROM delivery_attempts WHERE endpoint_id = ?"
+        params: list = [endpoint_id]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC, attempt DESC LIMIT ? OFFSET ?"
+        params.extend([limit, cursor])
+        rows = db.execute(query, tuple(params)).fetchall()
+        dead = db.execute(
+            "SELECT * FROM dead_letter_events WHERE endpoint_id = ? ORDER BY moved_at DESC LIMIT 50",
+            (endpoint_id,),
+        ).fetchall()
+    return {
+        "endpoint_id": endpoint_id,
+        "deliveries": [webhooks.delivery_public(row) for row in rows],
+        "next_cursor": cursor + limit if len(rows) == limit else None,
+        "dead_letters": [{
+            "event_id": item["event_id"], "event_type": item["event_type"], "attempts": item["attempts"],
+            "reason": item["reason"], "last_error": webhooks.redact_response(item["last_error"]),
+            "moved_at": item["moved_at"], "replayed_at": item["replayed_at"],
+        } for item in dead],
+        "note": "投递语义为至少一次：同一 event_id 可能重复到达，接收方需按 event_id 去重",
+    }
+
+
+@app.post("/api/v1/webhooks/{endpoint_id}/dead-letters/{event_id}/replay")
+def replay_dead_letter(endpoint_id: str, event_id: str) -> dict:
+    """死信重放：清除死信标记并立即重投一次（event_id 不变，接收方仍需去重）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        _webhook_row(db, owner_id, project_id, endpoint_id)
+        item = db.execute(
+            "SELECT * FROM dead_letter_events WHERE endpoint_id = ? AND event_id = ?",
+            (endpoint_id, event_id),
+        ).fetchone()
+        if not item:
+            raise HTTPException(404, "死信记录不存在")
+        db.execute("UPDATE dead_letter_events SET replayed_at = ? WHERE id = ?", (utc_now(), item["id"]))
+        db.execute(
+            "UPDATE webhook_endpoints SET paused_at = NULL, paused_reason = '', updated_at = ? WHERE id = ?",
+            (utc_now(), endpoint_id),
+        )
+    outcome = dispatch_webhooks(limit=5, force_due=True, endpoint_id=endpoint_id, event_id=event_id)
+    delivery = next((entry for entry in outcome["results"] if entry["event_id"] == event_id), None)
+    return {"endpoint_id": endpoint_id, "event_id": event_id, "delivery": delivery,
+            "note": "重放使用原 event_id（不变）与新的时间戳；接收方按 event_id 去重"}
+
+
+@app.post("/internal/v1/webhooks/dispatch")
+def internal_dispatch_webhooks(request: Request, limit: int = 20, force_due: bool = False) -> dict:
+    """投递 Worker 入口（Worker 令牌；非浏览器）。force_due 用于演练与故障恢复，忽略重试排期。"""
+    security.ensure_worker(request)
+    return dispatch_webhooks(limit=max(1, min(200, limit)), force_due=force_due)
 
 
 class ProductionShotInput(BaseModel):

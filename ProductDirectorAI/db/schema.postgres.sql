@@ -670,3 +670,69 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
   created_at TEXT NOT NULL,
   UNIQUE (owner_id, actor, scope, idem_key)
 );
+
+-- V6-08：Webhook 目标、事务性 Outbox、投递尝试与死信
+CREATE TABLE IF NOT EXISTS webhook_endpoints (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL,
+  event_types TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  paused_at TEXT,
+  paused_reason TEXT NOT NULL DEFAULT '',
+  secret_current TEXT NOT NULL,
+  secret_previous TEXT,
+  secret_previous_expires_at DOUBLE PRECISION,
+  revision INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outbox_events (
+  id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL UNIQUE,
+  event_type TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  aggregate_type TEXT NOT NULL,
+  aggregate_id TEXT NOT NULL,
+  aggregate_revision INTEGER NOT NULL DEFAULT 0,
+  schema_version TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS delivery_attempts (
+  id TEXT PRIMARY KEY,
+  endpoint_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  response_status INTEGER,
+  response_excerpt TEXT NOT NULL DEFAULT '',
+  signature TEXT NOT NULL DEFAULT '',
+  error TEXT,
+  next_retry_at TEXT,
+  delivered_at TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (endpoint_id, event_id, attempt)
+);
+
+CREATE TABLE IF NOT EXISTS dead_letter_events (
+  id TEXT PRIMARY KEY,
+  endpoint_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  last_error TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  moved_at TEXT NOT NULL,
+  replayed_at TEXT,
+  UNIQUE (endpoint_id, event_id)
+);

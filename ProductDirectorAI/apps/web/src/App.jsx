@@ -19,7 +19,7 @@ const navItems = [
   ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck],
   ["interaction", "人物互动", User], ["reference", "参考重演", VideoCamera],
   ["profiles", "平台配置", SquaresFour], ["batch", "批次生产", Queue],
-  ["audio", "音频与音乐", MonitorPlay], ["packages", "发布包", Package], ["costs", "成本与用量", Coins], ["automation", "自动化接入", Plug], ["settings", "设置", Gear],
+  ["audio", "音频与音乐", MonitorPlay], ["packages", "发布包", Package], ["costs", "成本与用量", Coins], ["automation", "自动化接入", Plug], ["webhooks", "事件与 Webhook", Bell], ["settings", "设置", Gear],
 ];
 const defaultShots = [
   { id: "shot_01", name: "正面推近", camera: "dolly_in", focal_length_mm: 35, duration_frames: 48 },
@@ -1547,6 +1547,155 @@ function AutomationPage() {
   </section>;
 }
 
+function WebhookPage() {
+  const [endpoints, setEndpoints] = useState([]);
+  const [catalog, setCatalog] = useState(null);
+  const [created, setCreated] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [history, setHistory] = useState(null);
+  const [form, setForm] = useState({
+    name: "生产事件接收端", url: "",
+    event_types: ["batch.completed", "item.completed", "item.failed", "package.ready", "budget.blocked"],
+  });
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { load(); }, []);
+  useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(null), 9000); return () => clearTimeout(timer); } }, [notice]);
+
+  async function load() {
+    const [list, meta] = await Promise.all([apiRequest("/webhooks"), apiRequest("/webhooks/catalog")]);
+    if (list.ok) setEndpoints(await list.json());
+    if (meta.ok) setCatalog(await meta.json());
+  }
+  function toggleEvent(eventType) {
+    setForm((value) => ({
+      ...value,
+      event_types: value.event_types.includes(eventType)
+        ? value.event_types.filter((item) => item !== eventType)
+        : [...value.event_types, eventType],
+    }));
+  }
+  async function createEndpoint() {
+    setBusy(true);
+    try {
+      const response = await apiRequest("/webhooks", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: form.name, url: form.url, event_types: form.event_types }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "注册失败");
+      setCreated(body);
+      setNotice(["success", "目标已注册：签名密钥只显示这一次，请保存到接收端"]);
+      await load();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function act(endpoint, action, body = {}) {
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/webhooks/${endpoint.id}/${action}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail?.detail || payload.detail || "操作失败");
+      if (action === "rotate-secret") setCreated({ ...payload, name: `${endpoint.name}（轮换后的新密钥）` });
+      if (action === "test") {
+        const delivery = payload.delivery;
+        setNotice([delivery?.status === "DELIVERED" ? "success" : "warning",
+          `测试投递：${delivery?.status || "无结果"}${delivery?.response_status ? ` · HTTP ${delivery.response_status}` : ""}`]);
+      } else {
+        setNotice(["success", `${endpoint.name}：${action} 完成`]);
+      }
+      await load();
+      if (selected?.id === endpoint.id) await loadHistory(endpoint.id);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function loadHistory(endpointId) {
+    setSelected(endpoints.find((item) => item.id === endpointId) || { id: endpointId });
+    const response = await apiRequest(`/webhooks/${endpointId}/deliveries`);
+    if (response.ok) setHistory(await response.json());
+  }
+  function copySecret() {
+    if (!created?.secret) return;
+    navigator.clipboard?.writeText(created.secret);
+    setNotice(["success", "密钥已复制（刷新后无法再次读取）"]);
+  }
+
+  return <section className="page">
+    <div className="page-head"><div><b>V6 EVENT OUTBOX</b><h1>事件与 Webhook</h1>
+      <p>业务状态与事件同事务写入 Outbox，投递 Worker 异步发送；交付语义是至少一次，接收方按 event_id 去重。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    {created?.secret && <section className="card">
+      <div className="card-head"><div><h2>签名密钥（只显示一次）</h2><small>{created.name} · {created.url}</small></div>
+        <button onClick={copySecret}><DownloadSimple />复制</button></div>
+      <pre className="key-once">{created.secret}</pre>
+      <p className="capability-note"><WarningCircle weight="fill" />验签：HMAC-SHA256(secret, X-PDA-Timestamp + "." + 原始请求体)；
+        时间戳容差 {catalog?.tolerance_seconds ?? 300} 秒，重投使用新时间戳但 event_id 不变。</p>
+    </section>}
+    <div className="two-col">
+      <section className="card">
+        <div className="card-head"><div><h2>Webhook 目标</h2><small>{endpoints.length} 个</small></div></div>
+        <table className="table"><thead><tr><th>目标</th><th>订阅</th><th>投递</th><th>状态</th><th /></tr></thead>
+          <tbody>{endpoints.map((item) => <tr key={item.id}>
+            <td>{item.name}<small>{item.url}</small></td>
+            <td><small>{item.event_types.join(", ")}</small></td>
+            <td><small>成功 {item.stats.by_status.DELIVERED || 0} · 重试 {item.stats.pending_retry} · 死信 {item.stats.dead_letter}</small>
+              {item.stats.last_delivery && <small>最近 {item.stats.last_delivery.status} {item.stats.last_delivery.response_status || ""}</small>}</td>
+            <td>{item.paused_at ? <Pill status="FAILED" /> : item.enabled ? <Pill status="SUCCEEDED" /> : <Pill status="DRAFT" />}</td>
+            <td><div className="action-row">
+              <button onClick={() => loadHistory(item.id)} disabled={busy}>投递记录</button>
+              <button onClick={() => act(item, "test")} disabled={busy}>测试</button>
+              {item.paused_at ? <button onClick={() => act(item, "resume")} disabled={busy}>恢复</button>
+                : <button onClick={() => act(item, "pause", { reason: "控制台暂停" })} disabled={busy}>暂停</button>}
+              <button onClick={() => act(item, "rotate-secret", { grace_seconds: 86400 })} disabled={busy}>轮换密钥</button>
+            </div></td></tr>)}</tbody></table>
+        {!endpoints.length && <p className="capability-note">还没有目标：事件会写入 Outbox 但没有接收方，控制台可随时补注册（历史事件不会补投）。</p>}
+      </section>
+
+      <section className="card">
+        <div className="card-head"><div><h2>注册目标</h2><small>只接受 HTTPS（本机回环联调可用 http://127.0.0.1）</small></div></div>
+        <div className="inline-fields">
+          <label>名称<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
+          <label>接收地址<input value={form.url} onChange={(event) => setForm({ ...form, url: event.target.value })} placeholder="https://example.com/hooks/pda" /></label>
+        </div>
+        <div className="scope-grid">{(catalog?.event_types || []).map((eventType) => <label className="checkbox-line" key={eventType}>
+          <input type="checkbox" checked={form.event_types.includes(eventType)} onChange={() => toggleEvent(eventType)} />
+          <span>{eventType}</span></label>)}</div>
+        <div className="action-row"><button className="primary" onClick={createEndpoint} disabled={busy}><Plus />注册目标</button></div>
+        {catalog && <div className="profile-detail"><dl>
+          <dt>签名方案</dt><dd>{catalog.signature_scheme}</dd>
+          <dt>请求头</dt><dd>{Object.entries(catalog.headers).map(([key, value]) => `${value}（${key}）`).join("；")}</dd>
+          <dt>重试计划</dt><dd>{catalog.retry_schedule_seconds.join("s / ")}s（共 {catalog.max_attempts} 次尝试）</dd>
+          <dt>死信</dt><dd>{catalog.dead_letter}</dd>
+          <dt>顺序</dt><dd>{catalog.note}</dd>
+        </dl></div>}
+      </section>
+    </div>
+
+    {history && <section className="card">
+      <div className="card-head"><div><h2>投递记录（脱敏）</h2><small>{selected?.name || selected?.id}</small></div></div>
+      <table className="table"><thead><tr><th>事件</th><th>尝试</th><th>状态</th><th>响应</th><th>时间</th></tr></thead>
+        <tbody>{history.deliveries.map((item) => <tr key={item.id}>
+          <td>{item.event_id.slice(0, 8)}<small>{item.event_type}</small></td>
+          <td>#{item.attempt}</td>
+          <td>{item.status}</td>
+          <td><small>{item.response_status || item.error || "—"}</small><small>{item.response_excerpt?.slice(0, 60)}</small></td>
+          <td>{formatTime(item.created_at)}</td></tr>)}</tbody></table>
+      {!!history.dead_letters.length && <div>
+        <h3>死信（修复后可重放，event_id 不变）</h3>
+        <table className="table"><thead><tr><th>事件</th><th>次数</th><th>原因</th><th /></tr></thead>
+          <tbody>{history.dead_letters.map((item) => <tr key={item.event_id}>
+            <td>{item.event_id.slice(0, 8)}<small>{item.event_type}</small></td>
+            <td>{item.attempts}</td>
+            <td><small>{item.reason}</small><small>{item.last_error?.slice(0, 60)}</small></td>
+            <td>{item.replayed_at ? <small>已重放 {formatTime(item.replayed_at)}</small>
+              : <button onClick={() => act(selected, `dead-letters/${item.event_id}/replay`)} disabled={busy}>重放</button>}</td></tr>)}</tbody></table>
+      </div>}
+      {!history.deliveries.length && <p className="capability-note">还没有投递记录。</p>}
+    </section>}
+  </section>;
+}
+
 function ReferencePage() {
   const [references, setReferences] = useState([]);
   const [versions, setVersions] = useState([]);
@@ -1888,7 +2037,7 @@ export function App() {
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "costs" ? <CostPage /> : active === "automation" ? <AutomationPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "costs" ? <CostPage /> : active === "automation" ? <AutomationPage /> : active === "webhooks" ? <WebhookPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">
