@@ -785,6 +785,7 @@ def initialize_db() -> None:
               url TEXT NOT NULL,
               event_types TEXT NOT NULL,
               enabled INTEGER NOT NULL DEFAULT 1,
+              backfill_history INTEGER NOT NULL DEFAULT 0,
               paused_at TEXT,
               paused_reason TEXT NOT NULL DEFAULT '',
               secret_current TEXT NOT NULL,
@@ -931,6 +932,8 @@ def initialize_db() -> None:
         ensure_column(db, "cost_ledger", "settled_entry_id", "TEXT")
         # V6-07：账本行记录产生它的 Automation Key（Key 周期预算按此汇总，不额外记账）
         ensure_column(db, "cost_ledger", "actor_key_id", "TEXT")
+        # V6-09：端点默认不回填历史事件（旧安装补齐该列）
+        ensure_column(db, "webhook_endpoints", "backfill_history", "INTEGER NOT NULL DEFAULT 0")
         for column in ("verified_dimensions", "view_coverage", "unverified_regions", "logo_regions", "camera_visibility_constraints"):
             ensure_column(db, "product_versions", column, "TEXT")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
@@ -4500,6 +4503,20 @@ def _record_render_usage(job_id: str, started: float) -> None:
     )
 
 
+def _advance_batch_for_job(job_id: str) -> None:
+    """作业完成后推进它所属的批次：否则批次只按 max_concurrent 调度一次就永久停在 PENDING。
+
+    真实缺陷证据：V6-09 负载批次 100 项只调度了 2 项，其余 98 项在项完成后无人推进。
+    """
+    try:
+        with connect() as db:
+            item = db.execute("SELECT batch_id FROM batch_items WHERE job_id = ?", (job_id,)).fetchone()
+        if item:
+            advance_batch(item["batch_id"], execute_inline=False)
+    except Exception as exc:  # 推进失败不影响作业本身的结果
+        print(f"[batch] 推进批次失败 job={job_id}: {exc}", file=sys.stderr)
+
+
 def run_worker_once(worker_id: str) -> dict:
     reconcile_stale_jobs()
     claim = claim_job(worker_id)
@@ -4510,6 +4527,7 @@ def run_worker_once(worker_id: str) -> dict:
         execute_claimed_job(claim["job_id"], worker_id, int(claim["lease_epoch"]))
     finally:
         _record_render_usage(claim["job_id"], started)
+        _advance_batch_for_job(claim["job_id"])
     return {"claimed": True, "job_id": claim["job_id"], "lease_epoch": claim["lease_epoch"], "status": get_job(claim["job_id"])["status"]}
 
 
@@ -4562,6 +4580,20 @@ def _key_period_spend(db: sqlite3.Connection, key_id: str, period: str, now_epoc
 
 def _iso_from_epoch(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def _epoch_from_iso(value: str | None) -> float:
+    """解析库里已有的时间字符串（兼容带/不带 Z 与带时区偏移的写法）。"""
+    if not value:
+        return 0.0
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def enforce_automation_access(request: Request, identity: dict) -> None:
@@ -9859,6 +9891,25 @@ def _create_batch_record(request: BatchCreateRequest, background: BackgroundTask
     return {"batch": public, "reused_idempotent": False, "created": True}
 
 
+def _existing_or_new_item_run(db, batch_row, item_row) -> dict:
+    """幂等地为批次项取得 Run：已有同键 Run 就复用，否则新建。
+
+    并发调度下同一项可能已被其他调度器建过 Run（`runs` 的 `(plan_id, idempotency_key)`
+    唯一索引会拒绝第二次插入）；复用已有 Run 比报错更安全，也不会重复渲染。
+    """
+    payload = json.loads(item_row["payload"])
+    existing = db.execute(
+        "SELECT * FROM runs WHERE plan_id = ? AND idempotency_key = ?",
+        (payload["plan_id"], f"batch:{item_row['batch_id']}:{item_row['item_index']}"),
+    ).fetchone()
+    if existing:
+        _requeue_missing_run_job(db, existing["id"], existing["job_id"])
+        return {"run_id": existing["id"], "job_id": existing["job_id"], "plan_contract_id": existing["plan_contract_id"],
+                "reused": True}
+    created = start_batch_item_run(db, batch_row, item_row)
+    return {**created, "reused": False}
+
+
 def start_batch_item_run(db, batch_row, item_row) -> dict:
     """为批次项创建独立 Run（每项独立失败/取消，不影响其他项）。"""
     payload = json.loads(item_row["payload"])
@@ -9896,6 +9947,9 @@ def start_batch_item_run(db, batch_row, item_row) -> dict:
     # 执行器从 run 目录读取冻结计划快照：不写它，任务会在领取后立刻失败
     ensure_run_plan_snapshot(job_id, plan_snapshot)
     return {"run_id": run_id, "job_id": job_id, "plan_contract_id": contract["id"]}
+
+
+SCHEDULING_STALE_SECONDS = 300
 
 
 def _requeue_missing_run_job(db, run_id: str, job_id: str) -> bool:
@@ -9936,11 +9990,18 @@ def ensure_run_plan_snapshot(job_id: str, plan_payload: dict) -> Path:
 
 
 def reconcile_batch_items(db, batch_id: str) -> None:
-    """把关联 Run/Job 的终态回写到批次项；并补建缺失的队列行（否则项永远不执行）。"""
+    """把关联 Run/Job 的终态回写到批次项；补建缺失队列行；释放超时的调度认领。"""
     items = db.execute(
         "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
     ).fetchall()
     for item in items:
+        if item["status"] == "SCHEDULING" and not item["run_id"]:
+            # 认领后崩溃会留下 SCHEDULING：超时未落地 Run 就退回 PENDING，避免项永久卡住
+            age = _epoch_from_iso(utc_now()) - _epoch_from_iso(item["updated_at"])
+            if age > SCHEDULING_STALE_SECONDS:
+                db.execute("UPDATE batch_items SET status = 'PENDING', error = ?, updated_at = ? WHERE id = ?",
+                           (f"调度认领超时（{int(age)}s 未创建 Run），已退回待调度", utc_now(), item["id"]))
+            continue
         if not item["job_id"] or item["status"] not in ("QUEUED", "RUNNING"):
             continue
         job = db.execute("SELECT * FROM jobs WHERE id = ?", (item["job_id"],)).fetchone()
@@ -10027,8 +10088,19 @@ def refresh_batch_status(db, batch_id: str) -> sqlite3.Row:
     return db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
 
 
-def advance_batch(batch_id: str) -> dict:
-    """批次调度：按并发上限为 PENDING 项创建 Run，并更新聚合状态。暂停时只停新调度。"""
+def advance_batch(batch_id: str, *, execute_inline: bool = True) -> dict:
+    """批次调度：按并发上限为 PENDING 项创建 Run，并更新聚合状态。暂停时只停新调度。
+
+    `execute_inline=False` 时只调度（写 Run 与队列行），由 Worker 从 run_jobs 领取执行：
+    调度 Worker 与投递 Worker 用这种方式，避免调度请求被整段渲染阻塞。
+
+    并发安全（V6-09 负载实测到的真实缺陷）：多个调度器（API 内联执行器、调度 tick、
+    Worker 完成回调）会同时推进同一批次。因此这里分三步，**每一项各自一个事务**：
+    1) 短事务：按并发上限原子认领 PENDING 项（`WHERE status = 'PENDING'` 的条件更新）；
+    2) 每项独立事务：为已认领项创建 Run + 队列行（唯一键冲突只影响该项，且已有 Run 直接复用）；
+    3) 短事务：重算聚合状态。
+    这样一项失败不会污染其他项的事务，也不会让整批推进被 500 打断。
+    """
     with connect() as db:
         begin_immediate(db)
         batch = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
@@ -10036,43 +10108,68 @@ def advance_batch(batch_id: str) -> dict:
             raise HTTPException(404, "批次不存在")
         batch_payload = json.loads(batch["payload"])
         max_concurrent = int(batch_payload.get("max_concurrent") or batch_rules.DEFAULT_MAX_CONCURRENT)
+        paused, cancelled = bool(batch["paused"]), bool(batch["cancelled"])
         reconcile_batch_items(db, batch_id)
         items = db.execute(
             "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
         ).fetchall()
-        active = [item for item in items if item["status"] in ("QUEUED", "RUNNING")]
-        started = []
-        if not batch["paused"] and not batch["cancelled"]:
+        active = sum(1 for item in items if item["status"] in batch_rules.ACTIVE_ITEM_STATUSES)
+        claimed: list[dict] = []
+        if not paused and not cancelled:
             for item in items:
-                if len(active) >= max_concurrent:
+                if active + len(claimed) >= max_concurrent:
                     break
                 if item["status"] != "PENDING":
                     continue
-                try:
-                    created = start_batch_item_run(db, batch, item)
-                except HTTPException as exc:
-                    # 调度失败必须可见：记录到该项并继续尝试其他项（不阻塞、不静默）
-                    db.execute("UPDATE batch_items SET status = 'FAILED', error = ?, updated_at = ? WHERE id = ?",
-                               (f"调度失败: {exc.detail}", utc_now(), item["id"]))
+                result = db.execute(
+                    "UPDATE batch_items SET status = 'SCHEDULING', updated_at = ? WHERE id = ? AND status = 'PENDING'",
+                    (utc_now(), item["id"]),
+                )
+                if int(getattr(result, "rowcount", 0) or 0) > 0:
+                    claimed.append(dict(item))
+        statuses = [row["status"] for row in db.execute(
+            "SELECT status FROM batch_items WHERE batch_id = ?", (batch_id,)).fetchall()]
+        planned_status = batch_rules.aggregate_status(
+            statuses + ["QUEUED"] * len(claimed), paused=paused, cancelled=cancelled)
+        db.execute("UPDATE batches SET status = ?, updated_at = ? WHERE id = ?",
+                   (planned_status, utc_now(), batch_id))
+
+    started: list[dict] = []
+    for item in claimed:
+        try:
+            with connect() as item_db:
+                begin_immediate(item_db)
+                fresh_batch = item_db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+                if fresh_batch is None:
+                    raise RuntimeError("批次已不存在")
+                if fresh_batch["paused"] or fresh_batch["cancelled"]:
+                    item_db.execute(
+                        "UPDATE batch_items SET status = 'PENDING', updated_at = ? WHERE id = ?",
+                        (utc_now(), item["id"]))
                     continue
-                db.execute(
-                    "UPDATE batch_items SET status = 'QUEUED', run_id = ?, job_id = ?, error = NULL, updated_at = ? WHERE id = ?",
+                created = _existing_or_new_item_run(item_db, fresh_batch, item)
+                item_db.execute(
+                    "UPDATE batch_items SET status = 'QUEUED', run_id = ?, job_id = ?, error = NULL, updated_at = ? "
+                    "WHERE id = ?",
                     (created["run_id"], created["job_id"], utc_now(), item["id"]),
                 )
-                started.append({"item_id": item["id"], "index": item["item_index"], **created})
-                active.append(item)
-        items = db.execute(
-            "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
-        ).fetchall()
-        statuses = [item["status"] for item in items]
-        new_status = batch_rules.aggregate_status(statuses, paused=bool(batch["paused"]),
-                                                 cancelled=bool(batch["cancelled"]))
-        db.execute("UPDATE batches SET status = ?, updated_at = ? WHERE id = ?",
-                   (new_status, utc_now(), batch_id))
-        row = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+            started.append({"item_id": item["id"], "index": item["item_index"], **created})
+        except HTTPException as exc:
+            with connect() as fail_db:
+                fail_db.execute(
+                    "UPDATE batch_items SET status = 'FAILED', error = ?, updated_at = ? WHERE id = ?",
+                    (f"调度失败: {exc.detail}", utc_now(), item["id"]))
+        except Exception as exc:  # 并发/唯一键/上游异常：释放认领，下一轮重试（不影响其他项）
+            with connect() as retry_db:
+                retry_db.execute(
+                    "UPDATE batch_items SET status = 'PENDING', error = ?, updated_at = ? WHERE id = ?",
+                    (f"调度异常（已释放认领，稍后重试）: {exc}", utc_now(), item["id"]))
+
+    with connect() as db:
+        row = refresh_batch_status(db, batch_id)
         public = _batch_public(db, row)
     for start in started:
-        if not INLINE_EXECUTOR_DISABLED:
+        if execute_inline and not INLINE_EXECUTOR_DISABLED:
             execute_job(start["job_id"])
     return {"batch": public, "started": started}
 
@@ -11650,34 +11747,90 @@ def emit_event_standalone(**kwargs) -> str | None:
         return None
 
 
-def _endpoints_for_event(db: sqlite3.Connection, owner_id: str, project_id: str, event_type: str) -> list:
+def _endpoints_for_event(db: sqlite3.Connection, owner_id: str, project_id: str, event_type: str,
+                         event_created_at: str | None = None) -> list:
+    """订阅该事件的目标。
+
+    默认**不回填历史事件**：端点只收注册之后产生的事件（`backfill_history=1` 才回填）。
+    V6-09 实测缺陷：新端点若收到全部历史事件，会瞬间形成数百条待投递队列，
+    把新事件的投递延迟推到几十分钟（"事件通常 3 秒内到 UI"直接失效）。
+    """
     rows = db.execute(
         "SELECT * FROM webhook_endpoints WHERE owner_id = ? AND project_id = ? AND enabled = 1 "
         "AND paused_at IS NULL ORDER BY created_at ASC",
         (owner_id, project_id),
     ).fetchall()
-    return [row for row in rows if event_type in [item for item in (row["event_types"] or "").split(",") if item]]
+    matched = []
+    for row in rows:
+        if event_type not in [item for item in (row["event_types"] or "").split(",") if item]:
+            continue
+        backfill = bool(row["backfill_history"]) if "backfill_history" in row.keys() else False
+        if not backfill and event_created_at and row["created_at"] and event_created_at < row["created_at"]:
+            continue
+        matched.append(row)
+    return matched
+
+
+ENDPOINT_COOLDOWN_SECONDS = 60
+ENDPOINT_TICK_BUDGET = 5
 
 
 def _pending_deliveries(db: sqlite3.Connection, limit: int, *, force_due: bool = False,
-                        endpoint_id: str | None = None, event_id: str | None = None) -> list[dict]:
-    """待投递队列：Outbox 事件 × 订阅目标，排除已成功、死信与未到重试时间的。"""
+                        endpoint_id: str | None = None, event_id: str | None = None,
+                        per_endpoint_limit: int = ENDPOINT_TICK_BUDGET) -> tuple[list[dict], dict]:
+    """待投递队列：**按端点轮询**选取，保证每个目标都能推进。
+
+    这里刻意不做「全局按事件时间排序」：那样会让历史目标（或不可达目标）长期占满名额，
+    新注册的目标永远轮不到自己的事件（V6-09 负载实测到的饥饿问题）。规则：
+    - 每个目标每次 tick 最多 `per_endpoint_limit` 条；
+    - 默认只投递目标注册之后产生的事件（`backfill_history=1` 才回填历史）；
+    - 最近一次投递是连接级失败的目标进入冷却期，整体跳过，不拖慢其他目标。
+    """
     now = utc_now()
+    now_epoch = _epoch_from_iso(now)
+    endpoints = db.execute(
+        "SELECT * FROM webhook_endpoints WHERE enabled = 1 AND paused_at IS NULL ORDER BY created_at ASC"
+    ).fetchall()
+    if endpoint_id:
+        endpoints = [row for row in endpoints if row["id"] == endpoint_id]
     pending: list[dict] = []
-    query = "SELECT * FROM outbox_events"
-    params: list = []
-    if event_id:
-        query += " WHERE event_id = ?"
-        params.append(event_id)
-    query += " ORDER BY created_at ASC LIMIT ?"
-    params.append(max(1, limit))
-    events = db.execute(query, tuple(params)).fetchall()
-    for event in events:
-        subscribers = _endpoints_for_event(db, event["owner_id"], event["project_id"], event["event_type"])
-        if endpoint_id:
-            subscribers = [row for row in subscribers if row["id"] == endpoint_id]
-        for endpoint in subscribers:
-            attempts = db.execute(
+    skipped: dict[str, str] = {}
+    per_endpoint: dict[str, int] = {}
+    for endpoint in endpoints:
+        if len(pending) >= limit:
+            skipped.setdefault(endpoint["id"], "global_limit")
+            continue
+        event_types = [item for item in (endpoint["event_types"] or "").split(",") if item]
+        if not event_types:
+            continue
+        last_attempt = db.execute(
+            "SELECT * FROM delivery_attempts WHERE endpoint_id = ? ORDER BY created_at DESC LIMIT 1",
+            (endpoint["id"],),
+        ).fetchone()
+        if last_attempt and not force_due and last_attempt["status"] == "RETRY" \
+                and last_attempt["response_status"] is None:
+            age = now_epoch - _epoch_from_iso(last_attempt["created_at"])
+            if age < ENDPOINT_COOLDOWN_SECONDS:
+                skipped.setdefault(endpoint["id"], f"cooldown_{int(ENDPOINT_COOLDOWN_SECONDS - age)}s")
+                continue
+        placeholders = ", ".join("?" for _ in event_types)
+        conditions = [f"event_type IN ({placeholders})", "owner_id = ?", "project_id = ?"]
+        params: list = [*event_types, endpoint["owner_id"], endpoint["project_id"]]
+        if not bool(endpoint["backfill_history"] if "backfill_history" in endpoint.keys() else False):
+            conditions.append("created_at >= ?")
+            params.append(endpoint["created_at"])
+        if event_id:
+            conditions.append("event_id = ?")
+            params.append(event_id)
+        params.append(max(per_endpoint_limit * 4, per_endpoint_limit))
+        events = db.execute(
+            f"SELECT * FROM outbox_events WHERE {' AND '.join(conditions)} ORDER BY created_at ASC LIMIT ?",
+            tuple(params),
+        ).fetchall()
+        for event in events:
+            if len(pending) >= limit or per_endpoint.get(endpoint["id"], 0) >= per_endpoint_limit:
+                break
+            previous = db.execute(
                 "SELECT * FROM delivery_attempts WHERE endpoint_id = ? AND event_id = ? ORDER BY attempt DESC LIMIT 1",
                 (endpoint["id"], event["event_id"]),
             ).fetchone()
@@ -11685,18 +11838,17 @@ def _pending_deliveries(db: sqlite3.Connection, limit: int, *, force_due: bool =
                 "SELECT * FROM dead_letter_events WHERE endpoint_id = ? AND event_id = ? AND replayed_at IS NULL",
                 (endpoint["id"], event["event_id"]),
             ).fetchone()
-            if dead:
+            if dead or (previous and previous["status"] == "DELIVERED"):
                 continue
-            if attempts and attempts["status"] == "DELIVERED":
+            if previous and previous["next_retry_at"] and not force_due and previous["next_retry_at"] > now:
                 continue
-            if attempts and attempts["next_retry_at"] and not force_due and attempts["next_retry_at"] > now:
-                continue
+            per_endpoint[endpoint["id"]] = per_endpoint.get(endpoint["id"], 0) + 1
             pending.append({
                 "endpoint": endpoint,
                 "event": event,
-                "attempt": (int(attempts["attempt"]) + 1) if attempts else 1,
+                "attempt": (int(previous["attempt"]) + 1) if previous else 1,
             })
-    return pending
+    return pending, skipped
 
 
 def _deliver_once(endpoint, event, attempt: int) -> dict:
@@ -11744,8 +11896,8 @@ def dispatch_webhooks(limit: int = 20, *, force_due: bool = False, endpoint_id: 
     delivered = retried = dead = 0
     results: list[dict] = []
     with connect() as db:
-        pending = _pending_deliveries(db, limit, force_due=force_due, endpoint_id=endpoint_id,
-                                      event_id=event_id)
+        pending, skipped = _pending_deliveries(db, limit, force_due=force_due, endpoint_id=endpoint_id,
+                                               event_id=event_id)
     for entry in pending:
         endpoint, event, attempt = entry["endpoint"], entry["event"], entry["attempt"]
         outcome = _deliver_once(endpoint, event, attempt)
@@ -11791,7 +11943,11 @@ def dispatch_webhooks(limit: int = 20, *, force_due: bool = False, endpoint_id: 
             "error": outcome["error"],
         })
     return {"attempted": len(results), "delivered": delivered, "retried": retried, "dead_letter": dead,
-            "results": results, "force_due": force_due}
+            "results": results, "force_due": force_due,
+            "skipped_endpoints": skipped,
+            "fairness": {"per_endpoint_tick_budget": ENDPOINT_TICK_BUDGET,
+                         "endpoint_cooldown_seconds": ENDPOINT_COOLDOWN_SECONDS,
+                         "note": "不可达目标不会吃掉整轮投递名额（否则健康目标事件会排队数分钟）"}}
 
 
 # ---------------------------------------------------------------------------
@@ -12062,6 +12218,171 @@ def internal_dispatch_webhooks(request: Request, limit: int = 20, force_due: boo
     """投递 Worker 入口（Worker 令牌；非浏览器）。force_due 用于演练与故障恢复，忽略重试排期。"""
     security.ensure_worker(request)
     return dispatch_webhooks(limit=max(1, min(200, limit)), force_due=force_due)
+
+
+# ---------------------------------------------------------------------------
+# V6-09 总控台：全部指标在服务端按数据库真实数据聚合（不推算、不生成）
+# ---------------------------------------------------------------------------
+
+def _count(db: sqlite3.Connection, query: str, params: tuple = ()) -> int:
+    row = db.execute(query, params).fetchone()
+    return int(row["n"] or 0) if row else 0
+
+
+@app.get("/api/v1/console/overview")
+def console_overview(window_minutes: int = 60) -> dict:
+    """总控台概览：队列深度、吞吐、失败原因、成本、事件与投递健康。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    window = max(5, min(24 * 60, int(window_minutes)))
+    since = _iso_from_epoch(time.time() - window * 60)
+    with connect() as db:
+        job_rows = db.execute(
+            "SELECT status, count(*) AS n FROM jobs GROUP BY status ORDER BY n DESC").fetchall()
+        jobs_by_status = {row["status"]: row["n"] for row in job_rows}
+        recent_jobs = db.execute(
+            "SELECT status, count(*) AS n FROM jobs WHERE created_at >= ? GROUP BY status", (since,)).fetchall()
+        run_rows = db.execute(
+            "SELECT status, count(*) AS n FROM runs WHERE owner_id = ? GROUP BY status ORDER BY n DESC",
+            (owner_id,)).fetchall()
+        queue = {
+            "queued": _count(db, "SELECT count(*) AS n FROM run_jobs WHERE status = 'QUEUED'"),
+            "running": _count(db, "SELECT count(*) AS n FROM run_jobs WHERE status = 'RUNNING'"),
+            "oldest_queued_at": (db.execute(
+                "SELECT min(created_at) AS t FROM run_jobs WHERE status = 'QUEUED'").fetchone() or {"t": None})["t"],
+            "jobs_without_queue_row": _count(
+                db,
+                "SELECT count(*) AS n FROM jobs j WHERE j.status = 'QUEUED' "
+                "AND NOT EXISTS (SELECT 1 FROM run_jobs q WHERE q.job_id = j.id)"),
+        }
+        batches = {
+            "by_status": {row["status"]: row["n"] for row in db.execute(
+                "SELECT status, count(*) AS n FROM batches WHERE owner_id = ? GROUP BY status", (owner_id,)).fetchall()},
+            "items_by_status": {row["status"]: row["n"] for row in db.execute(
+                "SELECT status, count(*) AS n FROM batch_items GROUP BY status").fetchall()},
+            "recent_items": {row["status"]: row["n"] for row in db.execute(
+                "SELECT status, count(*) AS n FROM batch_items WHERE updated_at >= ? GROUP BY status",
+                (since,)).fetchall()},
+        }
+        failures = [{"status": row["status"], "error": (row["error"] or "")[:160], "count": row["n"],
+                     "last_at": row["last_at"]}
+                    for row in db.execute(
+                        "SELECT status, error, count(*) AS n, max(updated_at) AS last_at FROM jobs "
+                        "WHERE status IN ('FAILED', 'QA_REJECTED') GROUP BY status, error ORDER BY n DESC LIMIT 5"
+                    ).fetchall()]
+        ledger = db.execute(
+            "SELECT kind, currency, sum(amount) AS total FROM cost_ledger WHERE owner_id = ? GROUP BY kind, currency",
+            (owner_id,),
+        ).fetchall()
+        usage_events = _count(db, "SELECT count(*) AS n FROM usage_events WHERE owner_id = ?", (owner_id,))
+        unpriced = _count(db, "SELECT count(*) AS n FROM usage_events WHERE owner_id = ? AND amount IS NULL",
+                          (owner_id,))
+        outbox = {
+            "total": _count(db, "SELECT count(*) AS n FROM outbox_events WHERE owner_id = ?", (owner_id,)),
+            "window": _count(db, "SELECT count(*) AS n FROM outbox_events WHERE owner_id = ? AND created_at >= ?",
+                             (owner_id, since)),
+            "undelivered": _count(
+                db,
+                "SELECT count(*) AS n FROM outbox_events e WHERE e.owner_id = ? AND EXISTS ("
+                "SELECT 1 FROM webhook_endpoints w WHERE w.owner_id = e.owner_id AND w.project_id = e.project_id "
+                "AND w.enabled = 1 AND w.paused_at IS NULL AND (',' || w.event_types || ',') LIKE '%,' || e.event_type || ',%') "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_attempts a WHERE a.event_id = e.event_id AND a.status = 'DELIVERED')",
+                (owner_id,)),
+        }
+        latency_rows = db.execute(
+            "SELECT a.created_at AS delivered_at, e.created_at AS event_at FROM delivery_attempts a "
+            "JOIN outbox_events e ON e.event_id = a.event_id "
+            "WHERE a.status = 'DELIVERED' AND a.created_at >= ? ORDER BY a.created_at DESC LIMIT 200",
+            (since,),
+        ).fetchall()
+        latencies = sorted(
+            max(0.0, (_epoch_from_iso(row["delivered_at"]) - _epoch_from_iso(row["event_at"])) * 1000.0)
+            for row in latency_rows
+        )
+        deliveries = {
+            "attempts": _count(db, "SELECT count(*) AS n FROM delivery_attempts WHERE created_at >= ?", (since,)),
+            "delivered": _count(db, "SELECT count(*) AS n FROM delivery_attempts WHERE status = 'DELIVERED' AND created_at >= ?", (since,)),
+            "retry": _count(db, "SELECT count(*) AS n FROM delivery_attempts WHERE status = 'RETRY' AND created_at >= ?", (since,)),
+            "dead": _count(db, "SELECT count(*) AS n FROM delivery_attempts WHERE status = 'DEAD' AND created_at >= ?", (since,)),
+            "dead_letters_open": _count(db, "SELECT count(*) AS n FROM dead_letter_events WHERE replayed_at IS NULL"),
+            "paused_endpoints": _count(db, "SELECT count(*) AS n FROM webhook_endpoints WHERE paused_at IS NOT NULL"),
+            "delivery_latency_ms": {
+                "sample": len(latencies),
+                "p50": round(latencies[len(latencies) // 2], 1) if latencies else None,
+                "p95": round(latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))], 1) if latencies else None,
+                "max": round(latencies[-1], 1) if latencies else None,
+                "note": "事件写入 Outbox 到成功投递的实测耗时（同一数据库时间源）",
+            },
+        }
+        keys = {
+            "active": _count(db, "SELECT count(*) AS n FROM automation_keys WHERE revoked_at IS NULL"),
+            "revoked": _count(db, "SELECT count(*) AS n FROM automation_keys WHERE revoked_at IS NOT NULL"),
+            "calls_window": _count(db, "SELECT coalesce(sum(call_count), 0) AS n FROM automation_keys"),
+        }
+        latest_events = [{
+            "event_id": row["event_id"], "event_type": row["event_type"], "created_at": row["created_at"],
+            "aggregate_id": row["aggregate_id"],
+            "delivered": _count(db, "SELECT count(*) AS n FROM delivery_attempts WHERE event_id = ? AND status = 'DELIVERED'",
+                                (row["event_id"],)),
+            "attempts": _count(db, "SELECT count(*) AS n FROM delivery_attempts WHERE event_id = ?", (row["event_id"],)),
+        } for row in db.execute(
+            "SELECT * FROM outbox_events WHERE owner_id = ? ORDER BY created_at DESC LIMIT 10", (owner_id,)).fetchall()]
+    return {
+        "measured_at": utc_now(),
+        "window_minutes": window,
+        "jobs": {
+            "by_status": jobs_by_status,
+            "total": sum(jobs_by_status.values()),
+            "window": {row["status"]: row["n"] for row in recent_jobs},
+            # 成功口径：生产成功包括 SUCCEEDED（批次/普通 Run）与 VERIFICATION_PASSED（受控渲染）
+            "succeeded": (jobs_by_status.get("SUCCEEDED", 0) + jobs_by_status.get("VERIFICATION_PASSED", 0)),
+            "success_rate": (round((jobs_by_status.get("SUCCEEDED", 0) + jobs_by_status.get("VERIFICATION_PASSED", 0))
+                                   / max(1, jobs_by_status.get("SUCCEEDED", 0)
+                                         + jobs_by_status.get("VERIFICATION_PASSED", 0)
+                                         + jobs_by_status.get("FAILED", 0)
+                                         + jobs_by_status.get("QA_REJECTED", 0)), 4)),
+        },
+        "runs": {row["status"]: row["n"] for row in run_rows},
+        "queue": queue,
+        "batches": batches,
+        "failures": failures,
+        "cost": {
+            "by_kind_currency": [{"kind": row["kind"], "currency": row["currency"],
+                                  "total": round(float(row["total"] or 0), 6)} for row in ledger],
+            "usage_events": usage_events, "unpriced_usage_events": unpriced,
+            "note": "自管资源为内部估算；未定价事件不按 0 计入",
+        },
+        "events": {**outbox, "latest": latest_events},
+        "webhooks": deliveries,
+        "automation_keys": keys,
+        "notes": [
+            "全部数值来自数据库实时聚合（jobs/runs/run_jobs/batches/batch_items/cost_ledger/outbox_events/delivery_attempts）",
+            "queue.jobs_without_queue_row > 0 表示存在无法被 Worker 领取的作业：对账会自动补建队列行",
+            "success_rate 用真实终态作业计算，不包含仍在队列中的作业",
+        ],
+    }
+
+
+@app.post("/internal/v1/batches/advance")
+def internal_advance_batches(request: Request, limit: int = 20) -> dict:
+    """调度 Worker 入口：推进所有未完成且未暂停的批次（等价于部署里的调度 tick）。"""
+    security.ensure_worker(request)
+    owner_id, _, _ = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT id FROM batches WHERE owner_id = ? AND paused = 0 AND cancelled = 0 "
+            "AND status IN ('QUEUED', 'RUNNING') ORDER BY created_at ASC LIMIT ?",
+            (owner_id, max(1, min(200, limit))),
+        ).fetchall()
+    results = []
+    for row in rows:
+        try:
+            outcome = advance_batch(row["id"], execute_inline=False)
+            results.append({"batch_id": row["id"], "scheduled": len(outcome.get("started") or []),
+                            "status": outcome["batch"]["status"]})
+        except HTTPException as exc:
+            results.append({"batch_id": row["id"], "error": exc.detail})
+    return {"advanced": len(results), "results": results,
+            "note": "调度不执行渲染：只按并发上限为 PENDING 项创建 Run 与队列行，Worker 领取后才会真正执行"}
 
 
 class ProductionShotInput(BaseModel):

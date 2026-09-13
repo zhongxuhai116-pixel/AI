@@ -23,7 +23,9 @@ BATCH_STATUSES = (
     "DRAFT", "QUEUED", "RUNNING", "PAUSED", "WAITING_REVIEW",
     "COMPLETED", "PARTIAL_FAILED", "FAILED", "CANCELLED",
 )
-ITEM_STATUSES = ("PENDING", "QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED", "SKIPPED")
+ITEM_STATUSES = ("PENDING", "SCHEDULING", "QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED", "SKIPPED")
+# 占用并发额度的状态：SCHEDULING 是"已被某个调度器认领、正在创建 Run"的短暂状态
+ACTIVE_ITEM_STATUSES = ("SCHEDULING", "QUEUED", "RUNNING")
 
 
 class ExpansionError(ValueError):
@@ -197,7 +199,7 @@ def aggregate_status(item_statuses: list[str], *, paused: bool = False, cancelle
     succeeded = sum(1 for status in statuses if status == "SUCCEEDED")
     failed = sum(1 for status in statuses if status in ("FAILED",))
     cancelled_count = sum(1 for status in statuses if status == "CANCELLED")
-    active = sum(1 for status in statuses if status in ("RUNNING", "QUEUED"))
+    active = sum(1 for status in statuses if status in ACTIVE_ITEM_STATUSES)
     pending = sum(1 for status in statuses if status == "PENDING")
     if succeeded == len(statuses):
         return "COMPLETED"
@@ -225,7 +227,7 @@ def summarize(items: list[dict]) -> dict:
         "failed": counts.get("FAILED", 0),
         "cancelled": counts.get("CANCELLED", 0),
         "pending": counts.get("PENDING", 0),
-        "active": counts.get("RUNNING", 0) + counts.get("QUEUED", 0),
+        "active": sum(counts.get(status, 0) for status in ACTIVE_ITEM_STATUSES),
         "production_complete": counts.get("SUCCEEDED", 0) == len(items) and bool(items),
     }
 

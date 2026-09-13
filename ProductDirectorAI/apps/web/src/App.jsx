@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive, ArrowClockwise, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
-  Clock, Coins, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
+  Clock, Coins, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gauge, Gear, Image, ListChecks,
   MagnifyingGlass, MonitorPlay, Package, PencilSimple, Play, Plug, Plus, Queue,
   ShieldCheck, SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, User, VideoCamera, WarningCircle, X,
 } from "@phosphor-icons/react";
@@ -13,7 +13,7 @@ const API = `${API_BASE}/api/v1`;
 let sessionCsrfToken = "";
 const demoImage = "/assets/boxing-trainer.png";
 const navItems = [
-  ["project", "项目", SquaresFour], ["products", "产品库", Cube],
+  ["console", "总控台", Gauge], ["project", "项目", SquaresFour], ["products", "产品库", Cube],
   ["director", "导演台", SlidersHorizontal], ["storyboard", "分镜", FilmSlate],
   ["preview", "3D 预演", MonitorPlay], ["jobs", "渲染任务", Queue],
   ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck],
@@ -1696,6 +1696,97 @@ function WebhookPage() {
   </section>;
 }
 
+function ConsolePage() {
+  const [overview, setOverview] = useState(null);
+  const [window, setWindow] = useState(60);
+  const [auto, setAuto] = useState(true);
+  const [notice, setNotice] = useState(null);
+
+  useEffect(() => { load(); }, [window]);
+  useEffect(() => {
+    if (!auto) return undefined;
+    const timer = setInterval(() => { load(); }, 5000);
+    return () => clearInterval(timer);
+  }, [auto, window]);
+  useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(null), 6000); return () => clearTimeout(timer); } }, [notice]);
+
+  async function load() {
+    const response = await apiRequest(`/console/overview?window_minutes=${window}`);
+    if (response.ok) setOverview(await response.json());
+    else setNotice(["danger", "总控台数据读取失败"]);
+  }
+  const metric = (value) => (value === null || value === undefined ? "—" : value);
+
+  return <section className="page">
+    <div className="page-head"><div><b>V6 CONSOLE</b><h1>总控台</h1>
+      <p>全部数值来自数据库实时聚合（作业/队列/批次/账本/事件/投递）；页面每 5 秒刷新一次。</p></div>
+      <div className="action-row">
+        <label className="checkbox-line"><input type="checkbox" checked={auto} onChange={() => setAuto(!auto)} /><span>自动刷新</span></label>
+        <select value={window} onChange={(event) => setWindow(Number(event.target.value))}>
+          <option value={15}>近 15 分钟</option><option value={60}>近 1 小时</option>
+          <option value={180}>近 3 小时</option><option value={1440}>近 24 小时</option></select>
+        <button onClick={load}><ArrowClockwise />刷新</button>
+      </div>
+    </div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    {!overview && <p className="capability-note">正在读取总控台数据…</p>}
+    {overview && <>
+      <section className="metric-grid">
+        <div className="metric"><span>队列中</span><b>{metric(overview.queue.queued)}</b><small>运行中 {overview.queue.running}</small></div>
+        <div className="metric"><span>作业成功率</span><b>{Math.round((overview.jobs.success_rate || 0) * 100)}%</b>
+          <small>终态作业 {overview.jobs.total} 个</small></div>
+        <div className="metric"><span>批次项</span><b>{Object.values(overview.batches.items_by_status).reduce((sum, value) => sum + value, 0)}</b>
+          <small>{Object.entries(overview.batches.items_by_status).map(([key, value]) => `${key} ${value}`).join(" · ") || "无"}</small></div>
+        <div className="metric"><span>未投递事件</span><b>{overview.events.undelivered}</b>
+          <small>窗口内新增 {overview.events.window}</small></div>
+        <div className="metric"><span>投递延迟 p50 / p95</span>
+          <b>{metric(overview.webhooks.delivery_latency_ms.p50)} / {metric(overview.webhooks.delivery_latency_ms.p95)} ms</b>
+          <small>样本 {overview.webhooks.delivery_latency_ms.sample} · 死信 {overview.webhooks.dead_letters_open}</small></div>
+        <div className="metric"><span>成本（已确认）</span>
+          <b>{(overview.cost.by_kind_currency.filter((item) => item.kind === "settled")[0]?.total) ?? 0}</b>
+          <small>已发生未对账 {(overview.cost.by_kind_currency.filter((item) => item.kind === "accrued")[0]?.total) ?? 0} · 未定价用量 {overview.cost.unpriced_usage_events}</small></div>
+      </section>
+      {overview.queue.jobs_without_queue_row > 0 && <p className="capability-note danger">
+        <WarningCircle weight="fill" />有 {overview.queue.jobs_without_queue_row} 个队列中的作业缺少 run_jobs 队列行：
+        它们不会被 Worker 领取；读取批次会触发对账补建（V6-07 修复），如需立即处理可打开对应批次页。</p>}
+      <div className="two-col">
+        <section className="card">
+          <div className="card-head"><div><h2>作业与运行</h2><small>测量时间 {formatTime(overview.measured_at)}</small></div></div>
+          <table className="table"><thead><tr><th>状态</th><th>作业</th><th>窗口内</th><th>运行</th></tr></thead>
+            <tbody>{Object.entries(overview.jobs.by_status).map(([status, value]) => <tr key={status}>
+              <td>{status}</td><td>{value}</td><td>{overview.jobs.window[status] ?? 0}</td>
+              <td>{overview.runs[status] ?? 0}</td></tr>)}</tbody></table>
+          <h3>失败原因（前 5）</h3>
+          <table className="table"><thead><tr><th>状态</th><th>原因</th><th>次数</th><th>最近</th></tr></thead>
+            <tbody>{overview.failures.map((item, index) => <tr key={`${item.status}-${index}`}>
+              <td>{item.status}</td><td><small>{item.error || "（无错误文本）"}</small></td>
+              <td>{item.count}</td><td>{formatTime(item.last_at)}</td></tr>)}</tbody></table>
+          {!overview.failures.length && <p className="capability-note">没有失败或 QA 拒绝的作业。</p>}
+        </section>
+        <section className="card">
+          <div className="card-head"><div><h2>批次、事件与自动化</h2><small>{overview.window_minutes} 分钟窗口</small></div></div>
+          <div className="profile-detail"><dl>
+            <dt>批次状态</dt><dd>{Object.entries(overview.batches.by_status).map(([key, value]) => `${key} ${value}`).join(" · ") || "无"}</dd>
+            <dt>项窗口内</dt><dd>{Object.entries(overview.batches.recent_items).map(([key, value]) => `${key} ${value}`).join(" · ") || "无"}</dd>
+            <dt>投递（窗口）</dt><dd>尝试 {overview.webhooks.attempts} · 成功 {overview.webhooks.delivered} · 重试 {overview.webhooks.retry} · 死信 {overview.webhooks.dead}</dd>
+            <dt>暂停目标</dt><dd>{overview.webhooks.paused_endpoints}</dd>
+            <dt>自动化 Key</dt><dd>有效 {overview.automation_keys.active} · 已撤销 {overview.automation_keys.revoked} · 累计调用 {overview.automation_keys.calls_window}</dd>
+            <dt>用量事件</dt><dd>{overview.cost.usage_events}</dd>
+          </dl></div>
+          <h3>最近事件</h3>
+          <table className="table"><thead><tr><th>事件</th><th>类型</th><th>投递</th><th>时间</th></tr></thead>
+            <tbody>{overview.events.latest.map((item) => <tr key={item.event_id}>
+              <td>{item.event_id.slice(0, 8)}</td><td><small>{item.event_type}</small></td>
+              <td>{item.delivered > 0 ? <Pill status="SUCCEEDED" /> : <small>尝试 {item.attempts}</small>}</td>
+              <td>{formatTime(item.created_at)}</td></tr>)}</tbody></table>
+          {!overview.events.latest.length && <p className="capability-note">还没有事件：注册 Webhook 目标并产生批次/发布动作后会出现在这里。</p>}
+          <ul className="notes">{overview.notes.map((text) => <li key={text}>{text}</li>)}</ul>
+        </section>
+      </div>
+    </>}
+  </section>;
+}
+
 function ReferencePage() {
   const [references, setReferences] = useState([]);
   const [versions, setVersions] = useState([]);
@@ -2037,7 +2128,7 @@ export function App() {
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "costs" ? <CostPage /> : active === "automation" ? <AutomationPage /> : active === "webhooks" ? <WebhookPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "console" ? <ConsolePage /> : active === "costs" ? <CostPage /> : active === "automation" ? <AutomationPage /> : active === "webhooks" ? <WebhookPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">

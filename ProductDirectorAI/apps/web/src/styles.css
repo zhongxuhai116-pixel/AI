@@ -234,6 +234,12 @@ button { color: inherit; }
 td small { display: block; color: #97a1b2; font-size: 9px; }
 td code { font-size: 9px; color: #4b5a6e; }
 .scope-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px 10px; margin: 10px 14px; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; margin: 14px 0; }
+.metric { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+.metric span { font-size: 10px; color: #8791a3; letter-spacing: 0.04em; }
+.metric b { font-size: 19px; color: #1f2a37; }
+.metric small { font-size: 9px; color: #97a1b2; }
+.notes { margin: 10px 14px 14px; padding-left: 18px; font-size: 10px; color: #596579; display: flex; flex-direction: column; gap: 4px; }
 .key-once { margin: 10px 14px; padding: 10px 12px; background: #f5f7fa; border: 1px dashed #c7d0dc; border-radius: 6px;
   font-size: 11px; word-break: break-all; white-space: pre-wrap; color: #23303f; }
 .card-head h3, .two-col h3 { font-size: 11px; margin: 12px 14px 4px; color: #596579; }

@@ -680,6 +680,7 @@ CREATE TABLE IF NOT EXISTS webhook_endpoints (
   url TEXT NOT NULL,
   event_types TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
+  backfill_history INTEGER NOT NULL DEFAULT 0,
   paused_at TEXT,
   paused_reason TEXT NOT NULL DEFAULT '',
   secret_current TEXT NOT NULL,
@@ -736,3 +737,5 @@ CREATE TABLE IF NOT EXISTS dead_letter_events (
   replayed_at TEXT,
   UNIQUE (endpoint_id, event_id)
 );
+-- V6-09：端点默认不回填历史事件（避免新端点被历史事件洪水拖慢新事件投递）
+ALTER TABLE webhook_endpoints ADD COLUMN IF NOT EXISTS backfill_history INTEGER NOT NULL DEFAULT 0;
