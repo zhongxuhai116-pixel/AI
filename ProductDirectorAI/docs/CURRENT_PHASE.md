@@ -1,6 +1,6 @@
 # 当前阶段
 
-> **2026-09-13 云端会话更新**：V1/V2 仍为 ACCEPTED。本轮完成两条开发线合并（`b260f1f`/`edc2df7`/`c8f0396`）、**V3-05 独立层真实闭环**、**主规划 V3-04 QA 闭环补强**、**主规划 V3-06 审核界面上线**、**主规划 V3-07 真机校准与验收组装**（[V3_ACCEPTANCE 草稿](reports/V3_ACCEPTANCE.md)）；**V4 推进中**（V4-01…06 全部落地 + 击打几何 + [V4_ACCEPTANCE 草稿](reports/V4_ACCEPTANCE.md)）；**V5 已开工**（V5-01 参考视频摄取：上传/URL 约束/代理/时间戳映射，375/375，线上冒烟通过）。V3/V4 均保持 IN_PROGRESS 待负责人人工复核。剩余：V3/V4 收尾复核、V4 尾巴（真人感人物层/双人动作/修订流程/浏览器走查）、V5-02…06（切镜/多模态分析/计划映射/双栏播放器/真实重演）、V6。
+> **2026-09-13 云端会话更新**：V1/V2 仍为 ACCEPTED。本轮完成两条开发线合并（`b260f1f`/`edc2df7`/`c8f0396`）、**V3-05 独立层真实闭环**、**主规划 V3-04 QA 闭环补强**、**主规划 V3-06 审核界面上线**、**主规划 V3-07 真机校准与验收组装**（[V3_ACCEPTANCE 草稿](reports/V3_ACCEPTANCE.md)）；**V4 推进中**（V4-01…06 全部落地 + 击打几何 + [V4_ACCEPTANCE 草稿](reports/V4_ACCEPTANCE.md)）；**V5 推进中**（V5-01 参考摄取、V5-02 本地切镜与编辑：10/10 合成夹具 F1=1.0 过 0.90 门，380/380）。V3/V4 均保持 IN_PROGRESS 待负责人人工复核。剩余：V3/V4 收尾复核、V4 尾巴（真人感人物层/双人动作/修订流程/浏览器走查）、V5-03…06（多模态分析/计划映射/双栏播放器/真实重演与 V5_ACCEPTANCE）、V6。
 
 > **2026-09-13 最新**：用户已确认 V1/V2 ACCEPTED；完整 V3 仍为 IN_PROGRESS，V4–V6 未开始。V3 的 Q01–Q06、Strict 运行/来源、受控 Blender 输出、背景 Worker、QA 与 display-linear 色彩合同已有局部代码和验证报告。真实 Blender 探针已从 24 帧扩到 **72 帧、540×960**；核心区色差、288 个 EXR 通道结构与 576 项文件哈希通过独立复验，Depth/Normal/稳定 ID/跨空间颜色语义仍未验收，见 [P0.1b 控制端报告](reports/V3_P01B_72FRAME_CONTROLLER_ACCEPTANCE_2026-09-13.md)。远端历史 V3-06/V3-07 云端记录见 [任务书](reports/V3_TASK_BRIEF.md)，该编号与[主规划](../ProductDirectorAI_V1-V6_Codex_Development_Plan.md)不同，不能据此宣布主规划任务或完整 V3 PASS。H3 场景校准也不能替代两类产品×至少三镜头×两背景及完整人工审批。本页下方大量分时记录为历史快照；最新验收以 [控制记录](BROKER_V6_CONTROL.md) 和独立报告为准。
 

@@ -310,3 +310,16 @@ CREATE TABLE IF NOT EXISTS reference_assets (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reference_analyses (
+  id TEXT PRIMARY KEY,
+  reference_id TEXT NOT NULL REFERENCES reference_assets(id),
+  revision INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'DRAFT',
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  edited_from_revision INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (reference_id, revision)
+);

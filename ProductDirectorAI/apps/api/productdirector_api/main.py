@@ -55,6 +55,7 @@ from .strict_background import (
 from . import strict_qa
 from . import interaction_geometry
 from . import interaction_validation
+from . import reference_analysis
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -513,6 +514,18 @@ def initialize_db() -> None:
               payload TEXT NOT NULL,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reference_analyses (
+              id TEXT PRIMARY KEY,
+              reference_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'DRAFT',
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              edited_from_revision INTEGER,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (reference_id, revision)
             );
             """
     with connect() as db:
@@ -5603,6 +5616,165 @@ def get_reference_proxy(reference_id: str) -> FileResponse:
     if not proxy_path.exists():
         raise HTTPException(404, "代理文件不存在")
     return FileResponse(proxy_path, media_type="video/mp4", filename="reference_proxy.mp4")
+
+
+# ---------------------------------------------------------------------------
+# V5-02：本地切镜、编辑与冻结分析版本
+# ---------------------------------------------------------------------------
+
+class ReferenceAnalyzeRequest(BaseModel):
+    scope: Literal["cuts"] = "cuts"
+    sample_policy: Literal["uniform"] = "uniform"
+    notes: str = Field(default="", max_length=2000)
+
+
+class ReferenceAnalysisEditRequest(BaseModel):
+    """仅草稿可编辑；提交后生成新修订并记录 edited_from。segments 为人工修订后的分段。"""
+    segments: list[dict] = Field(min_length=1, max_length=200)
+    notes: str = Field(default="", max_length=2000)
+
+
+def _reference_analysis_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "reference_id": row["reference_id"],
+        "revision": row["revision"],
+        "status": row["status"],
+        "payload_sha256": row["payload_sha256"],
+        "edited_from_revision": row["edited_from_revision"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "analysis": json.loads(row["payload"]),
+    }
+
+
+def _load_reference_owned(reference_id: str, owner_id: str, project_id: str):
+    with connect() as db:
+        row = db.execute("SELECT * FROM reference_assets WHERE id = ?", (reference_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "参考视频不存在")
+    if row["owner_id"] != owner_id or row["project_id"] != project_id:
+        raise HTTPException(403, "越权访问参考视频")
+    return row
+
+
+@app.post("/api/v1/references/{reference_id}/analyze", status_code=201)
+def analyze_reference(reference_id: str, request: ReferenceAnalyzeRequest | None = None) -> dict:
+    """本地切镜分析（同步执行 ffmpeg scene 检测；结果如实带算法与阈值说明）。"""
+    request = request or ReferenceAnalyzeRequest()
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    reference = _load_reference_owned(reference_id, owner_id, project_id)
+    if reference["status"] != "READY":
+        raise HTTPException(409, "参考视频尚未完成摄取")
+    proxy_path = VAR / "references" / reference_id / "proxy.mp4"
+    try:
+        payload = reference_analysis.segment_reference(
+            proxy_path, json.loads(reference["payload"]).get("timebase", {}).get("fps")
+        )
+    except Exception as exc:
+        raise HTTPException(422, f"切镜分析失败: {exc}") from exc
+    payload["scope"] = request.scope
+    payload["sample_policy"] = request.sample_policy
+    payload["notes"] = request.notes
+    payload_text = _canonical_json_text(payload)
+    digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    analysis_id = str(uuid.uuid4())
+    now = utc_now()
+    with connect() as db:
+        begin_immediate(db)
+        latest = db.execute(
+            "SELECT COALESCE(MAX(revision), 0) AS revision FROM reference_analyses WHERE reference_id = ?",
+            (reference_id,),
+        ).fetchone()
+        revision = int(latest["revision"]) + 1
+        db.execute(
+            "INSERT INTO reference_analyses(id, reference_id, revision, status, payload, payload_sha256, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'DRAFT', ?, ?, ?, ?)",
+            (analysis_id, reference_id, revision, payload_text, digest, now, now),
+        )
+        row = db.execute("SELECT * FROM reference_analyses WHERE id = ?", (analysis_id,)).fetchone()
+    return _reference_analysis_public(row)
+
+
+@app.get("/api/v1/references/{reference_id}/analyses")
+def list_reference_analyses(reference_id: str) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    _load_reference_owned(reference_id, owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM reference_analyses WHERE reference_id = ? ORDER BY revision DESC",
+            (reference_id,),
+        ).fetchall()
+    return [_reference_analysis_public(row) for row in rows]
+
+
+@app.get("/api/v1/reference-analyses/{analysis_id}")
+def get_reference_analysis(analysis_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute("SELECT * FROM reference_analyses WHERE id = ?", (analysis_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "分析不存在")
+    _load_reference_owned(row["reference_id"], owner_id, project_id)
+    return _reference_analysis_public(row)
+
+
+@app.patch("/api/v1/reference-analyses/{analysis_id}")
+def edit_reference_analysis(analysis_id: str, request: ReferenceAnalysisEditRequest) -> dict:
+    """人工修订切镜：仅草稿可编辑；生成新修订并记录 edited_from（修订有来源）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute("SELECT * FROM reference_analyses WHERE id = ?", (analysis_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "分析不存在")
+    _load_reference_owned(row["reference_id"], owner_id, project_id)
+    if row["status"] != "DRAFT":
+        raise HTTPException(409, "已批准的分析不可编辑；请基于新修订修改")
+    base = json.loads(row["payload"])
+    payload = {
+        **base,
+        "segments": request.segments,
+        "edited": True,
+        "edited_notes": request.notes,
+    }
+    payload_text = _canonical_json_text(payload)
+    digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    new_id = str(uuid.uuid4())
+    now = utc_now()
+    with connect() as db:
+        begin_immediate(db)
+        latest = db.execute(
+            "SELECT COALESCE(MAX(revision), 0) AS revision FROM reference_analyses WHERE reference_id = ?",
+            (row["reference_id"],),
+        ).fetchone()
+        revision = int(latest["revision"]) + 1
+        db.execute(
+            "INSERT INTO reference_analyses(id, reference_id, revision, status, payload, payload_sha256, edited_from_revision, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)",
+            (new_id, row["reference_id"], revision, payload_text, digest, row["revision"], now, now),
+        )
+        created = db.execute("SELECT * FROM reference_analyses WHERE id = ?", (new_id,)).fetchone()
+    return _reference_analysis_public(created)
+
+
+@app.post("/api/v1/reference-analyses/{analysis_id}/approve")
+def approve_reference_analysis(analysis_id: str) -> dict:
+    """冻结分析版本（幂等）；批准后不可编辑，修订有来源。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute("SELECT * FROM reference_analyses WHERE id = ?", (analysis_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "分析不存在")
+    _load_reference_owned(row["reference_id"], owner_id, project_id)
+    if row["status"] == "APPROVED":
+        return _reference_analysis_public(row)
+    with connect() as db:
+        db.execute(
+            "UPDATE reference_analyses SET status = 'APPROVED', updated_at = ? WHERE id = ?",
+            (utc_now(), analysis_id),
+        )
+        updated = db.execute("SELECT * FROM reference_analyses WHERE id = ?", (analysis_id,)).fetchone()
+    return _reference_analysis_public(updated)
 
 
 # ---------------------------------------------------------------------------
