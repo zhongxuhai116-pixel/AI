@@ -1722,7 +1722,15 @@ def _apply_job_update(db: sqlite3.Connection, job_id: str, values: dict) -> None
     if current is None:
         raise HTTPException(404, "任务不存在")
     if not reopen:
-        if current["status"] in TERMINAL_JOB_STATUSES:
+        # QA 降级是唯一允许的终态→终态状态迁移：较新的 QA 运行失败必须把任务标回
+        # QA_REJECTED（发布门已由审批失效兜底，状态本身也不能继续显示成功）。
+        # 取消胜出的语义仍然优先（取消的任务不能被 QA 改标）。
+        qa_downgrade = (
+            values.get("status") == "QA_REJECTED"
+            and current["status"] in TERMINAL_JOB_STATUSES
+            and current["status"] != "CANCELLED"
+        )
+        if current["status"] in TERMINAL_JOB_STATUSES and not qa_downgrade:
             # 终态是最终事实：迟到的心跳/进度/完成回报不能把任务改回进行中。
             values = {
                 key: value

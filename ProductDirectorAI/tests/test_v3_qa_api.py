@@ -8,6 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+from PIL import Image
+
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "tests"))
 sys.path.insert(0, str(PROJECT / "apps" / "api"))
@@ -172,6 +175,103 @@ class V3QaApiTests(unittest.TestCase):
             ).fetchone()
         self.assertIsNotNone(row)
         return Path(main.resolve_asset_path(main.row_to_dict(row)))
+
+    # ---- 真实 QA 引擎的故障注入（主规划 V3-04 退出证据：故意改 Logo/尺寸/错位/变色） ----
+
+    def _tamper_product_pixels(self, job_id: str, frames, rect: tuple[int, int, int, int],
+                               color: tuple[int, int, int]) -> None:
+        strict_root = main.RUNS / job_id / "strict"
+        for index in frames:
+            path = strict_root / "product" / f"frame_{index:04d}.png"
+            array = np.asarray(Image.open(path).convert("RGBA"), dtype=np.uint8).copy()
+            x0, y0, x1, y1 = rect
+            array[y0:y1, x0:x1, 0] = color[0]
+            array[y0:y1, x0:x1, 1] = color[1]
+            array[y0:y1, x0:x1, 2] = color[2]
+            Image.fromarray(array, mode="RGBA").save(path)
+
+    def _tamper_mask_alpha(self, job_id: str, frames, rect: tuple[int, int, int, int]) -> None:
+        strict_root = main.RUNS / job_id / "strict"
+        for index in frames:
+            path = strict_root / "mask" / f"frame_{index:04d}.png"
+            height, width = rt.SIZE
+            array = np.zeros((height, width, 4), dtype=np.uint8)
+            x0, y0, x1, y1 = rect
+            array[y0:y1, x0:x1, 3] = 255
+            Image.fromarray(array, mode="RGBA").save(path)
+
+    def _tamper_product_color(self, job_id: str, frames, color: tuple[int, int, int]) -> None:
+        strict_root = main.RUNS / job_id / "strict"
+        for index in frames:
+            path = strict_root / "product" / f"frame_{index:04d}.png"
+            array = np.asarray(Image.open(path).convert("RGBA"), dtype=np.uint8).copy()
+            array[:, :, 0] = color[0]
+            array[:, :, 1] = color[1]
+            array[:, :, 2] = color[2]
+            Image.fromarray(array, mode="RGBA").save(path)
+
+    def _run_qa_expect_fail(self, job_id: str, needle: str) -> dict:
+        run_id = self._run_id(job_id)
+        response = self.client.post(f"/api/v1/runs/{run_id}/qa", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["status"], "FAIL")
+        self.assertTrue(
+            any(needle in item for item in payload["fatal_failures"]),
+            payload["fatal_failures"],
+        )
+        # 状态联动：QA 失败必须把任务标回 QA_REJECTED，发布门必须拒绝
+        self.assertEqual(main.get_job(job_id)["status"], "QA_REJECTED", main.get_job(job_id))
+        release = self.client.get(f"/api/v1/jobs/{job_id}/release-status")
+        self.assertEqual(release.status_code, 200, release.text)
+        self.assertFalse(release.json()["eligible"], release.text)
+        return payload
+
+    def _positive_qa_control_has_no_fatal(self, job_id: str) -> None:
+        with main.connect() as db:
+            row = db.execute(
+                "SELECT payload FROM qa_reports WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        control = json.loads(row["payload"])
+        self.assertFalse(control["fatal_failures"], control["fatal_failures"])
+
+    def test_qa_fails_on_logo_region_tamper(self) -> None:
+        job_id, _, _ = self._create_strict_run()
+        self._write_strict_inputs(job_id)
+        main.execute_job(job_id)
+        self._positive_qa_control_has_no_fatal(job_id)
+        # 负例：审核 logo_regions（归一化 0.4,0.35,0.2,0.1 → 像素 (3,3)-(5,4)）抹红
+        self._tamper_product_pixels(job_id, range(1, rt.FRAME_COUNT + 1), (3, 3, 5, 4), (255, 0, 0))
+        payload = self._run_qa_expect_fail(job_id, "Logo")
+
+    def test_qa_fails_on_mask_size_tamper(self) -> None:
+        job_id, _, _ = self._create_strict_run()
+        self._write_strict_inputs(job_id)
+        main.execute_job(job_id)
+        self._positive_qa_control_has_no_fatal(job_id)
+        # 负例：部分帧掩码放大到全图 → 轮廓 IoU 骤降
+        self._tamper_mask_alpha(job_id, range(10, 14), (0, 0, 8, 8))
+        payload = self._run_qa_expect_fail(job_id, "轮廓")
+
+    def test_qa_fails_on_shifted_mask(self) -> None:
+        job_id, _, _ = self._create_strict_run()
+        self._write_strict_inputs(job_id)
+        main.execute_job(job_id)
+        self._positive_qa_control_has_no_fatal(job_id)
+        # 负例：掩码错位（同面积、整体平移 1px）→ 仅轮廓 IoU 下降
+        self._tamper_mask_alpha(job_id, range(20, 24), (0, 0, 6, 6))
+        payload = self._run_qa_expect_fail(job_id, "轮廓")
+
+    def test_qa_fails_on_product_color_change(self) -> None:
+        job_id, _, _ = self._create_strict_run()
+        self._write_strict_inputs(job_id)
+        main.execute_job(job_id)
+        self._positive_qa_control_has_no_fatal(job_id)
+        # 负例：产品变色 → 线性核心区 MAE 超阈值
+        self._tamper_product_color(job_id, range(30, 36), (200, 30, 30))
+        payload = self._run_qa_expect_fail(job_id, "核心区")
 
     def test_threshold_set_version_is_frozen(self) -> None:
         response = self.client.post(
