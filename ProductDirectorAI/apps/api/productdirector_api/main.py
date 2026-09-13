@@ -53,6 +53,7 @@ from .strict_background import (
     write_background_evidence,
 )
 from . import strict_qa
+from . import audio_post
 from . import interaction_geometry
 from . import interaction_validation
 from . import localization
@@ -637,6 +638,62 @@ def initialize_db() -> None:
               payload_sha256 TEXT NOT NULL,
               created_at TEXT NOT NULL,
               FOREIGN KEY(localization_id) REFERENCES localizations(id)
+            );
+            CREATE TABLE IF NOT EXISTS music_assets (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              license_ref TEXT NOT NULL,
+              commercial_use_allowed INTEGER NOT NULL DEFAULT 0,
+              path TEXT NOT NULL,
+              duration_s REAL NOT NULL DEFAULT 0,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS audio_mixes (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              voiceover_id TEXT,
+              music_asset_id TEXT,
+              path TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS duration_adaptations (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              policy TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS video_sources (
+              id TEXT PRIMARY KEY,
+              run_id TEXT,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              path TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS output_renditions (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              profile_id TEXT,
+              kind TEXT NOT NULL,
+              path TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
             );
             """
     with connect() as db:
@@ -8384,6 +8441,576 @@ async def upload_voiceover(
              hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
         )
     return {"id": voiceover_id, "path": str(path), **payload}
+
+
+# ---------------------------------------------------------------------------
+# V6-03：BGM、ducking 混音、响度测量、时长适配与编码输出
+# ---------------------------------------------------------------------------
+
+MAX_MUSIC_BYTES = 100 * 1024 * 1024
+MAX_VIDEO_SOURCE_BYTES = 500 * 1024 * 1024
+AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v"}
+
+
+class AudioMixRequest(BaseModel):
+    # None = 自动取该 Run 最新配音；"" = 显式关闭该音轨（开关必须真的改变输出）
+    voiceover_id: str | None = Field(default=None, max_length=80)
+    music_asset_id: str | None = Field(default=None, max_length=80)
+    profile_id: str = Field(default="", max_length=80)
+    duration_s: float | None = Field(default=None, gt=0, le=3600)
+    voice_gain_db: float = Field(default=0.0, ge=-30.0, le=30.0)
+    music_gain_db: float = Field(default=-18.0, ge=-60.0, le=12.0)
+    ducking: dict = Field(default_factory=dict)
+    fade_in_s: float = Field(default=1.0, ge=0.0, le=30.0)
+    fade_out_s: float = Field(default=1.0, ge=0.0, le=30.0)
+    loop_music: bool = True
+    target_lufs: float | None = Field(default=None, ge=-40.0, le=-6.0)
+    true_peak_max_dbtp: float | None = Field(default=None, ge=-6.0, le=0.0)
+    notes: str = Field(default="", max_length=2000)
+
+
+class DurationAdaptRequest(BaseModel):
+    policy: Literal["extend_non_contact_shot", "adjust_speech_rate", "rewrite_copy", "fail_and_review"]
+    voiceover_id: str = Field(default="", max_length=80)
+    audio_duration_s: float | None = Field(default=None, gt=0, le=3600)
+    profile_id: str = Field(default="", max_length=80)
+    preset_id: str = Field(default="", max_length=80)
+    interaction_plan_id: str = Field(default="", max_length=80)
+    notes: str = Field(default="", max_length=2000)
+
+
+class OutputRenderRequest(BaseModel):
+    profile_id: str = Field(default="", max_length=80)
+    video_source_id: str = Field(default="", max_length=80)
+    audio_mix_id: str = Field(default="", max_length=80)
+    subtitle_track_id: str = Field(default="", max_length=80)
+    clean_master: bool = True
+    thumbnail_at_s: float = Field(default=0.5, ge=0.0, le=3600.0)
+    notes: str = Field(default="", max_length=2000)
+
+
+def _music_asset_public(row) -> dict:
+    payload = json.loads(row["payload"])
+    return {
+        "id": row["id"], "name": row["name"], "license_ref": row["license_ref"],
+        "commercial_use_allowed": bool(row["commercial_use_allowed"]),
+        "duration_s": row["duration_s"], "path": row["path"], "created_at": row["created_at"],
+        "download_url": f"/api/v1/music-assets/{row['id']}/content",
+        "sha256": payload.get("sha256"),
+        "note": "原文件默认不进发布包；仅保留许可引用与混音记录",
+    }
+
+
+def _profile_for_request(db, profile_id: str, owner_id: str, project_id: str):
+    if not profile_id:
+        return None
+    row = db.execute(
+        "SELECT * FROM platform_profiles WHERE id = ? AND owner_id = ? AND project_id = ?",
+        (profile_id, owner_id, project_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Profile 不存在")
+    version = db.execute(
+        "SELECT * FROM platform_profile_versions WHERE profile_id = ? ORDER BY version DESC LIMIT 1",
+        (profile_id,),
+    ).fetchone()
+    return {"row": row, "version": version,
+            "spec": platform_profiles.spec_from_payload(json.loads(version["payload"]))}
+
+
+@app.get("/api/v1/music-assets")
+def list_music_assets(
+    owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJECT_ID,
+) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM music_assets WHERE owner_id = ? AND project_id = ? ORDER BY created_at ASC",
+            (owner_id, project_id),
+        ).fetchall()
+        return [_music_asset_public(row) for row in rows]
+
+
+@app.post("/api/v1/music-assets", status_code=201)
+async def upload_music_asset(
+    file: UploadFile = File(...),
+    name: str = Form(default=""),
+    license_ref: str = Form(...),
+    commercial_use_allowed: bool = Form(default=False),
+    notes: str = Form(default=""),
+) -> dict:
+    """上传 BGM 素材：**必须提供许可引用**，未知许可不得入库（主规划 12.4）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    if not license_ref.strip():
+        raise HTTPException(422, "必须提供 license_ref：未知商业许可不得默认用于商业发布")
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in AUDIO_SUFFIXES:
+        raise HTTPException(422, f"不支持的音频格式 {suffix}（支持 {sorted(AUDIO_SUFFIXES)}）")
+    data = await file.read()
+    if not data or len(data) > MAX_MUSIC_BYTES:
+        raise HTTPException(413 if data else 422, f"文件为空或超过 {MAX_MUSIC_BYTES // (1024 * 1024)}MB 上限")
+    asset_id = str(uuid.uuid4())
+    directory = VAR / "music" / asset_id
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"music{suffix}"
+    path.write_bytes(data)
+    probe = audio_post.probe_audio(path)
+    if not probe["has_audio"]:
+        path.unlink(missing_ok=True)
+        raise HTTPException(422, "上传文件没有可解析的音频流")
+    payload = {
+        "name": name or file.filename, "license_ref": license_ref, "commercial_use_allowed": commercial_use_allowed,
+        "duration_s": probe["duration_s"], "channels": probe["channels"], "sample_rate": probe["sample_rate"],
+        "sha256": _file_sha256(path), "notes": notes, "origin": "owner_upload",
+    }
+    payload_text = _canonical_json_text(payload)
+    with connect() as db:
+        db.execute(
+            "INSERT INTO music_assets(id, owner_id, project_id, name, license_ref, commercial_use_allowed, path, "
+            "duration_s, payload, payload_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (asset_id, owner_id, project_id, payload["name"], license_ref, int(bool(commercial_use_allowed)),
+             str(path), probe["duration_s"], payload_text, hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
+             utc_now()),
+        )
+        row = db.execute("SELECT * FROM music_assets WHERE id = ?", (asset_id,)).fetchone()
+        return _music_asset_public(row)
+
+
+@app.get("/api/v1/music-assets/{music_asset_id}/content")
+def get_music_asset_content(music_asset_id: str) -> FileResponse:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM music_assets WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (music_asset_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "BGM 素材不存在")
+    path = Path(row["path"])
+    if not path.exists():
+        raise HTTPException(404, "BGM 文件已不存在")
+    return FileResponse(path, media_type="audio/*", filename=Path(row["path"]).name)
+
+
+@app.post("/api/v1/runs/{run_id}/audio/mix", status_code=201)
+def mix_run_audio(run_id: str, request: AudioMixRequest) -> dict:
+    """真实混音：旁白优先（ducking）+ 响度归一，返回实测响度与判定。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        run = _resolve_run_scope(db, run_id)
+        if run["owner_id"] != owner_id or run["project_id"] != project_id:
+            raise HTTPException(403, "越权访问 Run")
+        voiceover = None
+        if request.voiceover_id is None:
+            voiceover = db.execute(
+                "SELECT * FROM voiceovers WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        elif request.voiceover_id:
+            voiceover = db.execute(
+                "SELECT * FROM voiceovers WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.voiceover_id, owner_id, project_id),
+            ).fetchone()
+            if not voiceover:
+                raise HTTPException(404, "配音不存在")
+        music = None
+        if request.music_asset_id:
+            music = db.execute(
+                "SELECT * FROM music_assets WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.music_asset_id, owner_id, project_id),
+            ).fetchone()
+            if not music:
+                raise HTTPException(404, "BGM 素材不存在")
+        profile = _profile_for_request(db, request.profile_id, owner_id, project_id)
+    if voiceover is None and music is None:
+        raise HTTPException(422, "配音与 BGM 都为关闭状态：不会生成静音混音（开关必须真的改变输出）")
+    if profile and music is not None:
+        commercial_targets = {"ads_material", "listing"}
+        if profile["spec"].publish.output_target in commercial_targets and not bool(music["commercial_use_allowed"]):
+            raise HTTPException(422, {
+                "code": "MUSIC_NOT_COMMERCIAL",
+                "detail": "该 Profile 用于商业用途，但 BGM 未标注允许商业使用（未知商业许可不得默认用于商业发布）",
+            })
+    duration = request.duration_s
+    if duration is None:
+        plan_payload = json.loads(run["plan_payload"] or "{}")
+        output = plan_payload.get("output") or {}
+        fps = int(output.get("fps") or DEFAULT_FPS)
+        frame_count = output.get("frame_count")
+        duration = (float(frame_count) / fps) if frame_count else float(output.get("duration_seconds") or 6.0)
+    mix_id = str(uuid.uuid4())
+    out_path = VAR / "audio-mixes" / f"{mix_id}.wav"
+    try:
+        result = audio_post.mix_tracks(
+            voice_path=Path(voiceover["path"]) if voiceover else None,
+            music_path=Path(music["path"]) if music else None,
+            out_path=out_path, duration_s=float(duration),
+            voice_gain_db=request.voice_gain_db, music_gain_db=request.music_gain_db,
+            ducking=request.ducking, fade_in_s=request.fade_in_s, fade_out_s=request.fade_out_s,
+            loop_music=request.loop_music,
+            target_lufs=request.target_lufs if request.target_lufs is not None else audio_post.DEFAULT_TARGET_LUFS,
+            true_peak_max_dbtp=(request.true_peak_max_dbtp if request.true_peak_max_dbtp is not None
+                                else audio_post.DEFAULT_TRUE_PEAK_DBTP),
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(422, {"code": "MIX_FAILED", "detail": str(exc)}) from exc
+    payload = {
+        "run_id": run_id,
+        "voiceover_id": voiceover["id"] if voiceover else None,
+        "music_asset_id": music["id"] if music else None,
+        "music_license_ref": music["license_ref"] if music else None,
+        "music_commercial_use_allowed": bool(music["commercial_use_allowed"]) if music else None,
+        "profile_id": request.profile_id,
+        "duration_s": float(duration),
+        "voice": result["voice"], "music": result["music"], "ducking": result["ducking"],
+        "measurement": result["measurement"], "verdict": result["verdict"],
+        "notes": request.notes,
+    }
+    payload_text = _canonical_json_text(payload)
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO audio_mixes(id, run_id, owner_id, project_id, voiceover_id, music_asset_id, path, payload, "
+            "payload_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (mix_id, run_id, owner_id, project_id, voiceover["id"] if voiceover else None,
+             music["id"] if music else None, str(out_path), payload_text,
+             hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+        )
+    return {"id": mix_id, "path": str(out_path), "sha256": _file_sha256(out_path),
+            "download_url": f"/api/v1/audio/mixes/{mix_id}/content", **payload}
+
+
+@app.get("/api/v1/audio/mixes/{mix_id}/content")
+def get_audio_mix_content(mix_id: str) -> FileResponse:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM audio_mixes WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (mix_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "混音不存在")
+    path = Path(row["path"])
+    if not path.exists():
+        raise HTTPException(404, "混音文件已不存在")
+    return FileResponse(path, media_type="audio/wav", filename=f"mix-{mix_id}.wav")
+
+
+@app.post("/api/v1/runs/{run_id}/audio/adapt", status_code=201)
+def adapt_run_duration(run_id: str, request: DurationAdaptRequest) -> dict:
+    """配音过长的显式适配：只允许主规划 12.4 的三种策略。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        run = _resolve_run_scope(db, run_id)
+        if run["owner_id"] != owner_id or run["project_id"] != project_id:
+            raise HTTPException(403, "越权访问 Run")
+        audio_duration = request.audio_duration_s
+        voiceover = None
+        if request.voiceover_id:
+            voiceover = db.execute(
+                "SELECT * FROM voiceovers WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.voiceover_id, owner_id, project_id),
+            ).fetchone()
+            if not voiceover:
+                raise HTTPException(404, "配音不存在")
+        elif audio_duration is None:
+            voiceover = db.execute(
+                "SELECT * FROM voiceovers WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if audio_duration is None and voiceover is not None:
+            audio_duration = float(json.loads(voiceover["payload"]).get("duration_s") or 0.0)
+        if audio_duration is None:
+            raise HTTPException(422, "缺少配音或显式 audio_duration_s，无法判断时长适配")
+        profile = _profile_for_request(db, request.profile_id, owner_id, project_id)
+        preset_spec = None
+        if request.preset_id:
+            preset_row = db.execute(
+                "SELECT * FROM postproduction_presets WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.preset_id, owner_id, project_id),
+            ).fetchone()
+            if not preset_row:
+                raise HTTPException(404, "后期模板不存在")
+            preset_version = db.execute(
+                "SELECT * FROM postproduction_preset_versions WHERE preset_id = ? ORDER BY version DESC LIMIT 1",
+                (request.preset_id,),
+            ).fetchone()
+            preset_spec = platform_profiles.PostproductionPresetSpec.model_validate(
+                json.loads(preset_version["payload"])
+            )
+        interaction_plan = None
+        if request.interaction_plan_id:
+            interaction_row = db.execute(
+                "SELECT * FROM interaction_plans WHERE id = ?", (request.interaction_plan_id,),
+            ).fetchone()
+            if interaction_row:
+                interaction_payload = json.loads(interaction_row["payload"])
+                plan_row = db.execute("SELECT payload FROM plans WHERE id = ?", (run["plan_id"],)).fetchone()
+                plan_shots = (json.loads(plan_row["payload"]) or {}).get("shots") or []
+                first_contact = next(
+                    (shot["id"] for shot in plan_shots
+                     if str(interaction_payload.get("action") or "") in {"press_button", "single_punch_target"}),
+                    None,
+                )
+                interaction_plan = {"action": interaction_payload.get("action"), "shot_id": first_contact}
+    plan_payload = json.loads(run["plan_payload"] or "{}")
+    extend_max = int(preset_spec.extend_max_frames) if preset_spec else 0
+    rate_range = (0.9, 1.1)
+    if preset_spec and preset_spec.voice.enabled:
+        rate_range = (max(0.5, preset_spec.voice.rate * 0.9), min(2.0, preset_spec.voice.rate * 1.1))
+    profile_max = profile["spec"].video.duration_max_seconds if profile else None
+    decision = audio_post.adapt_plan_duration(
+        plan_payload, audio_duration_s=float(audio_duration), policy=request.policy,
+        extend_max_frames=extend_max,
+        rate=preset_spec.voice.rate if preset_spec else 1.0,
+        rate_range=rate_range, profile_max_seconds=profile_max, interaction_plan=interaction_plan,
+    )
+    adaptation_id = str(uuid.uuid4())
+    payload = {
+        "run_id": run_id, "policy": request.policy, "audio_duration_s": float(audio_duration),
+        "voiceover_id": voiceover["id"] if voiceover else None,
+        "profile_id": request.profile_id, "preset_id": request.preset_id,
+        "interaction_plan_id": request.interaction_plan_id,
+        "decision": decision, "notes": request.notes,
+        "allowed_policies": ["extend_non_contact_shot", "adjust_speech_rate", "rewrite_copy"],
+        "constraints": {
+            "contact_shots_must_not_change": True,
+            "no_truncation_of_video_or_voice": True,
+            "profile_max_seconds": profile_max,
+            "extend_max_frames": extend_max,
+            "speech_rate_range": list(rate_range),
+        },
+    }
+    payload_text = _canonical_json_text(payload)
+    with connect() as db:
+        db.execute(
+            "INSERT INTO duration_adaptations(id, run_id, policy, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (adaptation_id, run_id, request.policy, payload_text,
+             hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), utc_now()),
+        )
+    return {"id": adaptation_id, **payload}
+
+
+@app.post("/api/v1/video-sources", status_code=201)
+async def upload_video_source(
+    file: UploadFile = File(...),
+    run_id: str = Form(default=""),
+    name: str = Form(default=""),
+    notes: str = Form(default=""),
+) -> dict:
+    """登记待编码的 Master 视频（真实渲染产物）；保留来源链供 lineage 记录。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in VIDEO_SUFFIXES:
+        raise HTTPException(422, f"不支持的视频格式 {suffix}（支持 {sorted(VIDEO_SUFFIXES)}）")
+    data = await file.read()
+    if not data or len(data) > MAX_VIDEO_SOURCE_BYTES:
+        raise HTTPException(413 if data else 422, f"文件为空或超过 {MAX_VIDEO_SOURCE_BYTES // (1024 * 1024)}MB 上限")
+    source_id = str(uuid.uuid4())
+    directory = VAR / "video-sources" / source_id
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"master{suffix}"
+    path.write_bytes(data)
+    probe = subprocess.run(
+        [FFPROBE, "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name,width,height,r_frame_rate,nb_frames:format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True,
+    )
+    try:
+        info = json.loads(probe.stdout)
+    except json.JSONDecodeError:
+        info = {}
+    video_stream = next((s for s in (info.get("streams") or []) if s.get("codec_type") == "video"), None)
+    if not video_stream:
+        path.unlink(missing_ok=True)
+        raise HTTPException(422, "上传文件没有可解析的视频流")
+    payload = {
+        "run_id": run_id or None, "name": name or file.filename, "notes": notes,
+        "width": video_stream.get("width"), "height": video_stream.get("height"),
+        "fps": video_stream.get("r_frame_rate"), "nb_frames": video_stream.get("nb_frames"),
+        "duration_s": round(float((info.get("format") or {}).get("duration") or 0), 3),
+        "sha256": _file_sha256(path), "bytes": len(data),
+    }
+    payload_text = _canonical_json_text(payload)
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO video_sources(id, run_id, owner_id, project_id, name, path, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (source_id, run_id or None, owner_id, project_id, payload["name"], str(path), payload_text,
+             hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+        )
+    return {"id": source_id, "path": str(path), **payload}
+
+
+@app.post("/api/v1/runs/{run_id}/outputs", status_code=201)
+def render_outputs(run_id: str, request: OutputRenderRequest) -> dict:
+    """按 Profile 规格编码成片（可带混音与烧录字幕）、可选无字幕 Master 与封面。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        run = _resolve_run_scope(db, run_id)
+        if run["owner_id"] != owner_id or run["project_id"] != project_id:
+            raise HTTPException(403, "越权访问 Run")
+        source = None
+        if request.video_source_id:
+            source = db.execute(
+                "SELECT * FROM video_sources WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.video_source_id, owner_id, project_id),
+            ).fetchone()
+            if not source:
+                raise HTTPException(404, "视频来源不存在")
+        mix = None
+        if request.audio_mix_id:
+            mix = db.execute(
+                "SELECT * FROM audio_mixes WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.audio_mix_id, owner_id, project_id),
+            ).fetchone()
+            if not mix:
+                raise HTTPException(404, "混音不存在")
+        subtitle = None
+        if request.subtitle_track_id:
+            subtitle = db.execute(
+                "SELECT * FROM subtitle_tracks WHERE id = ?", (request.subtitle_track_id,),
+            ).fetchone()
+            if not subtitle:
+                raise HTTPException(404, "字幕轨不存在")
+        profile = _profile_for_request(db, request.profile_id, owner_id, project_id)
+    if source is None:
+        raise HTTPException(422, "缺少 video_source_id：编码需要真实 Master 视频")
+    source_payload = json.loads(source["payload"])
+    width = profile["spec"].video.width if profile else int(source_payload.get("width") or 540)
+    height = profile["spec"].video.height if profile else int(source_payload.get("height") or 960)
+    fps = profile["spec"].video.fps if profile else 24
+    codec = profile["spec"].video.codec if profile else "h264"
+    out_dir = VAR / "outputs" / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = uuid.uuid4().hex[:8]
+    rendition_ids: list[dict] = []
+    now = utc_now()
+
+    def _write_rendition(path: Path, kind: str, extra: dict, report: dict) -> dict:
+        payload = {
+            "run_id": run_id, "profile_id": request.profile_id, "kind": kind,
+            "video_source_id": source["id"], "video_source_sha256": source_payload.get("sha256"),
+            "audio_mix_id": mix["id"] if mix else None,
+            "audio_mix_sha256": _file_sha256(Path(mix["path"])) if mix else None,
+            "subtitle_track_id": subtitle["id"] if subtitle else None,
+            "profile_version": profile["version"]["version"] if profile else None,
+            "profile_payload_sha256": profile["version"]["payload_sha256"] if profile else None,
+            "spec": {"width": width, "height": height, "fps": fps, "codec": codec,
+                     "container": profile["spec"].video.container if profile else "mp4"},
+            "report": report, "sha256": _file_sha256(path), "bytes": path.stat().st_size,
+            "note": "保留渲染 Master 与发布编码之间的来源链",
+            **extra,
+        }
+        payload_text = _canonical_json_text(payload)
+        rendition_id = str(uuid.uuid4())
+        with connect() as db:
+            db.execute(
+                "INSERT INTO output_renditions(id, run_id, owner_id, project_id, profile_id, kind, path, payload, "
+                "payload_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rendition_id, run_id, owner_id, project_id, request.profile_id or None, kind, str(path),
+                 payload_text, hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+            )
+        rendition_ids.append({"id": rendition_id, "kind": kind, "path": str(path), **payload})
+        return rendition_ids[-1]
+
+    final_path = out_dir / f"final-{stamp}.mp4"
+    burn_report = None
+    if subtitle is not None:
+        srt_files = [item for item in json.loads(subtitle["payload"]).get("files", []) if item["format"] == "srt"]
+        if not srt_files:
+            raise HTTPException(422, "字幕轨没有 SRT 文件，无法烧录")
+        burn_path = out_dir / f"burned-{stamp}.mp4"
+        burn = subprocess.run(
+            [FFMPEG, "-y", "-v", "error", "-i", str(Path(source["path"])),
+             "-vf", f"subtitles={srt_files[0]['path']}:force_style='FontName=DejaVu Sans'",
+             "-an", "-c:v", "libx264", "-crf", "20", "-pix_fmt", "yuv420p", str(burn_path)],
+            capture_output=True, text=True,
+        )
+        if burn.returncode != 0 or not burn_path.exists():
+            raise HTTPException(422, {"code": "BURN_FAILED", "detail": (burn.stderr or "")[-300:]})
+        burn_report = {"burned_video": str(burn_path), "srt": srt_files[0]["path"],
+                       "note": "烧录字幕版本仅用于最终成片；无字幕 Master 单独产出"}
+        encode_source = burn_path
+    else:
+        encode_source = Path(source["path"])
+    crop_policy = profile["spec"].composition.crop_policy if profile else "letterbox"
+    source_size = {"width": source_payload.get("width"), "height": source_payload.get("height")}
+    try:
+        report = audio_post.encode_rendition(
+            video_path=encode_source, audio_path=Path(mix["path"]) if mix else None, out_path=final_path,
+            width=width, height=height, fps=fps, codec=codec,
+            container=profile["spec"].video.container if profile else "mp4",
+            crop_policy=crop_policy, source_size=source_size,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, {"code": "GEOMETRY_UNSUPPORTED", "detail": str(exc)}) from exc
+    _write_rendition(final_path, "final", {"burned_subtitles": bool(subtitle), "burn_report": burn_report}, report)
+    clean_path = None
+    if request.clean_master:
+        if subtitle is not None:
+            clean_path = out_dir / f"clean_master-{stamp}.mp4"
+            clean_report = audio_post.encode_rendition(
+                video_path=Path(source["path"]), audio_path=Path(mix["path"]) if mix else None,
+                out_path=clean_path, width=width, height=height, fps=fps, codec=codec,
+                crop_policy=crop_policy, source_size=source_size,
+            )
+        else:
+            clean_report = dict(report)
+            clean_path = final_path
+        _write_rendition(clean_path, "clean_master",
+                         {"burned_subtitles": False, "same_as_final": clean_path == final_path}, clean_report)
+    thumbnail = audio_post.make_thumbnail(final_path, out_dir / f"thumbnail-{stamp}.jpg",
+                                          at_seconds=request.thumbnail_at_s)
+    _write_rendition(Path(thumbnail["path"]), "thumbnail", {"at_seconds": thumbnail["at_seconds"]}, {"passed": True})
+    audio_measurement = audio_post.measure_loudness(final_path) if mix else None
+    return {
+        "run_id": run_id,
+        "renditions": rendition_ids,
+        "final": next(item for item in rendition_ids if item["kind"] == "final"),
+        "clean_master": next((item for item in rendition_ids if item["kind"] == "clean_master"), None),
+        "thumbnail": next(item for item in rendition_ids if item["kind"] == "thumbnail"),
+        "burn_report": burn_report,
+        "final_loudness": audio_measurement,
+        "final_loudness_verdict": audio_post.loudness_verdict(audio_measurement) if audio_measurement else None,
+    }
+
+
+@app.get("/api/v1/outputs/{rendition_id}")
+def get_output_rendition(rendition_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM output_renditions WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (rendition_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "成片不存在")
+    return {"id": row["id"], "kind": row["kind"], "profile_id": row["profile_id"],
+            "created_at": row["created_at"], "path": row["path"],
+            "download_url": f"/api/v1/outputs/{row['id']}/content",
+            **json.loads(row["payload"])}
+
+
+@app.get("/api/v1/outputs/{rendition_id}/content")
+def get_output_rendition_content(rendition_id: str) -> FileResponse:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM output_renditions WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (rendition_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "成片不存在")
+    path = Path(row["path"])
+    if not path.exists():
+        raise HTTPException(404, "成片文件已不存在")
+    media = "image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "video/mp4"
+    return FileResponse(path, media_type=media, filename=path.name)
 
 
 def main_cli(argv: list[str] | None = None) -> int:

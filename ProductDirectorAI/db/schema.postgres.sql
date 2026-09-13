@@ -440,3 +440,65 @@ CREATE TABLE IF NOT EXISTS subtitle_tracks (
   payload_sha256 TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- V6-03：BGM 素材、混音、时长适配、视频来源与输出成片
+CREATE TABLE IF NOT EXISTS music_assets (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  license_ref TEXT NOT NULL,
+  commercial_use_allowed INTEGER NOT NULL DEFAULT 0,
+  path TEXT NOT NULL,
+  duration_s DOUBLE PRECISION NOT NULL DEFAULT 0,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audio_mixes (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  voiceover_id TEXT,
+  music_asset_id TEXT,
+  path TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS duration_adaptations (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  policy TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS video_sources (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS output_renditions (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  profile_id TEXT,
+  kind TEXT NOT NULL,
+  path TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
