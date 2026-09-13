@@ -100,8 +100,9 @@ def generate_scenes(snapshot: dict, reference_bytes: bytes, run_dir: Path, *, ff
         uploaded.write_text(json.dumps({"name":image_name}), encoding="utf-8")
     entries = []
     output = snapshot["output"]
-    for index, shot in enumerate(snapshot["shots"]):
+    def prepare(index):
         check_active()
+        shot = snapshot["shots"][index]
         scene_id = f"scene-{index+1:02d}"
         state_path, raw = folder / f"{scene_id}.json", folder / f"{scene_id}-source.mp4"
         state = json.loads(state_path.read_text()) if state_path.exists() else {}
@@ -115,40 +116,64 @@ def generate_scenes(snapshot: dict, reference_bytes: bytes, run_dir: Path, *, ff
             state = {"external_id": comfyui.submit(graph, client_id=run_dir.name), "graph_sha256": graph_hash,
                      "prompt_sha256": hashlib.sha256(shot["scene_prompt"].encode()).hexdigest()}
             state_path.write_text(json.dumps(state), encoding="utf-8")
-        deadline = time.monotonic()+2400
-        if not (raw.exists() and state.get("source_sha256") == _sha(raw)):
-            while True:
-                check_active()
-                progress(f"SCENE_{index+1}_OF_{len(snapshot['shots'])}", 5+int(index/len(snapshot['shots'])*80))
-                record = comfyui.history(state["external_id"])
-                status = comfyui.status_text(record)
-                if status == "FAILED":
-                    raise RuntimeError(f"场景{index+1} H3生成失败；不会降级成摄影棚或灰模")
-                if status == "SUCCEEDED":
-                    videos = [item for item in comfyui.outputs(record) if item["filename"].lower().endswith(".mp4")]
-                    if not videos: raise RuntimeError(f"场景{index+1}未返回真实视频")
-                    raw.write_bytes(comfyui.download(videos[0]))
-                    state["source_sha256"] = _sha(raw)
-                    state_path.write_text(json.dumps(state), encoding="utf-8")
-                    break
-                if time.monotonic()>deadline: raise RuntimeError(f"场景{index+1}生成超时，可重试；原Provider任务ID已记录")
-                time.sleep(2)
-        check_active()
-        clip = folder / f"{scene_id}.mp4"
-        vf = (f"fps={output['fps']},scale={output['width']}:{output['height']}:force_original_aspect_ratio=decrease,"
-              f"pad={output['width']}:{output['height']}:(ow-iw)/2:(oh-ih)/2,setsar=1")
-        run_command([ffmpeg,"-y","-i",str(raw),"-an","-vf",vf,"-frames:v",str(shot["duration_frames"]),
-                     "-c:v","libx264","-preset","fast","-pix_fmt","yuv420p",str(clip)])
-        entries.append({"shot_id":shot["id"],"description":shot["scene_description"],
-                        "duration_frames":shot["duration_frames"],"external_id":state["external_id"],
-                        "prompt_sha256":state["prompt_sha256"],"source_sha256":state["source_sha256"],
-                        "clip_sha256":_sha(clip),"clip":clip.name})
+        return shot, scene_id, state_path, raw, state
+
+    queued_next = queued_path = None
+    try:
+        for index in range(len(snapshot["shots"])):
+            shot, scene_id, state_path, raw, state = prepare(index)
+            queued_next = queued_path = None
+            deadline = time.monotonic()+2400
+            if not (raw.exists() and state.get("source_sha256") == _sha(raw)):
+                while True:
+                    check_active()
+                    progress(f"SCENE_{index+1}_OF_{len(snapshot['shots'])}", 5+int(index/len(snapshot['shots'])*80))
+                    record = comfyui.history(state["external_id"])
+                    status = comfyui.status_text(record)
+                    if status == "FAILED":
+                        raise RuntimeError(f"场景{index+1} H3生成失败；不会降级成摄影棚或灰模")
+                    if status == "SUCCEEDED":
+                        videos = [item for item in comfyui.outputs(record) if item["filename"].lower().endswith(".mp4")]
+                        if not videos: raise RuntimeError(f"场景{index+1}未返回真实视频")
+                        raw.write_bytes(comfyui.download(videos[0]))
+                        state["source_sha256"] = _sha(raw)
+                        state_path.write_text(json.dumps(state), encoding="utf-8")
+                        break
+                    if time.monotonic()>deadline: raise RuntimeError(f"场景{index+1}生成超时，可重试；原Provider任务ID已记录")
+                    time.sleep(2)
+            check_active()
+            # Keep one next scene ready while CPU normalizes the current clip.
+            # ComfyUI still executes one GPU prompt at a time; no extra model replica.
+            if index + 1 < len(snapshot["shots"]):
+                prepared_next = prepare(index + 1)
+                queued_next, queued_path = prepared_next[4]["external_id"], prepared_next[2]
+            clip = folder / f"{scene_id}.mp4"
+            vf = (f"fps={output['fps']},scale={output['width']}:{output['height']}:force_original_aspect_ratio=decrease,"
+                  f"pad={output['width']}:{output['height']}:(ow-iw)/2:(oh-ih)/2,setsar=1")
+            run_command([ffmpeg,"-y","-i",str(raw),"-an","-vf",vf,"-frames:v",str(shot["duration_frames"]),
+                         "-c:v","libx264","-preset","fast","-pix_fmt","yuv420p",str(clip)])
+            entries.append({"shot_id":shot["id"],"description":shot["scene_description"],
+                            "duration_frames":shot["duration_frames"],"external_id":state["external_id"],
+                            "prompt_sha256":state["prompt_sha256"],"source_sha256":state["source_sha256"],
+                            "clip_sha256":_sha(clip),"clip":clip.name})
+    except BaseException:
+        if queued_next:
+            try:
+                if comfyui.delete_pending(queued_next):
+                    pending_path = queued_path
+                    pending_state = json.loads(pending_path.read_text())
+                    if pending_state.get("external_id") == queued_next:
+                        pending_state["abandoned_external_id"] = pending_state.pop("external_id")
+                        pending_path.write_text(json.dumps(pending_state), encoding="utf-8")
+            except Exception:
+                pass  # Persisted ID remains recoverable; never interrupt another running prompt.
+        raise
     # Concatenate actual generated clips, not repeated images or a fixed studio shot.
     concat = folder / "concat.txt"
     concat.write_text("".join(f"file '{entry['clip']}'\n" for entry in entries),encoding="utf-8")
     run_command([ffmpeg,"-y","-f","concat","-safe","1","-i",str(concat),"-c","copy",
                  "-movflags","+faststart",str(run_dir/"preview.mp4")])
-    return {"engine":"H3_REFERENCE_SCENES","reference_asset_id":reference["asset_id"],
+    return {"engine":"H3_REFERENCE_SCENES","pipeline":"one_scene_lookahead_cpu_encode","reference_asset_id":reference["asset_id"],
             "reference_sha256":reference["sha256"],"reference_crop":reference.get("crop"),
             "native_width":576,"native_height":1024,"scenes":entries,
             "visual_verification":"NOT_VERIFIED","audio":"DISABLED",

@@ -169,6 +169,33 @@ class BatchApiTests(unittest.TestCase):
         self.assertEqual(mismatched.json()["detail"]["code"], "incompatible_combination")
         self.assertTrue(approved_other.json()["product_version_id"])
 
+    def test_inline_executor_drains_batch_without_an_external_worker_tick(self) -> None:
+        completed = []
+        def finish(job_id):
+            with main.connect() as db:
+                db.execute("UPDATE jobs SET status='SUCCEEDED', progress=100 WHERE id=?", (job_id,))
+            completed.append(job_id)
+        with patch("productdirector_api.main.execute_job", side_effect=finish):
+            created = self.client.post("/api/v1/batches", json={"matrix": self._matrix(), "max_concurrent": 1})
+        self.assertEqual(created.status_code, 202, created.text)
+        result = self.client.get(f"/api/v1/batches/{created.json()['batch']['id']}").json()
+        self.assertEqual(result['summary']['succeeded'], 6)
+        self.assertEqual(len(set(completed)), 6)
+
+    def test_inline_drain_respects_pause_after_current_item(self) -> None:
+        completed = []
+        def finish_then_pause(job_id):
+            with main.connect() as db:
+                db.execute("UPDATE jobs SET status='SUCCEEDED', progress=100 WHERE id=?", (job_id,))
+                db.execute("UPDATE batches SET paused=1 WHERE id=(SELECT batch_id FROM batch_items WHERE job_id=?)", (job_id,))
+            completed.append(job_id)
+        with patch("productdirector_api.main.execute_job", side_effect=finish_then_pause):
+            created = self.client.post("/api/v1/batches", json={"matrix": self._matrix(), "max_concurrent": 1})
+        self.assertEqual(created.status_code, 202, created.text)
+        result = self.client.get(f"/api/v1/batches/{created.json()['batch']['id']}").json()
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(result['summary']['pending'], 5)
+
     def test_create_batch_is_idempotent_and_creates_items_and_runs(self) -> None:
         payload = {"name": "1×1×3×2", "matrix": self._matrix(), "idempotency_key": "batch-key-1"}
         with patch("productdirector_api.main.execute_job"):
@@ -202,7 +229,8 @@ class BatchApiTests(unittest.TestCase):
         self.assertEqual(paused.json()["batch"]["revision"], 2)
         advanced = main.advance_batch(batch["id"])
         self.assertEqual(advanced["started"], [])  # 暂停期间不新开任务
-        resumed = self.client.post(f"/api/v1/batches/{batch['id']}/resume", json={})
+        with patch("productdirector_api.main.execute_job"):
+            resumed = self.client.post(f"/api/v1/batches/{batch['id']}/resume", json={})
         self.assertEqual(resumed.status_code, 200, resumed.text)
 
     def test_cancel_scope_and_retry_failed(self) -> None:
@@ -213,7 +241,10 @@ class BatchApiTests(unittest.TestCase):
         with main.connect() as db:
             db.execute("UPDATE batch_items SET status = 'FAILED', error = '渲染失败' WHERE id = ?", (items[0]["id"],))
             db.execute("UPDATE batch_items SET status = 'SUCCEEDED' WHERE id = ?", (items[1]["id"],))
-        retried = self.client.post(f"/api/v1/batches/{batch['id']}/retry-failed", json={"reason": "重试失败项"})
+        # Keep jobs unfinished so this test can exercise cancellation, even when
+        # the inline scheduler now drains the full batch in the background.
+        with patch("productdirector_api.main.execute_job"):
+            retried = self.client.post(f"/api/v1/batches/{batch['id']}/retry-failed", json={"reason": "重试失败项"})
         self.assertEqual(retried.status_code, 200, retried.text)
         body = retried.json()
         self.assertEqual([item["index"] for item in body["retried"]], [items[0]["index"]])

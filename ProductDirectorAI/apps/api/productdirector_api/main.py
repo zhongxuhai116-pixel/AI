@@ -10527,9 +10527,15 @@ def advance_batch(batch_id: str, *, execute_inline: bool = True) -> dict:
     with connect() as db:
         row = refresh_batch_status(db, batch_id)
         public = _batch_public(db, row)
-    for start in started:
-        if execute_inline and not INLINE_EXECUTOR_DISABLED:
-            execute_job(start["job_id"])
+    if execute_inline and not INLINE_EXECUTOR_DISABLED:
+        pending_execution = started
+        while pending_execution:
+            for start in pending_execution:
+                execute_job(start["job_id"])
+            # The local background executor has no external worker completion tick.
+            # Advance iteratively so the next item starts without a user refresh.
+            following = advance_batch(batch_id, execute_inline=False)
+            pending_execution = following["started"]
     return {"batch": public, "started": started}
 
 
