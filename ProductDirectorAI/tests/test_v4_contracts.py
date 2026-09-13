@@ -148,6 +148,13 @@ class V4ContractTests(unittest.TestCase):
         )
         self.assertEqual(bad_height.status_code, 422, bad_height.text)
 
+    def test_list_plans(self) -> None:
+        plan = self._create_plan()
+        listed = self.client.get("/api/v1/plans")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        ids = {item["id"] for item in listed.json()}
+        self.assertIn(plan["id"], ids)
+
     def test_character_asset_refs_validated_and_capability(self) -> None:
         missing = self.client.post(
             "/api/v1/characters",

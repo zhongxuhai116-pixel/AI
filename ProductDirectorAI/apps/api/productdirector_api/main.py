@@ -4758,6 +4758,24 @@ def create_plan(request: PlanRequest) -> dict:
     }
 
 
+@app.get("/api/v1/plans")
+def list_plans(owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJECT_ID) -> list[dict]:
+    """计划列表（V4 互动界面选择计划用；单 Owner 应用，按时间倒序）。"""
+    with connect() as db:
+        rows = db.execute("SELECT * FROM plans ORDER BY created_at DESC LIMIT 200").fetchall()
+    return [
+        {
+            "id": row["id"],
+            "product_asset_id": row["product_asset_id"],
+            "intent": row["intent"],
+            "approved": bool(row["approved"]),
+            "created_at": row["created_at"],
+            "payload": json.loads(row["payload"]) if row["payload"] else {},
+        }
+        for row in rows
+    ]
+
+
 @app.get("/api/v1/plans/{plan_id}/contracts")
 def list_plan_contracts(
     plan_id: str,

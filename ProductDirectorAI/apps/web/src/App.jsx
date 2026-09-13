@@ -3,7 +3,7 @@ import {
   Archive, ArrowClockwise, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
   Clock, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
   MagnifyingGlass, MonitorPlay, Package, PencilSimple, Play, Plus, Queue,
-  ShieldCheck, SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, WarningCircle, X,
+  ShieldCheck, SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, User, WarningCircle, X,
 } from "@phosphor-icons/react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -16,7 +16,8 @@ const navItems = [
   ["project", "项目", SquaresFour], ["products", "产品库", Cube],
   ["director", "导演台", SlidersHorizontal], ["storyboard", "分镜", FilmSlate],
   ["preview", "3D 预演", MonitorPlay], ["jobs", "渲染任务", Queue],
-  ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck], ["settings", "设置", Gear],
+  ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck],
+  ["interaction", "人物互动", User], ["settings", "设置", Gear],
 ];
 const defaultShots = [
   { id: "shot_01", name: "正面推近", camera: "dolly_in", focal_length_mm: 35, duration_frames: 48 },
@@ -418,6 +419,142 @@ function FidelityPage({ jobs }) {
   </section>;
 }
 
+const interactionActions = [
+  ["press_button", "按按钮"], ["single_punch_target", "击打指定靶点"],
+  ["approach", "走近产品"], ["celebrate", "庆祝"],
+];
+
+function InteractionPage() {
+  const [plans, setPlans] = useState([]);
+  const [characters, setCharacters] = useState([]);
+  const [selectedPlanId, setSelectedPlanId] = useState("");
+  const [versionId, setVersionId] = useState("");
+  const [anchors, setAnchors] = useState([]);
+  const [anchorSets, setAnchorSets] = useState([]);
+  const [interactions, setInteractions] = useState([]);
+  const [selectedInteraction, setSelectedInteraction] = useState(null);
+  const [validation, setValidation] = useState(null);
+  const [timeline, setTimeline] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState({
+    character_id: "", anchor_set_id: "", action: "press_button",
+    prepare_frame: 10, contact_frame: 46, end_frame: 60, speed_scale: 1.0, notes: "",
+  });
+
+  useEffect(() => {
+    Promise.all([apiRequest("/plans"), apiRequest("/characters")]).then(async ([p, c]) => {
+      if (p.ok) setPlans(await p.json());
+      if (c.ok) setCharacters(await c.json());
+    }).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (notice) { const timer = setTimeout(() => setNotice(null), 5000); return () => clearTimeout(timer); }
+  }, [notice]);
+
+  async function selectPlan(planId) {
+    setSelectedPlanId(planId); setAnchors([]); setAnchorSets([]); setInteractions([]);
+    setSelectedInteraction(null); setValidation(null); setTimeline(null);
+    const contracts = await apiRequest(`/plans/${planId}/contracts`);
+    if (!contracts.ok) return;
+    const rows = await contracts.json();
+    if (!rows[0]) return;
+    setVersionId(rows[0].product_version_id);
+    const [a, s, i] = await Promise.all([
+      apiRequest(`/product-versions/${rows[0].product_version_id}/anchors`),
+      apiRequest(`/product-versions/${rows[0].product_version_id}/anchor-sets`),
+      apiRequest(`/plans/${planId}/interactions`),
+    ]);
+    if (a.ok) setAnchors(await a.json());
+    if (s.ok) setAnchorSets(await s.json());
+    if (i.ok) setInteractions(await i.json());
+  }
+
+  async function createInteraction() {
+    if (!selectedPlanId || !form.character_id || !form.anchor_set_id) {
+      setNotice(["danger", "请先选择计划、人物与已批准的锚点集。"]);
+      return;
+    }
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/plans/${selectedPlanId}/interactions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...form, prepare_frame: Number(form.prepare_frame), contact_frame: Number(form.contact_frame), end_frame: Number(form.end_frame), speed_scale: Number(form.speed_scale) }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || "交互计划创建失败");
+      setNotice(["success", `交互计划 v${body.version} 已创建。`]);
+      await selectPlan(selectedPlanId);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+
+  async function validate(interaction) {
+    setSelectedInteraction(interaction); setValidation(null); setTimeline(null);
+    const [v, p] = await Promise.all([
+      apiRequest(`/interaction-plans/${interaction.id}/validate`, { method: "POST" }),
+      apiRequest(`/interaction-plans/${interaction.id}/previz`, { method: "POST" }),
+    ]);
+    if (v.ok) setValidation(await v.json());
+    if (p.ok) setTimeline(await p.json());
+  }
+
+  const selectedVersionAnchors = anchors.filter((item) => item.revision === anchorSets[0]?.revision);
+  const maxHandZ = timeline ? Math.max(...timeline.frames.map((f) => f.hand_z_m), 1) : 1;
+
+  return <section className="page">
+    <div className="page-head"><div><b>V4 HUMAN INTERACTION</b><h1>人物与互动</h1><p>人物规格、产品锚点与交互计划：校验接触/穿透/时序并生成预演时间线。真人感人物层需经批准的工作流或授权素材（能力页如实报告）。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    <div className="fidelity-grid">
+      <section className="card">
+        <div className="card-head"><div><h2>计划与锚点</h2><span className="count">{anchors.length}</span></div><small>锚点绑定产品版本，版本升级后需重新映射</small></div>
+        <div className="qa-pick">
+          <select value={selectedPlanId} onChange={(event) => selectPlan(event.target.value)}>
+            <option value="">选择计划…</option>
+            {plans.map((item) => <option key={item.id} value={item.id}>计划 {item.id.slice(0, 8)} · {item.intent.slice(0, 24)}</option>)}
+          </select>
+        </div>
+        {anchors.length ? <div className="table-wrap"><table><thead><tr><th>修订</th><th>名称</th><th>位置（bbox 归一化）</th><th>半径</th><th>允许动作</th><th>状态</th></tr></thead><tbody>{anchors.map((item) => <tr key={item.id}><td>r{item.revision}</td><td>{item.name}</td><td><small>{item.anchor.position_m.map((v) => v.toFixed(2)).join(", ")}</small></td><td>{item.anchor.radius_m}</td><td><small>{item.anchor.allowed_actions.join("、")}</small></td><td><Pill status={item.status === "APPROVED" ? "SUCCEEDED" : "DRAFT"} /></td></tr>)}</tbody></table></div> : <div className="table-empty"><ShieldCheck /><strong>还没有锚点</strong><span>选择计划后在「保真审核」创建并批准锚点集。</span></div>}
+        {anchorSets.length > 0 && <p className="qa-empty-note">已冻结锚点集：revision {anchorSets.map((s) => s.revision).join("、")}</p>}
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>人物</h2><span className="count">{characters.length}</span></div><small>合成 Proxy 可用于预演；真人感成片需授权素材或批准工作流</small></div>
+        {characters.length ? <div className="table-wrap"><table><thead><tr><th>名称</th><th>来源</th><th>身高</th><th>授权记录</th></tr></thead><tbody>{characters.map((item) => <tr key={item.id}><td>{item.name}</td><td>{item.character.source === "licensed_asset" ? "授权素材" : "合成 Proxy"}</td><td><small>{item.character.height_range_m.join("–")}m</small></td><td>{item.character.source === "licensed_asset" ? (item.character.license_record ? "已记录" : "缺记录") : "—"}</td></tr>)}</tbody></table></div> : <div className="table-empty"><User /><strong>还没有人物</strong><span>在 API 创建人物规格（/characters）。</span></div>}
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>新建交互计划</h2></div><small>动作帧数必须落在计划总时长内</small></div>
+        <div className="interaction-form">
+          <label><span>人物</span><select value={form.character_id} onChange={(e) => setForm({ ...form, character_id: e.target.value })}><option value="">选择人物…</option>{characters.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+          <label><span>锚点集</span><select value={form.anchor_set_id} onChange={(e) => setForm({ ...form, anchor_set_id: e.target.value })}><option value="">选择已批准锚点集…</option>{anchorSets.map((item) => <option key={item.id} value={item.id}>revision {item.revision}</option>)}</select></label>
+          <label><span>动作</span><select value={form.action} onChange={(e) => setForm({ ...form, action: e.target.value })}>{interactionActions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label><span>准备帧</span><input type="number" min="1" value={form.prepare_frame} onChange={(e) => setForm({ ...form, prepare_frame: e.target.value })} /></label>
+          <label><span>接触帧</span><input type="number" min="1" value={form.contact_frame} onChange={(e) => setForm({ ...form, contact_frame: e.target.value })} /></label>
+          <label><span>结束帧</span><input type="number" min="1" value={form.end_frame} onChange={(e) => setForm({ ...form, end_frame: e.target.value })} /></label>
+          <label><span>变速</span><input type="number" min="0.5" max="1.5" step="0.05" value={form.speed_scale} onChange={(e) => setForm({ ...form, speed_scale: e.target.value })} /></label>
+          <button className="primary" disabled={busy} onClick={createInteraction}><Plus />创建交互计划</button>
+        </div>
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>交互计划</h2><span className="count">{interactions.length}</span></div><small>修改 = 新版本；计划更新后旧交互失效</small></div>
+        {interactions.length ? <div className="table-wrap"><table><thead><tr><th>版本</th><th>动作</th><th>帧</th><th>创建时间</th><th /></tr></thead><tbody>{interactions.map((item) => <tr className={selectedInteraction?.id === item.id ? "selected" : ""} key={item.id}><td>v{item.version}</td><td>{interactionActions.find(([v]) => v === item.interaction.action)?.[1] || item.interaction.action}</td><td><small>{item.interaction.prepare_frame} / {item.interaction.contact_frame} / {item.interaction.end_frame}</small></td><td>{formatTime(item.created_at)}</td><td><button onClick={() => validate(item)}>校验</button></td></tr>)}</tbody></table></div> : <div className="table-empty"><FilmSlate /><strong>还没有交互计划</strong><span>选择计划与锚点集后创建。</span></div>}
+        {validation && <div className="validation-report">
+          <h3>校验 {validation.passed ? <Pill status="SUCCEEDED" /> : <Pill status="QA_REJECTED" />}</h3>
+          {validation.failures.map((failure, index) => <p className="validation-fail" key={index}><WarningCircle weight="fill" />{failure}</p>)}
+          {Object.entries(validation.metrics?.timing || {}).length > 0 && <p><b>时序</b> 偏差 {validation.metrics.timing.deviation_frames} 帧（容差 ±{validation.metrics.timing.tolerance_frames}）</p>}
+          {Object.entries(validation.metrics?.contact || {}).length > 0 && <p><b>接触</b> 距离 {validation.metrics.contact.contact_distance_m}m（阈值 {validation.metrics.contact.threshold_m}m）</p>}
+          {Object.entries(validation.metrics?.penetration || {}).length > 0 && <p><b>穿透</b> {validation.metrics.penetration.penetration_m}m（容差 {validation.metrics.penetration.tolerance_m}m）</p>}
+          {validation.metrics?.capabilities && Object.entries(validation.metrics.capabilities).length > 0 && <p><b>能力</b> 可达带 {validation.metrics.capabilities.reach_low_m}–{validation.metrics.capabilities.reach_high_m}m</p>}
+        </div>}
+        {timeline && <div className="timeline">
+          <h3>预演时间线（确定性代理手部高度）</h3>
+          <div className="timeline-events">{timeline.events.map((event) => <span key={event.event}>● {event.event}@{event.frame}</span>)}</div>
+          <div className="timeline-bars">{timeline.frames.map((frame) => <i key={frame.frame} className={frame.event ? "marked" : ""} style={{ height: `${Math.max(6, (frame.hand_z_m / maxHandZ) * 100)}%` }} title={`帧 ${frame.frame} · ${frame.hand_z_m}m${frame.event ? ` · ${frame.event}` : ""}`} />)}</div>
+        </div>}
+      </section>
+    </div>
+  </section>;
+}
+
 export function App() {
   const [session, setSession] = useState(null);
   const [accessKey, setAccessKey] = useState("");
@@ -641,7 +778,7 @@ export function App() {
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">

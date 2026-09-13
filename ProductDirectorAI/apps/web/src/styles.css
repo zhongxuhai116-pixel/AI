@@ -157,3 +157,22 @@ button { color: inherit; }
 .viewer-problems button { border: 1px solid #dfe4eb; background: #fff; border-radius: 5px; padding: 5px 9px; cursor: pointer; }
 .viewer-problems button:hover { border-color: var(--blue); color: var(--blue); }
 @media (max-width: 760px) { .fidelity-grid { grid-template-columns: 1fr; } }
+
+/* V4 人物与互动 */
+.interaction-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; padding: 14px 0; }
+.interaction-form label { display: grid; gap: 5px; font-size: 11px; color: var(--muted); }
+.interaction-form select, .interaction-form input { padding: 8px 10px; border: 1px solid #dfe4eb; border-radius: 6px; background: #f8f9fb; }
+.interaction-form button { padding: 9px 14px; border-radius: 6px; border: 0; cursor: pointer; align-self: end; height: 34px; }
+.interaction-form button.primary { background: var(--blue); color: #fff; }
+.validation-report { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 7px; background: #fafbfc; }
+.validation-report h3 { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 0 0 8px; }
+.validation-report p { margin: 5px 0; font-size: 12px; }
+.validation-fail { display: flex; align-items: center; gap: 6px; color: var(--danger); }
+.validation-fail svg { width: 14px; flex: none; }
+.timeline { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 7px; }
+.timeline h3 { font-size: 13px; margin: 0 0 8px; }
+.timeline-events { display: flex; gap: 12px; font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+.timeline-bars { display: flex; align-items: flex-end; gap: 2px; height: 90px; }
+.timeline-bars i { flex: 1; min-width: 3px; background: #b9c8e8; border-radius: 2px 2px 0 0; display: block; }
+.timeline-bars i.marked { background: var(--accent); }
+@media (max-width: 760px) { .timeline-bars { height: 60px; } }
