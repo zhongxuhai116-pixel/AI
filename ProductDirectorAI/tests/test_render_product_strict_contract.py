@@ -86,6 +86,21 @@ class RenderProductStrictContractTests(unittest.TestCase):
         self.assertIn("if obj in product or obj.type != \"MESH\":", hide)
         self.assertIn("obj.hide_render = True", hide)
 
+    def test_occluder_requires_passes_and_layers(self) -> None:
+        self.assertIn('"--occluder"', _function_text("parse_args"))
+        main_text = _function_text("main")
+        self.assertIn("--occluder 需与 --passes --layers 一起使用", main_text)
+        self.assertIn("import_occluders(args.occluder) if args.occluder else []", main_text)
+
+    def test_import_occluders_marks_meshes_and_normalize_aligns_them(self) -> None:
+        text = _function_text("import_occluders")
+        self.assertIn("pd_occluder", text)
+        self.assertIn("Occluder_", text)
+        self.assertIn("obj.name not in existing", text)
+        normalize_text = _function_text("normalize")
+        self.assertIn("extra_objects", normalize_text)
+        self.assertIn("list(meshes) + list(extra_objects or [])", normalize_text)
+
 
 if __name__ == "__main__":
     unittest.main()

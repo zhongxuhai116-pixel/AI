@@ -28,6 +28,8 @@ def parse_args():
                         help="V3：额外输出 Beauty/Alpha/Depth/Normal/Index 多通道（不改动既有单帧产物）")
     parser.add_argument("--layers", action="store_true",
                         help="V3-05：在 --passes 基础上额外输出独立层素材（干净底板 + 遮挡层），需与 --passes 同用")
+    parser.add_argument("--occluder", default="",
+                        help="V3-05 可选：独立遮挡物 GLB（其网格不属于产品；需与 --passes --layers 同用）")
     return parser.parse_args(sys.argv[sys.argv.index("--") + 1 :])
 
 
@@ -44,7 +46,25 @@ def import_product(path: str):
     return meshes
 
 
-def normalize(meshes, pose: dict | None = None):
+def import_occluders(path: str) -> list:
+    """导入独立遮挡物 GLB（V3-05 --occluder）。
+
+    遮挡物网格不属于产品：不进入产品网格集合、不参与产品归一化的包围盒计算，
+    但随产品做同一坐标对齐（缩放/居中/落地），保持遮挡物与产品的相对位置。
+    网格统一标记 `pd_occluder` 且名称以 `Occluder` 开头，供遮挡层渲染识别。
+    只收集本次导入**新增**的网格，绝不把已导入的产品网格误标成遮挡物。
+    """
+    existing = {obj.name for obj in bpy.context.scene.objects if obj.type == "MESH"}
+    bpy.ops.import_scene.gltf(filepath=path)
+    occluders = [obj for obj in bpy.context.scene.objects if obj.type == "MESH" and obj.name not in existing]
+    for obj in occluders:
+        if not obj.name.startswith("Occluder"):
+            obj.name = "Occluder_" + obj.name
+        obj["pd_occluder"] = True
+    return occluders
+
+
+def normalize(meshes, pose: dict | None = None, extra_objects=None):
     corners = []
     for obj in meshes:
         corners.extend(obj.matrix_world @ Vector(corner) for corner in obj.bound_box)
@@ -56,12 +76,12 @@ def normalize(meshes, pose: dict | None = None):
         raise RuntimeError("产品模型包围盒无效")
     scale = 1.45 / largest
     center = (min_v + max_v) / 2
-    for obj in meshes:
+    for obj in list(meshes) + list(extra_objects or []):
         obj.scale *= scale
         obj.location = (obj.location - center) * scale
         obj.location.z += size.z * scale / 2
     if pose:
-        # 目标 3D 合同的 product_pose：在归一化底座上再叠加位置/旋转/缩放。
+        # 目标 3D 合同的 product_pose：在归一化底座上再叠加位置/旋转/缩放（只作用于产品）。
         offset = Vector(pose.get("position_m") or (0, 0, 0))
         rotation = pose.get("rotation_xyz_deg") or (0, 0, 0)
         extra_scale = float(pose.get("scale", 1) or 1)
@@ -759,9 +779,12 @@ def main():
             raise SystemExit("--frame-end 必须在 1 与 --frames 之间")
         render_frame_end = args.frame_end
     plan_payload = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+    if args.occluder and not (args.passes and args.layers):
+        raise RuntimeError("--occluder 需与 --passes --layers 一起使用（遮挡层素材依赖独立层产物布局）")
     clear_scene()
     meshes = import_product(args.input)
-    normalize(meshes, plan_payload.get("product_pose"))
+    occluders = import_occluders(args.occluder) if args.occluder else []
+    normalize(meshes, plan_payload.get("product_pose"), occluders)
     add_lighting(plan_payload.get("scene"))
     if args.passes:
         configure_passes(meshes, output / "passes")
