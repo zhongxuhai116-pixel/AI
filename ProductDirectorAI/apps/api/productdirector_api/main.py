@@ -60,6 +60,8 @@ from . import interaction_geometry
 from . import interaction_validation
 from . import automation
 from . import webhooks
+from . import publishing
+from . import publishing_connectors
 from . import ledger
 from . import localization
 from . import platform_profiles
@@ -840,8 +842,86 @@ def initialize_db() -> None:
               replayed_at TEXT,
               UNIQUE (endpoint_id, event_id)
             );
-            CREATE TABLE IF NOT EXISTS budgets (
+            CREATE TABLE IF NOT EXISTS connected_accounts (
               id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              account_ref TEXT NOT NULL,
+              display_name TEXT NOT NULL DEFAULT '',
+              credential_ref TEXT NOT NULL DEFAULT '',
+              scopes TEXT NOT NULL DEFAULT '',
+              capabilities TEXT NOT NULL DEFAULT '',
+              authorization_status TEXT NOT NULL DEFAULT 'CONNECTED',
+              capabilities_checked_at TEXT,
+              connected_at TEXT NOT NULL,
+              disconnected_at TEXT,
+              disconnect_reason TEXT NOT NULL DEFAULT '',
+              revision INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS oauth_states (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              state TEXT NOT NULL,
+              code_verifier TEXT NOT NULL,
+              return_path TEXT NOT NULL DEFAULT '/',
+              created_at TEXT NOT NULL,
+              consumed_at TEXT,
+              UNIQUE (state)
+            );
+            CREATE TABLE IF NOT EXISTS publish_preflights (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS publish_approvals (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              preflight_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              account_id TEXT,
+              package_id TEXT NOT NULL,
+              snapshot_hash TEXT NOT NULL,
+              scope TEXT NOT NULL DEFAULT 'single_publish',
+              binding TEXT NOT NULL,
+              actor TEXT NOT NULL,
+              expires_at REAL,
+              revoked_at TEXT,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS publish_jobs (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              account_id TEXT NOT NULL,
+              package_id TEXT NOT NULL,
+              package_version_id TEXT NOT NULL,
+              publish_intent_id TEXT NOT NULL,
+              approval_id TEXT NOT NULL,
+              dedupe_key TEXT NOT NULL,
+              state TEXT NOT NULL,
+              external_publish_id TEXT,
+              permalink_url TEXT,
+              last_error TEXT,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (dedupe_key)
+            );
+            CREATE TABLE IF NOT EXISTS budgets (              id TEXT PRIMARY KEY,
               owner_id TEXT NOT NULL,
               project_id TEXT NOT NULL,
               name TEXT NOT NULL,
@@ -12383,6 +12463,555 @@ def internal_advance_batches(request: Request, limit: int = 20) -> dict:
             results.append({"batch_id": row["id"], "error": exc.detail})
     return {"advanced": len(results), "results": results,
             "note": "调度不执行渲染：只按并发上限为 PENDING 项创建 Run 与队列行，Worker 领取后才会真正执行"}
+
+
+# ---------------------------------------------------------------------------
+# V6-10…15 发布：连接器状态、账号授权、预检、审批、发布任务与对账
+# 诚实边界：无真实平台授权时一律 BLOCKED/NOT_CONFIGURED，不伪造发布成功；
+# 提交成功 ≠ 已发布；只有上游查询确认才标 PUBLISHED；拿不到链接只留平台 ID。
+# ---------------------------------------------------------------------------
+
+class PublishingConnectRequest(BaseModel):
+    platform: Literal["tiktok", "youtube", "instagram", "facebook_page"]
+    return_path: str = Field(default="/", max_length=300)
+
+
+class PublishingOAuthCallbackRequest(BaseModel):
+    state: str = Field(min_length=8, max_length=200)
+    code: str = Field(min_length=4, max_length=2000)
+    code_verifier: str | None = Field(default=None, max_length=200)
+
+
+class PublishingPreflightRequest(BaseModel):
+    package_ids: list[str] = Field(min_length=1, max_length=20)
+    account_ids: list[str] = Field(default_factory=list, max_length=20)
+    options: dict = Field(default_factory=dict)
+
+
+class PublishingApprovalRequest(BaseModel):
+    preflight_id: str
+    confirmations: dict = Field(default_factory=dict)
+    scope: Literal["single_publish", "automation_policy"] = "single_publish"
+    expires_in_seconds: int = Field(default=3600, ge=1, le=30 * 86400)
+
+
+class PublishingJobRequest(BaseModel):
+    approval_id: str
+    package_id: str
+    account_id: str
+    publish_intent_id: str = Field(min_length=1, max_length=120)
+    options: dict = Field(default_factory=dict)
+    idempotency_key: str | None = Field(default=None, max_length=120)
+
+
+class PublishingActionRequest(BaseModel):
+    reason: str = Field(default="", max_length=300)
+
+
+def _connector_credentials(platform: str) -> dict:
+    """从环境读取平台凭据（本部署未配置任何平台凭据 → 一律 NOT_CONFIGURED）。"""
+    return publishing_connectors.credentials_from_env(platform)
+
+
+def normalize_context_for_publishing() -> tuple[str, str, str]:
+    """发布相关接口的归属上下文（与其它接口同一套冻结上下文校验）。"""
+    return normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+
+
+def _account_row(db: sqlite3.Connection, owner_id: str, project_id: str, account_id: str):
+    row = db.execute(
+        "SELECT * FROM connected_accounts WHERE id = ? AND owner_id = ? AND project_id = ?",
+        (account_id, owner_id, project_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "账号不存在或未授权")
+    return row
+
+
+def _account_public(row) -> dict:
+    capabilities = {}
+    try:
+        capabilities = json.loads(row["capabilities"]) if row["capabilities"] else {}
+    except (json.JSONDecodeError, TypeError):
+        capabilities = {}
+    return {
+        "id": row["id"], "platform": row["platform"], "account_ref": row["account_ref"],
+        "display_name": row["display_name"], "scopes": [item for item in (row["scopes"] or "").split(",") if item],
+        "authorization_status": row["authorization_status"], "connected": row["disconnected_at"] is None,
+        "capabilities": capabilities, "capabilities_checked_at": row["capabilities_checked_at"],
+        "connected_at": row["connected_at"], "disconnected_at": row["disconnected_at"],
+        "disconnect_reason": row["disconnect_reason"], "revision": row["revision"],
+        "note": ("授权真实存在：能力来自平台查询" if row["capabilities_checked_at"]
+                 else "账号能力尚未实时查询：预检会给出 WARNING，发布前必须刷新"),
+    }
+
+
+@app.get("/api/v1/publishing/connectors")
+def list_publishing_connectors() -> dict:
+    """四个默认原生连接器状态：未配置授权时如实 NOT_CONFIGURED（不假装可用）。"""
+    return publishing_connectors.connector_overview()
+
+
+@app.get("/api/v1/publishing/accounts")
+def list_publishing_accounts(platform: str = "") -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    query = "SELECT * FROM connected_accounts WHERE owner_id = ? AND project_id = ?"
+    params: list = [owner_id, project_id]
+    if platform:
+        query += " AND platform = ?"
+        params.append(platform)
+    query += " ORDER BY created_at DESC LIMIT 200"
+    with connect() as db:
+        rows = db.execute(query, tuple(params)).fetchall()
+    return [_account_public(row) for row in rows]
+
+
+@app.post("/api/v1/publishing/accounts/connect")
+def begin_publishing_authorization(request: PublishingConnectRequest) -> dict:
+    """官方授权跳转信息：state + PKCE 由服务端生成并落库；未配置应用凭据时明确 BLOCKED。"""
+    owner_id, _, project_id = normalize_context_for_publishing()
+    state = secrets.token_urlsafe(24)
+    verifier, challenge = publishing_connectors.pkce_pair()
+    redirect_uri = publishing_connectors.redirect_uri()
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO oauth_states(id, owner_id, project_id, platform, state, code_verifier, return_path, "
+            "created_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (str(uuid.uuid4()), owner_id, project_id, request.platform, state, verifier,
+             request.return_path, now),
+        )
+    credentials = _connector_credentials(request.platform)
+    try:
+        authorization = publishing_connectors.begin_authorization(
+            request.platform, state=state, code_challenge=challenge, redirect_uri=redirect_uri,
+            credentials=credentials,
+        )
+    except publishing.PublishError as exc:
+        raise HTTPException(exc.status_code, exc.as_detail()) from exc
+    authorization["state"] = state
+    authorization["redirect_uri"] = redirect_uri
+    authorization["note"] = ("state 与 PKCE 已落库；回调必须带回同一 state（防 CSRF）"
+                            "；本产品不做浏览器自动化绕过平台授权")
+    return authorization
+
+
+@app.post("/api/v1/publishing/oauth/{platform}/callback")
+def publishing_oauth_callback(platform: str, request: PublishingOAuthCallbackRequest) -> dict:
+    """OAuth 回调：校验 state（一次性）与 PKCE，向上游换 token；未配置应用凭据时 BLOCKED。"""
+    owner_id, _, project_id = normalize_context_for_publishing()
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM oauth_states WHERE state = ? AND owner_id = ? AND project_id = ? AND platform = ?",
+            (request.state, owner_id, project_id, platform),
+        ).fetchone()
+        if not row:
+            raise HTTPException(400, {"code": "unknown_state",
+                                      "detail": "state 不存在或不属于本项目：拒绝回调（防 CSRF）"})
+        if row["consumed_at"]:
+            raise HTTPException(409, {"code": "state_already_used",
+                                      "detail": f"state 已于 {row['consumed_at']} 使用：一次性校验"})
+        db.execute("UPDATE oauth_states SET consumed_at = ? WHERE id = ?", (utc_now(), row["id"]))
+    credentials = _connector_credentials(platform)
+    try:
+        exchanged = publishing_connectors.exchange_callback(
+            platform, code=request.code, code_verifier=request.code_verifier or row["code_verifier"],
+            redirect_uri=publishing_connectors.redirect_uri(), credentials=credentials,
+        )
+    except publishing.PublishError as exc:
+        raise HTTPException(exc.status_code, exc.as_detail()) from exc
+    if not exchanged.get("connected"):
+        return exchanged
+    now = utc_now()
+    account_id = str(uuid.uuid4())
+    with connect() as db:
+        db.execute(
+            "INSERT INTO connected_accounts(id, owner_id, project_id, platform, account_ref, display_name, "
+            "credential_ref, scopes, capabilities, authorization_status, capabilities_checked_at, connected_at, "
+            "disconnected_at, disconnect_reason, revision, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONNECTED', NULL, ?, NULL, '', 1, ?, ?)",
+            (account_id, owner_id, project_id, platform, exchanged["account_ref"],
+             exchanged.get("display_name") or exchanged["account_ref"], exchanged["credential_ref"],
+             ",".join(exchanged.get("scopes") or []), json.dumps(exchanged.get("capabilities") or {},
+                                                                 ensure_ascii=False),
+             now, now, now),
+        )
+        account = _account_row(db, owner_id, project_id, account_id)
+    return {**_account_public(account), "credential_note": "凭证只保存引用，不回传明文"}
+
+
+@app.delete("/api/v1/publishing/accounts/{account_id}")
+def disconnect_publishing_account(account_id: str, request: PublishingActionRequest) -> dict:
+    """断开账号：撤销未来任务访问；已提交的发布不会被"取消"（上游语义见各平台文档）。"""
+    owner_id, _, project_id = normalize_context_for_publishing()
+    with connect() as db:
+        begin_immediate(db)
+        row = _account_row(db, owner_id, project_id, account_id)
+        if row["disconnected_at"]:
+            return {**_account_public(row), "disconnected": True, "note": "该账号早已断开（幂等）"}
+        active_jobs = db.execute(
+            "SELECT id, state FROM publish_jobs WHERE account_id = ? AND state IN "
+            "('QUEUED', 'UPLOADING', 'PROCESSING', 'RECONCILING', 'CANCEL_REQUESTED')",
+            (account_id,),
+        ).fetchall()
+        now = utc_now()
+        db.execute(
+            "UPDATE connected_accounts SET authorization_status = 'REVOKED', disconnected_at = ?, "
+            "disconnect_reason = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+            (now, request.reason or "管理员断开", now, account_id),
+        )
+        db.execute(
+            "UPDATE publish_jobs SET state = 'BLOCKED', last_error = ?, updated_at = ? WHERE account_id = ? "
+            "AND state IN ('QUEUED', 'UPLOADING', 'RECONCILING')",
+            ("账号已断开：需要重新授权后才能继续", now, account_id),
+        )
+        updated = _account_row(db, owner_id, project_id, account_id)
+    return {**_account_public(updated), "disconnected": True,
+            "blocked_active_jobs": [dict(item) for item in active_jobs],
+            "note": "断开只撤销未来访问；已在平台侧提交的内容不会被本系统删除"}
+
+
+@app.post("/api/v1/publishing/preflight")
+def publishing_preflight(request: PublishingPreflightRequest) -> dict:
+    """预检：逐包逐平台给出可执行/阻断项，并产出审批要绑定的快照哈希。"""
+    owner_id, _, project_id = normalize_context_for_publishing()
+    results: list[dict] = []
+    with connect() as db:
+        accounts = db.execute(
+            "SELECT * FROM connected_accounts WHERE owner_id = ? AND project_id = ? AND disconnected_at IS NULL",
+            (owner_id, project_id),
+        ).fetchall()
+        if request.account_ids:
+            accounts = [row for row in accounts if row["id"] in set(request.account_ids)]
+        for package_id in request.package_ids:
+            package_row = db.execute(
+                "SELECT * FROM publish_packages WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (package_id, owner_id, project_id),
+            ).fetchone()
+            if not package_row:
+                raise HTTPException(404, f"发布包不存在: {package_id}")
+            package = _package_for_publishing(db, package_row)
+            if not accounts:
+                results.append({
+                    "package_id": package_id, "platform": None, "executable": False,
+                    "blocking": [{"code": "no_connected_account", "severity": "BLOCKING",
+                                  "detail": "没有已授权账号：请先完成平台官方授权（未授权一律 BLOCKED）"}],
+                    "warnings": [], "snapshot": None, "snapshot_hash": None,
+                })
+                continue
+            for account in accounts:
+                platform = account["platform"]
+                connector = publishing_connectors.connector_status(platform, _connector_credentials(platform))
+                account_view = {
+                    "id": account["id"], "connected": account["disconnected_at"] is None,
+                    "authorization_status": account["authorization_status"],
+                    "capabilities_checked_at": account["capabilities_checked_at"],
+                    "revision": account["revision"],
+                }
+                outcome = publishing.preflight(
+                    platform=platform, package=package, account=account_view,
+                    options=request.options, connector=connector,
+                )
+                # 连接器层的平台素材限制（官方确认的才阻断；未确认的只给 WARNING）
+                try:
+                    platform_rules = publishing_connectors.validate_package(
+                        platform, package, account_view, request.options, _connector_credentials(platform))
+                    outcome["blocking"] = list(outcome["blocking"]) + list(platform_rules["blocking"])
+                    outcome["warnings"] = list(outcome["warnings"]) + list(platform_rules["warnings"])
+                    outcome["limits_source"] = platform_rules["limits_source"]
+                    outcome["executable"] = not outcome["blocking"]
+                except publishing.PublishError as exc:
+                    outcome.setdefault("warnings", []).append({"code": exc.code, "detail": exc.message})
+                outcome["package_id"] = package_id
+                outcome["account_id"] = account["id"]
+                results.append(outcome)
+        preflight_id = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO publish_preflights(id, owner_id, project_id, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (preflight_id, owner_id, project_id, _canonical_json_text({"results": results}),
+             hashlib.sha256(_canonical_json_text({"results": results}).encode("utf-8")).hexdigest(), utc_now()),
+        )
+    return {
+        "preflight_id": preflight_id,
+        "results": results,
+        "executable_count": sum(1 for item in results if item.get("executable")),
+        "blocked_count": sum(1 for item in results if not item.get("executable")),
+        "note": ("预检不产生任何平台动作；审批必须引用某一条结果的 snapshot_hash，"
+                 "绑定字段变化即使审批失效"),
+    }
+
+
+def _package_for_publishing(db: sqlite3.Connection, row) -> dict:
+    payload = json.loads(row["payload"])
+    manifest = payload.get("manifest") or {}
+    video = next((item for item in manifest.get("files", []) if item.get("role") == "final_video"), {})
+    verification = payload.get("verification") or {}
+    return {
+        "id": row["id"], "version_id": f"{row['id']}:v{row['version']}", "status": row["status"],
+        "content_hash": row["content_hash"], "stored_hash": row["content_hash"],
+        "locale": row["locale"], "profile_id": row["profile_id"],
+        "qa_passed": bool((manifest.get("qa") or {}).get("passed")),
+        "approval_ref": manifest.get("approval_ref"),
+        "duration_seconds": float((manifest.get("video") or {}).get("duration_seconds") or 0.0),
+        "has_music": bool((manifest.get("audio") or {}).get("mixed", {}).get("enabled")),
+        "music_license_ref": (manifest.get("audio") or {}).get("music_license_ref"),
+        "unlicensed_font": not bool((manifest.get("subtitles") or {}).get("font_license")),
+        "verification_failures": verification.get("failures") or [],
+        "video_file": video.get("path"),
+    }
+
+
+@app.post("/api/v1/publishing/approvals", status_code=201)
+def create_publishing_approval(request: PublishingApprovalRequest) -> dict:
+    """创建审批：必须引用预检快照哈希，并显式确认包哈希/账号/可见性/声明。"""
+    owner_id, _, project_id = normalize_context_for_publishing()
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM publish_preflights WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (request.preflight_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "预检记录不存在")
+        stored = json.loads(row["payload"])["results"]
+        candidates = [item for item in stored if item.get("executable")]
+        if not candidates:
+            raise HTTPException(409, {"code": "no_executable_preflight",
+                                      "detail": "该预检没有任何可执行结果：不允许创建审批",
+                                      "blocking": [item.get("blocking") for item in stored]})
+        target = candidates[0]
+        try:
+            approval = publishing.build_approval(
+                preflight_result=target, actor=current_actor_label(), expires_in_seconds=request.expires_in_seconds,
+                confirmations=request.confirmations, scope=request.scope,
+            )
+        except publishing.PublishError as exc:
+            raise HTTPException(exc.status_code, exc.as_detail()) from exc
+        approval_id = str(uuid.uuid4())
+        expires_at = time.time() + request.expires_in_seconds
+        now = utc_now()
+        db.execute(
+            "INSERT INTO publish_approvals(id, owner_id, project_id, preflight_id, platform, account_id, "
+            "package_id, snapshot_hash, scope, binding, actor, expires_at, revoked_at, payload, payload_sha256, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+            (approval_id, owner_id, project_id, request.preflight_id, target["platform"],
+             target.get("account_id"), target["package_id"], approval["snapshot_hash"], request.scope,
+             _canonical_json_text(approval["binding"]), current_actor_label(), expires_at,
+             _canonical_json_text(approval), hashlib.sha256(_canonical_json_text(approval).encode()).hexdigest(),
+             now),
+        )
+    return {"id": approval_id, "expires_at": expires_at, **approval,
+            "note": "审批绑定包哈希/账号/平台/文案/可见性/声明与范围；任何绑定字段变化都会使审批失效"}
+
+
+@app.post("/api/v1/publishing/jobs", status_code=202)
+def create_publishing_job(request: PublishingJobRequest, response: Response, http_request: Request) -> dict:
+    """创建发布任务：审批 + 预检快照必须仍然一致；防重键 = 包版本 + 账号 + 发布意图。"""
+    owner_id, _, project_id = normalize_context_for_publishing()
+    gate = _idempotency_gate(http_request, "publishing.jobs.create", request.model_dump())
+    replay = gate.replay()
+    if replay is not None:
+        response.headers["Idempotency-Replayed"] = "true"
+        return replay
+    with connect() as db:
+        begin_immediate(db)
+        approval_row = db.execute(
+            "SELECT * FROM publish_approvals WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (request.approval_id, owner_id, project_id),
+        ).fetchone()
+        if not approval_row:
+            raise HTTPException(404, "审批不存在")
+        if approval_row["revoked_at"]:
+            raise HTTPException(409, {"code": "approval_revoked", "detail": "审批已撤销"})
+        if approval_row["expires_at"] is not None and float(approval_row["expires_at"]) <= time.time():
+            raise HTTPException(409, {"code": "approval_expired", "detail": "审批已过期：请重新预检并审批"})
+        package_row = db.execute(
+            "SELECT * FROM publish_packages WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (request.package_id, owner_id, project_id),
+        ).fetchone()
+        if not package_row:
+            raise HTTPException(404, "发布包不存在")
+        account_row = _account_row(db, owner_id, project_id, request.account_id)
+        package = _package_for_publishing(db, package_row)
+        platform = account_row["platform"]
+        connector = publishing_connectors.connector_status(platform, _connector_credentials(platform))
+        current_snapshot = publishing.preflight(
+            platform=platform, package=package,
+            account={"id": account_row["id"], "connected": account_row["disconnected_at"] is None,
+                     "authorization_status": account_row["authorization_status"],
+                     "capabilities_checked_at": account_row["capabilities_checked_at"],
+                     "revision": account_row["revision"]},
+            options=request.options, connector=connector,
+        )["snapshot"]
+        validity = publishing.approval_still_valid(
+            approval_binding=json.loads(approval_row["binding"]), current_snapshot=current_snapshot)
+        key = publishing.dedupe_key(package_version_id=package["version_id"], account_id=account_row["id"],
+                                    publish_intent_id=request.publish_intent_id)
+        existing = db.execute("SELECT * FROM publish_jobs WHERE dedupe_key = ?", (key,)).fetchone()
+        if existing:
+            return {"job": publishing.job_public(existing), "reused": True, "created": False,
+                    "note": "同一发布包版本 + 账号 + 意图已存在任务：用户需要再次发布时必须创建新的 intent"}
+        plan = publishing.submit_plan(connector=connector, package=package, options=request.options,
+                                      execution_key=key, approval=validity)
+        job_id = str(uuid.uuid4())
+        now = utc_now()
+        payload = {
+            "options": request.options, "visibility": current_snapshot["visibility"],
+            "connector": connector, "history": [{"state": plan["state"], "note": plan.get("note") or plan.get("detail"),
+                                                 "at": now}],
+            "submission_unknown": False, "blocked_reason": None if plan["accepted"] else plan.get("reason"),
+            "approval_snapshot_hash": approval_row["snapshot_hash"],
+        }
+        if not plan["accepted"]:
+            payload["blocked_reason"] = plan.get("reason")
+        blocked_detail = None if plan["accepted"] else str(plan.get("detail") or plan.get("reason") or "")
+        # 显式转成数据库可绑定类型（sqlite/psycopg 对非标量类型会直接报错）
+        values = tuple(
+            None if value is None else (value if isinstance(value, (int, float, str, bytes)) else str(value))
+            for value in (job_id, str(owner_id), str(project_id), str(platform), str(account_row["id"]),
+                          str(package_row["id"]), str(package["version_id"]), str(request.publish_intent_id),
+                          str(approval_row["id"]), str(key), str(plan["state"]), blocked_detail,
+                          _canonical_json_text(payload),
+                          hashlib.sha256(_canonical_json_text(payload).encode("utf-8")).hexdigest(), now, now)
+        )
+        db.execute(
+            "INSERT INTO publish_jobs(id, owner_id, project_id, platform, account_id, package_id, package_version_id, "
+            "publish_intent_id, approval_id, dedupe_key, state, external_publish_id, permalink_url, last_error, "
+            "attempt_count, payload, payload_sha256, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?)",
+            values,
+        )
+        row = db.execute("SELECT * FROM publish_jobs WHERE id = ?", (job_id,)).fetchone()
+        created = publishing.job_public(row, connector=connector)
+    result = {"job": created, "created": True, "reused": False, "submit_plan": plan,
+              "approval_valid": validity,
+              "note": ("提交只表示进入上传流程；连接器未配置时任务为 BLOCKED（不伪造发布成功）"
+                       if plan["accepted"] else "任务已创建但处于阻断状态：原因见 blocked_reason")}
+    gate.store(result, 202)
+    return result
+
+
+@app.get("/api/v1/publishing/jobs")
+def list_publishing_jobs(state: str = "", platform: str = "") -> list[dict]:
+    owner_id, _, project_id = normalize_context_for_publishing()
+    query = "SELECT * FROM publish_jobs WHERE owner_id = ? AND project_id = ?"
+    params: list = [owner_id, project_id]
+    if state:
+        query += " AND state = ?"
+        params.append(state)
+    if platform:
+        query += " AND platform = ?"
+        params.append(platform)
+    query += " ORDER BY created_at DESC LIMIT 200"
+    with connect() as db:
+        rows = db.execute(query, tuple(params)).fetchall()
+    return [publishing.job_public(row) for row in rows]
+
+
+@app.get("/api/v1/publishing/jobs/{job_id}")
+def get_publishing_job(job_id: str) -> dict:
+    owner_id, _, project_id = normalize_context_for_publishing()
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM publish_jobs WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (job_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "发布任务不存在")
+    connector = publishing_connectors.connector_status(row["platform"], _connector_credentials(row["platform"]))
+    return publishing.job_public(row, connector=connector)
+
+
+def _transition_publish_job(db, row, target: str, note: str, **updates) -> None:
+    publishing.check_transition(row["state"], target)
+    payload = json.loads(row["payload"])
+    payload = publishing.append_history(payload, target, note, utc_now())
+    payload["previous_state"] = row["state"]
+    fields = {"state": target, "payload": _canonical_json_text(payload), "updated_at": utc_now()}
+    fields.update(updates)
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    db.execute(f"UPDATE publish_jobs SET {assignments} WHERE id = ?", (*fields.values(), row["id"]))
+
+
+@app.post("/api/v1/publishing/jobs/{job_id}/reconcile")
+def reconcile_publishing_job(job_id: str) -> dict:
+    """对账：只查询既有提交，不发新帖；结果未知时保持 RECONCILING 而不是宣称成功。"""
+    owner_id, _, project_id = normalize_context_for_publishing()
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM publish_jobs WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (job_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "发布任务不存在")
+        connector = publishing_connectors.connector_status(row["platform"], _connector_credentials(row["platform"]))
+        if connector["status"] != "READY":
+            raise HTTPException(409, {"code": "connector_not_configured",
+                                      "detail": f"连接器未配置（缺少：{', '.join(connector['missing_requirements'])}）："
+                                                "无法查询上游状态"})
+        queried = publishing_connectors.query_publish(row["platform"], row["external_publish_id"],
+                                                     _connector_credentials(row["platform"]))
+        outcome = publishing.interpret_query(operation_handle=queried, platform=row["platform"])
+        _transition_publish_job(db, row, outcome["state"], outcome["note"],
+                                external_publish_id=outcome.get("external_publish_id"),
+                                permalink_url=outcome.get("permalink_url"))
+        updated = db.execute("SELECT * FROM publish_jobs WHERE id = ?", (job_id,)).fetchone()
+    return {**publishing.job_public(updated), "query": outcome,
+            "note": "对账只读取上游状态；没有公开链接时只保留平台 ID，不捏造 URL"}
+
+
+@app.post("/api/v1/publishing/jobs/{job_id}/retry")
+def retry_publishing_job(job_id: str, request: PublishingActionRequest) -> dict:
+    """重试：只对确定可安全重试的失败执行；提交结果未知时先对账。"""
+    owner_id, _, project_id = normalize_context_for_publishing()
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM publish_jobs WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (job_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "发布任务不存在")
+        payload = json.loads(row["payload"])
+        decision = publishing.retry_decision(
+            state=row["state"], failure_code=payload.get("failure_code"),
+            submission_unknown=bool(payload.get("submission_unknown")))
+        if not decision["retry"]:
+            raise HTTPException(409, {"code": decision["reason"], "detail": decision["note"]})
+        _transition_publish_job(db, row, "QUEUED", f"重试：{decision['reason']}（{request.reason}）",
+                                last_error=None, attempt_count=int(row["attempt_count"]) + 1)
+        updated = db.execute("SELECT * FROM publish_jobs WHERE id = ?", (job_id,)).fetchone()
+    return {**publishing.job_public(updated), "retry_decision": decision}
+
+
+@app.post("/api/v1/publishing/jobs/{job_id}/cancel")
+def cancel_publishing_job(job_id: str, request: PublishingActionRequest) -> dict:
+    """取消：显式返回上游支持程度；不支持时如实说明，不伪造取消成功。"""
+    owner_id, _, project_id = normalize_context_for_publishing()
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM publish_jobs WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (job_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "发布任务不存在")
+        capability = publishing.cancel_capability(row["platform"], row["state"])
+        if not capability["supported"]:
+            return {**publishing.job_public(row), "cancel": capability, "cancelled": False,
+                    "note": "上游不支持取消：任务状态保持不变（不伪造取消成功）"}
+        try:
+            outcome = publishing_connectors.cancel_publish(row["platform"], row["external_publish_id"],
+                                                          _connector_credentials(row["platform"]))
+        except publishing.PublishError as exc:
+            raise HTTPException(exc.status_code, exc.as_detail()) from exc
+        target = "CANCELLED" if outcome.get("cancelled") else "CANCEL_REQUESTED"
+        _transition_publish_job(db, row, target, outcome.get("note") or "已请求取消")
+        updated = db.execute("SELECT * FROM publish_jobs WHERE id = ?", (job_id,)).fetchone()
+    return {**publishing.job_public(updated), "cancel": capability, "cancelled": target == "CANCELLED",
+            "reason": request.reason, "upstream": outcome}
 
 
 class ProductionShotInput(BaseModel):

@@ -68,6 +68,17 @@ ROUTE_SCOPES: tuple[tuple[str, str, str], ...] = (
     ("POST", r"^/api/v1/batches/[^/]+/packages/archive$", "publish:write"),
     ("POST", r"^/api/v1/webhooks", "webhooks:manage"),
     ("GET", r"^/api/v1/webhooks", "webhooks:manage"),
+    # V6-10…15 发布面：读用 packages:read，写（授权/预检/审批/发布）用 publish:write
+    ("GET", r"^/api/v1/publishing/connectors$", "packages:read"),
+    ("GET", r"^/api/v1/publishing/accounts$", "packages:read"),
+    ("GET", r"^/api/v1/publishing/jobs", "packages:read"),
+    ("POST", r"^/api/v1/publishing/accounts/connect$", "publish:write"),
+    ("POST", r"^/api/v1/publishing/oauth/[^/]+/callback$", "publish:write"),
+    ("DELETE", r"^/api/v1/publishing/accounts/[^/]+$", "publish:write"),
+    ("POST", r"^/api/v1/publishing/preflight$", "publish:write"),
+    ("POST", r"^/api/v1/publishing/approvals$", "publish:write"),
+    ("POST", r"^/api/v1/publishing/jobs$", "publish:write"),
+    ("POST", r"^/api/v1/publishing/jobs/[^/]+/(reconcile|retry|cancel)$", "publish:write"),
 )
 
 # 必须带 Idempotency-Key 的自动化写入路径（创建付费任务/批次/发布）
@@ -77,6 +88,7 @@ REQUIRED_IDEMPOTENCY_ROUTES: tuple[tuple[str, str], ...] = (
     ("POST", r"^/api/v1/audio/previews$"),
     ("POST", r"^/api/v1/runs/[^/]+/packages$"),
     ("POST", r"^/api/v1/batches/[^/]+/packages/archive$"),
+    ("POST", r"^/api/v1/publishing/jobs$"),
 )
 
 OWNER_ONLY_PATHS = (r"^/api/v1/automation-keys",)

@@ -19,7 +19,7 @@ const navItems = [
   ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck],
   ["interaction", "人物互动", User], ["reference", "参考重演", VideoCamera],
   ["profiles", "平台配置", SquaresFour], ["batch", "批次生产", Queue],
-  ["audio", "音频与音乐", MonitorPlay], ["packages", "发布包", Package], ["costs", "成本与用量", Coins], ["automation", "自动化接入", Plug], ["webhooks", "事件与 Webhook", Bell], ["settings", "设置", Gear],
+  ["audio", "音频与音乐", MonitorPlay], ["packages", "发布包", Package], ["costs", "成本与用量", Coins], ["automation", "自动化接入", Plug], ["webhooks", "事件与 Webhook", Bell], ["publish", "发布与审批", UploadSimple], ["settings", "设置", Gear],
 ];
 const defaultShots = [
   { id: "shot_01", name: "正面推近", camera: "dolly_in", focal_length_mm: 35, duration_frames: 48 },
@@ -1787,6 +1787,243 @@ function ConsolePage() {
   </section>;
 }
 
+function PublishPage() {
+  const [connectors, setConnectors] = useState(null);
+  const [accounts, setAccounts] = useState([]);
+  const [jobs, setJobs] = useState([]);
+  const [packages, setPackages] = useState([]);
+  const [preflight, setPreflight] = useState(null);
+  const [approval, setApproval] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [form, setForm] = useState({
+    package_id: "", account_id: "", visibility: "", caption: "",
+    is_synthetic_media: true, is_branded_content: false, made_for_kids: false,
+  });
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { load(); }, []);
+  useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(null), 9000); return () => clearTimeout(timer); } }, [notice]);
+
+  async function load() {
+    const [c, a, j, p] = await Promise.all([
+      apiRequest("/publishing/connectors"), apiRequest("/publishing/accounts"),
+      apiRequest("/publishing/jobs"), apiRequest("/packages"),
+    ]);
+    if (c.ok) setConnectors(await c.json());
+    if (a.ok) setAccounts(await a.json());
+    if (j.ok) setJobs(await j.json());
+    if (p.ok) {
+      const body = await p.json();
+      setPackages(body);
+      const approved = body.find((item) => item.status === "APPROVED");
+      if (approved) setForm((value) => ({ ...value, package_id: value.package_id || approved.id }));
+    }
+  }
+  const connectorOf = (platform) => (connectors?.connectors || []).find((item) => item.platform === platform);
+  async function connect(platform) {
+    setBusy(true);
+    try {
+      const response = await apiRequest("/publishing/accounts/connect", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ platform, return_path: "/publish" }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "授权初始化失败");
+      setSelected(body);
+      setNotice([body.status === "READY" ? "success" : "warning",
+        body.status === "READY" ? "已生成官方授权链接：请在平台侧完成授权后回到本页" :
+          `未配置应用凭据：缺少 ${body.missing_credentials.join(", ")}（本产品不会生成假授权链接）`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function runPreflight() {
+    if (!form.package_id) { setNotice(["danger", "请选择发布包"]); return; }
+    setBusy(true);
+    try {
+      const options = buildOptions();
+      const response = await apiRequest("/publishing/preflight", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ package_ids: [form.package_id],
+                               account_ids: form.account_id ? [form.account_id] : [], options }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "预检失败");
+      setPreflight(body);
+      setApproval(null);
+      setNotice([body.executable_count ? "success" : "warning",
+        `预检完成：可执行 ${body.executable_count}，阻断 ${body.blocked_count}`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  function buildOptions() {
+    return {
+      visibility: form.visibility, caption: form.caption,
+      disclosures: { is_synthetic_media: form.is_synthetic_media, is_branded_content: form.is_branded_content,
+                     made_for_kids: form.made_for_kids },
+    };
+  }
+  async function createApproval() {
+    if (!preflight) { setNotice(["danger", "请先预检"]); return; }
+    setBusy(true);
+    try {
+      const response = await apiRequest("/publishing/approvals", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preflight_id: preflight.preflight_id,
+                               confirmations: { package_hash: true, account: true, visibility: true, disclosures: true },
+                               scope: "single_publish", expires_in_seconds: 3600 }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "审批失败");
+      setApproval(body);
+      setNotice(["success", `审批已创建（绑定快照 ${body.snapshot_hash.slice(0, 12)}…，1 小时后失效）`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function createJob() {
+    if (!approval) { setNotice(["danger", "请先创建审批"]); return; }
+    setBusy(true);
+    try {
+      const response = await apiRequest("/publishing/jobs", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approval_id: approval.id, package_id: form.package_id,
+                               account_id: form.account_id || accounts[0]?.id,
+                               publish_intent_id: `intent-${Date.now()}`, options: buildOptions() }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "提交失败");
+      setJobs((value) => [body.job, ...value]);
+      setNotice([body.job.state === "BLOCKED" ? "warning" : "success",
+        `发布任务已创建：${body.job.state}（提交成功 ≠ 已发布）`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function jobAction(job, action, body = {}) {
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/publishing/jobs/${job.id}/${action}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail?.detail || payload.detail || "操作失败");
+      setJobs((value) => value.map((item) => (item.id === job.id ? payload : item)));
+      setNotice([payload.cancelled === false && action === "cancel" ? "warning" : "success",
+        action === "cancel" ? (payload.cancelled ? "已取消" : "上游不支持取消（如实返回）")
+          : `${action} 完成：${payload.state}`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function disconnect(account) {
+    if (!window.confirm(`断开 ${account.display_name}？断开后未提交任务会被阻断。`)) return;
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/publishing/accounts/${account.id}`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason: "控制台断开" }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "断开失败");
+      setNotice(["warning", `已断开：阻断 ${body.blocked_active_jobs?.length || 0} 个在途任务`]);
+      await load();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+
+  const activeConnector = connectorOf(accounts.find((item) => item.id === form.account_id)?.platform
+    || accounts[0]?.platform || "tiktok");
+
+  return <section className="page">
+    <div className="page-head"><div><b>V6 PUBLISHING</b><h1>发布与审批</h1>
+      <p>选择已审批的包 → 预检 → 审批绑定快照 → 提交。提交成功不等于已发布：只有平台查询确认才标 PUBLISHED。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    <section className="card">
+      <div className="card-head"><div><h2>平台连接器</h2><small>{connectors?.note}</small></div></div>
+      <table className="table"><thead><tr><th>平台</th><th>状态</th><th>缺少的配置</th><th>Scope</th><th>取消</th><th /></tr></thead>
+        <tbody>{(connectors?.connectors || []).map((item) => <tr key={item.platform}>
+          <td>{item.display_name}<small><a href={item.docs} target="_blank" rel="noreferrer">官方资料笔记</a></small></td>
+          <td>{item.status === "READY" ? <Pill status="SUCCEEDED" /> : <Pill status="FAILED" />}</td>
+          <td><small>{item.missing_requirements.join(", ") || "—"}</small><small>{item.env_vars.join(" / ")}</small></td>
+          <td><small>{item.scopes.join(", ")}</small></td>
+          <td>{item.cancel_supported ? "支持" : <small>不支持（如实返回）</small>}</td>
+          <td><button onClick={() => connect(item.platform)} disabled={busy}>授权</button></td></tr>)}</tbody></table>
+      {selected && <div className="profile-detail"><dl>
+        <dt>授权状态</dt><dd>{selected.status}（缺少：{selected.missing_credentials.join(", ") || "无"}）</dd>
+        <dt>授权地址</dt><dd>{selected.url ? <a href={selected.url} target="_blank" rel="noreferrer">打开官方授权页</a> : "未配置凭据，不生成假链接"}</dd>
+        <dt>回调</dt><dd>{selected.parameters?.redirect_uri}</dd>
+        <dt>说明</dt><dd>{selected.note}</dd>
+      </dl></div>}
+      {!accounts.length && <p className="capability-note"><WarningCircle weight="fill" />还没有已授权账号：
+        四个默认连接器在没有真实授权时一律 BLOCKED，本产品不会把「打开平台网页」或「下载 MP4」当作一键发布完成。</p>}
+      <table className="table"><thead><tr><th>已授权账号</th><th>平台</th><th>授权</th><th>能力</th><th /></tr></thead>
+        <tbody>{accounts.map((item) => <tr key={item.id}>
+          <td>{item.display_name}<small>{item.account_ref}</small></td>
+          <td>{item.platform}</td>
+          <td>{item.connected ? <Pill status="SUCCEEDED" /> : <Pill status="FAILED" />}<small>{item.authorization_status}</small></td>
+          <td><small>{item.capabilities_checked_at ? "已实时查询" : "未查询（预检给 WARNING）"}</small></td>
+          <td>{item.connected ? <button onClick={() => disconnect(item)} disabled={busy}>断开</button> : null}</td></tr>)}</tbody></table>
+    </section>
+
+    <div className="two-col">
+      <section className="card">
+        <div className="card-head"><div><h2>预检与审批</h2><small>审批必须绑定预检快照哈希</small></div></div>
+        <div className="inline-fields">
+          <label>发布包<select value={form.package_id} onChange={(event) => setForm({ ...form, package_id: event.target.value })}>
+            <option value="">选择已审批的包</option>
+            {packages.map((item) => <option value={item.id} key={item.id}>{item.id.slice(0, 8)} · {item.locale} · {item.status}</option>)}</select></label>
+          <label>账号<select value={form.account_id} onChange={(event) => setForm({ ...form, account_id: event.target.value })}>
+            <option value="">（未授权账号）</option>
+            {accounts.filter((item) => item.connected).map((item) => <option value={item.id} key={item.id}>{item.platform} · {item.display_name}</option>)}</select></label>
+          <label>可见性<select value={form.visibility} onChange={(event) => setForm({ ...form, visibility: event.target.value })}>
+            <option value="">请选择</option>
+            {(activeConnector?.limits?.visibility_options || []).map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
+          <label>文案<input value={form.caption} onChange={(event) => setForm({ ...form, caption: event.target.value })} /></label>
+        </div>
+        <div className="scope-grid">
+          <label className="checkbox-line"><input type="checkbox" checked={form.is_synthetic_media}
+            onChange={() => setForm({ ...form, is_synthetic_media: !form.is_synthetic_media })} /><span>合成/AI 素材声明</span></label>
+          <label className="checkbox-line"><input type="checkbox" checked={form.is_branded_content}
+            onChange={() => setForm({ ...form, is_branded_content: !form.is_branded_content })} /><span>品牌合作内容</span></label>
+          <label className="checkbox-line"><input type="checkbox" checked={form.made_for_kids}
+            onChange={() => setForm({ ...form, made_for_kids: !form.made_for_kids })} /><span>面向儿童</span></label>
+        </div>
+        <div className="action-row">
+          <button onClick={runPreflight} disabled={busy}><ListChecks />预检</button>
+          <button onClick={createApproval} disabled={busy || !preflight}><CheckCircle />创建审批</button>
+          <button className="primary" onClick={createJob} disabled={busy || !approval}><UploadSimple />提交发布意图</button>
+        </div>
+        {preflight && <table className="table"><thead><tr><th>平台</th><th>可执行</th><th>阻断</th><th>快照</th></tr></thead>
+          <tbody>{preflight.results.map((item, index) => <tr key={`${item.platform}-${index}`}>
+            <td>{item.platform || "—"}</td>
+            <td>{item.executable ? <Pill status="SUCCEEDED" /> : <Pill status="FAILED" />}</td>
+            <td><small>{item.blocking.map((entry) => entry.code).join(", ") || "无"}</small></td>
+            <td><small>{item.snapshot_hash ? `${item.snapshot_hash.slice(0, 10)}…` : "—"}</small></td></tr>)}</tbody></table>}
+        {approval && <p className="capability-note"><CheckCircle weight="fill" />审批 {approval.id.slice(0, 8)} 绑定快照
+          {approval.snapshot_hash.slice(0, 12)}…，范围 {approval.scope}；任何绑定字段变化都会使审批失效。</p>}
+        {preflight?.results?.[0]?.snapshot && <div className="profile-detail"><dl>
+          <dt>平台规则</dt><dd>{activeConnector?.limits?.aspect_hint || "—"}</dd>
+          <dt>未确认限制</dt><dd>{(activeConnector?.unconfirmed_limits || []).join("；") || "无"}</dd>
+          <dt>文档</dt><dd>{activeConnector?.docs}</dd>
+        </dl></div>}
+      </section>
+
+      <section className="card">
+        <div className="card-head"><div><h2>发布任务</h2><small>{jobs.length} 个</small></div></div>
+        <table className="table"><thead><tr><th>任务</th><th>平台</th><th>状态</th><th>平台 ID</th><th /></tr></thead>
+          <tbody>{jobs.map((item) => <tr key={item.id}>
+            <td>{item.id.slice(0, 8)}<small>{item.visibility || "—"} · 尝试 {item.attempt_count}</small></td>
+            <td>{item.platform}</td>
+            <td>{item.state}{item.blocked_reason ? <small>{item.blocked_reason}</small> : null}
+              {item.last_error ? <small>{String(item.last_error).slice(0, 40)}</small> : null}</td>
+            <td><small>{item.external_publish_id || "—"}</small>
+              {item.permalink_url ? <a href={item.permalink_url} target="_blank" rel="noreferrer">链接</a> : null}</td>
+            <td><div className="action-row">
+              <button onClick={() => jobAction(item, "reconcile")} disabled={busy}>对账</button>
+              <button onClick={() => jobAction(item, "cancel", { reason: "控制台取消" })} disabled={busy}>取消</button></div></td></tr>)}</tbody></table>
+        {!jobs.length && <p className="capability-note">还没有发布任务：需要先有已审批的包与已授权账号。</p>}
+        <ul className="notes">
+          <li>提交成功只是进入上传队列；上传完成与平台处理完成都不等于已发布</li>
+          <li>结果未知时任务进入 RECONCILING：先对账，不重复提交（防重复发布）</li>
+          <li>取消支持程度按平台如实返回；不支持取消的平台不会被伪装成已取消</li>
+          <li>拿不到公开链接时只保留平台 ID，不捏造 URL</li>
+        </ul>
+      </section>
+    </div>
+  </section>;
+}
+
 function ReferencePage() {
   const [references, setReferences] = useState([]);
   const [versions, setVersions] = useState([]);
@@ -2128,7 +2365,7 @@ export function App() {
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "console" ? <ConsolePage /> : active === "costs" ? <CostPage /> : active === "automation" ? <AutomationPage /> : active === "webhooks" ? <WebhookPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "console" ? <ConsolePage /> : active === "costs" ? <CostPage /> : active === "automation" ? <AutomationPage /> : active === "webhooks" ? <WebhookPage /> : active === "publish" ? <PublishPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">

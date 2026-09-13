@@ -739,3 +739,86 @@ CREATE TABLE IF NOT EXISTS dead_letter_events (
 );
 -- V6-09：端点默认不回填历史事件（避免新端点被历史事件洪水拖慢新事件投递）
 ALTER TABLE webhook_endpoints ADD COLUMN IF NOT EXISTS backfill_history INTEGER NOT NULL DEFAULT 0;
+
+-- V6-10…15：发布框架（账号授权、OAuth state、预检、审批、发布任务）
+CREATE TABLE IF NOT EXISTS connected_accounts (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  account_ref TEXT NOT NULL,
+  display_name TEXT NOT NULL DEFAULT '',
+  credential_ref TEXT NOT NULL DEFAULT '',
+  scopes TEXT NOT NULL DEFAULT '',
+  capabilities TEXT NOT NULL DEFAULT '',
+  authorization_status TEXT NOT NULL DEFAULT 'CONNECTED',
+  capabilities_checked_at TEXT,
+  connected_at TEXT NOT NULL,
+  disconnected_at TEXT,
+  disconnect_reason TEXT NOT NULL DEFAULT '',
+  revision INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_states (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  state TEXT NOT NULL UNIQUE,
+  code_verifier TEXT NOT NULL,
+  return_path TEXT NOT NULL DEFAULT '/',
+  created_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS publish_preflights (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS publish_approvals (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  preflight_id TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  account_id TEXT,
+  package_id TEXT NOT NULL,
+  snapshot_hash TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'single_publish',
+  binding TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  expires_at DOUBLE PRECISION,
+  revoked_at TEXT,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS publish_jobs (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  package_id TEXT NOT NULL,
+  package_version_id TEXT NOT NULL,
+  publish_intent_id TEXT NOT NULL,
+  approval_id TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL,
+  external_publish_id TEXT,
+  permalink_url TEXT,
+  last_error TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
