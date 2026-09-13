@@ -527,6 +527,14 @@ def initialize_db() -> None:
               updated_at TEXT NOT NULL,
               UNIQUE (reference_id, revision)
             );
+            CREATE TABLE IF NOT EXISTS reference_mappings (
+              id TEXT PRIMARY KEY,
+              plan_id TEXT NOT NULL,
+              analysis_id TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
             """
     with connect() as db:
         db.executescript(schema_sql)
@@ -5671,6 +5679,11 @@ def analyze_reference(reference_id: str, request: ReferenceAnalyzeRequest | None
         payload = reference_analysis.segment_reference(
             proxy_path, json.loads(reference["payload"]).get("timebase", {}).get("fps")
         )
+        observations = reference_analysis.segment_observations(
+            proxy_path, payload["segments"], VAR / "references" / reference_id
+        )
+        for segment in payload["segments"]:
+            segment["observations"] = observations.get(segment["index"], {})
     except Exception as exc:
         raise HTTPException(422, f"切镜分析失败: {exc}") from exc
     payload["scope"] = request.scope
@@ -5775,6 +5788,176 @@ def approve_reference_analysis(analysis_id: str) -> dict:
         )
         updated = db.execute("SELECT * FROM reference_analyses WHERE id = ?", (analysis_id,)).fetchone()
     return _reference_analysis_public(updated)
+
+
+# ---------------------------------------------------------------------------
+# V5-04：ReferenceMapping 与从参考生成目标计划
+# ---------------------------------------------------------------------------
+
+V5_REUSE_DIMENSIONS = {"duration", "shot_size", "composition", "motion_direction", "action_rhythm", "transition"}
+V5_MOTION_TO_CAMERA = {"static": "static", "moving": "side_track"}
+
+
+class FromReferenceRequest(BaseModel):
+    analysis_id: str = Field(min_length=1, max_length=80)
+    product_version_id: str = Field(min_length=1, max_length=80)
+    selected_dimensions: list[str] = Field(min_length=1, max_length=8)
+    notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_dimensions(self):
+        unknown = [item for item in self.selected_dimensions if item not in V5_REUSE_DIMENSIONS]
+        if unknown:
+            raise ValueError(f"未知复用维度: {unknown}（可用: {sorted(V5_REUSE_DIMENSIONS)}）")
+        return self
+
+
+@app.post("/api/v1/projects/{project_id}/plans/from-reference", status_code=201)
+def create_plan_from_reference(project_id: str, request: FromReferenceRequest) -> dict:
+    """把已批准的分析分段映射为本产品可执行 DirectorPlan（适配规划 + 能力校验）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, project_id)
+    with connect() as db:
+        analysis = db.execute("SELECT * FROM reference_analyses WHERE id = ?", (request.analysis_id,)).fetchone()
+        if not analysis:
+            raise HTTPException(404, "分析不存在")
+        if analysis["status"] != "APPROVED":
+            raise HTTPException(409, "必须使用已批准的分析版本")
+        reference = db.execute(
+            "SELECT * FROM reference_assets WHERE id = ?", (analysis["reference_id"],),
+        ).fetchone()
+        version = load_product_version_for_owner(request.product_version_id, owner_id, project_id)
+    if reference["owner_id"] != owner_id:
+        raise HTTPException(403, "参考视频不属于当前 Owner")
+    analysis_payload = json.loads(analysis["payload"])
+    segments = analysis_payload.get("segments", [])
+    if not segments:
+        raise HTTPException(409, "分析没有可用分段")
+    asset_id = version["product_asset_id"]
+    # 适配规划：源分段 → 可执行 Shot（保留时长按目标 fps 量化为整帧，误差记录在映射中）
+    shots = []
+    mapping_shots = []
+    total_duration_error_frames = 0.0
+    total_frames = 0
+    for index, segment in enumerate(segments):
+        start_s = float(segment["start_s"])
+        end_s = segment["end_s"]
+        source_duration_s = (float(end_s) - start_s) if end_s is not None else 1.0
+        duration_frames = max(24, int(round(source_duration_s * DEFAULT_FPS)))
+        duration_error_frames = duration_frames - source_duration_s * DEFAULT_FPS
+        total_duration_error_frames += duration_error_frames
+        total_frames += duration_frames
+        observations = segment.get("observations", {})
+        motion = (observations.get("motion_type") or {}).get("value") or "static"
+        camera = V5_MOTION_TO_CAMERA.get(motion, "static")
+        transition = segment.get("transition_in")
+        shots.append({
+            "id": f"shot_{index + 1:02d}",
+            "name": f"参考重演 {index + 1}",
+            "camera": camera,
+            "focal_length_mm": 35,
+            "duration_frames": duration_frames,
+        })
+        mapping_shots.append({
+            "source_segment_index": segment["index"],
+            "source_range_s": [round(start_s, 3), round(end_s, 3) if end_s is not None else None],
+            "target_shot_id": f"shot_{index + 1:02d}",
+            "target_frames": [1 + (total_frames - duration_frames), total_frames],
+            "kept_dimensions": sorted(set(request.selected_dimensions) & {"duration", "motion_direction", "transition"}),
+            "changed_dimensions": ["shot_size", "composition", "action_rhythm"],
+            "unsupported_dimensions": [item for item in request.selected_dimensions if item in {"shot_size", "action_rhythm"}],
+            "duration_source_s": round(source_duration_s, 3),
+            "duration_target_frames": duration_frames,
+            "duration_error_frames": round(duration_error_frames, 2),
+            "motion_type": motion,
+            "camera": camera,
+        })
+    plan_id = str(uuid.uuid4())
+    created = utc_now()
+    payload = {
+        "schema_version": "1.0",
+        "product_asset_id": asset_id,
+        "intent": f"参考重演：{reference['id'][:8]}（{len(segments)} 段）",
+        "output": {"width": 540, "height": 960, "fps": DEFAULT_FPS,
+                   "duration_seconds": round(total_frames / DEFAULT_FPS, 2), "frame_count": total_frames},
+        "fidelity_mode": "STRICT_REQUESTED",
+        "shots": shots,
+        "from_reference": {"analysis_id": analysis["id"], "reference_id": reference["id"]},
+    }
+    mapping_payload = {
+        "schema_version": "1.0",
+        "plan_id": plan_id,
+        "analysis_id": analysis["id"],
+        "analysis_revision": analysis["revision"],
+        "selected_dimensions": request.selected_dimensions,
+        "shots": mapping_shots,
+        "total_frames": total_frames,
+        "total_duration_error_frames": round(total_duration_error_frames, 2),
+        "capability_notes": [
+            "单目视频不恢复焦距/相机路径；运动类型为启发式推断，低置信度已在分析中标记",
+            "shot_size/action_rhythm 无主体检测模型，未复用（unsupported）",
+            "品牌/人物身份/音乐/逐字文案默认不复用",
+        ],
+        "notes": request.notes,
+    }
+    with connect() as db:
+        begin_immediate(db)
+        _, payload_sha256 = plan_contract_payload_hash(payload)
+        product_version_id = create_product_version(asset_id, owner_id, project_id, payload_sha256, db)
+        db.execute(
+            "INSERT INTO plans VALUES (?, ?, ?, ?, 0, ?)",
+            (plan_id, asset_id, payload["intent"], json.dumps(payload, ensure_ascii=False), created),
+        )
+        contract = upsert_plan_contract(plan_id, product_version_id, payload, db=db)
+        mapping_text = _canonical_json_text(mapping_payload)
+        mapping_id = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO reference_mappings(id, plan_id, analysis_id, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (mapping_id, plan_id, analysis["id"], mapping_text,
+             hashlib.sha256(mapping_text.encode("utf-8")).hexdigest(), created),
+        )
+    return {
+        "id": plan_id,
+        "approved": False,
+        "created_at": created,
+        "contract_id": contract["contract_id"],
+        "product_version_id": product_version_id,
+        "schema_version": "1.0",
+        "product_asset_id": asset_id,
+        "intent": payload["intent"],
+        "output": payload["output"],
+        "shots": shots,
+        "reference_mapping_id": mapping_id,
+        "reference_mapping": mapping_payload,
+    }
+
+
+@app.get("/api/v1/plans/{plan_id}/reference-mapping")
+def get_plan_reference_mapping(plan_id: str) -> dict:
+    """来源与目标时间映射（冻结引用）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        plan = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if not plan:
+            raise HTTPException(404, "计划不存在")
+        row = db.execute(
+            "SELECT * FROM reference_mappings WHERE plan_id = ? ORDER BY created_at DESC LIMIT 1",
+            (plan_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "该计划没有参考映射")
+    with connect() as db:
+        analysis = db.execute("SELECT reference_id FROM reference_analyses WHERE id = ?", (row["analysis_id"],)).fetchone()
+    if analysis:
+        _load_reference_owned(analysis["reference_id"], owner_id, project_id)
+    return {
+        "id": row["id"],
+        "plan_id": row["plan_id"],
+        "analysis_id": row["analysis_id"],
+        "payload_sha256": row["payload_sha256"],
+        "created_at": row["created_at"],
+        "mapping": json.loads(row["payload"]),
+    }
 
 
 # ---------------------------------------------------------------------------

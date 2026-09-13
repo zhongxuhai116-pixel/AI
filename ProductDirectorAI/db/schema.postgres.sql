@@ -323,3 +323,12 @@ CREATE TABLE IF NOT EXISTS reference_analyses (
   updated_at TEXT NOT NULL,
   UNIQUE (reference_id, revision)
 );
+
+CREATE TABLE IF NOT EXISTS reference_mappings (
+  id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL REFERENCES plans(id),
+  analysis_id TEXT NOT NULL REFERENCES reference_analyses(id),
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
