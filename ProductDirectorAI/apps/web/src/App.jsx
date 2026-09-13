@@ -17,7 +17,9 @@ const navItems = [
   ["director", "导演台", SlidersHorizontal], ["storyboard", "分镜", FilmSlate],
   ["preview", "3D 预演", MonitorPlay], ["jobs", "渲染任务", Queue],
   ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck],
-  ["interaction", "人物互动", User], ["reference", "参考重演", VideoCamera], ["settings", "设置", Gear],
+  ["interaction", "人物互动", User], ["reference", "参考重演", VideoCamera],
+  ["profiles", "平台配置", SquaresFour], ["batch", "批次生产", Queue],
+  ["audio", "音频与音乐", MonitorPlay], ["packages", "发布包", Package], ["settings", "设置", Gear],
 ];
 const defaultShots = [
   { id: "shot_01", name: "正面推近", camera: "dolly_in", focal_length_mm: 35, duration_frames: 48 },
@@ -561,6 +563,610 @@ const reuseDimensions = [
 ];
 const cameraLabelsV5 = { static: "Static · 定格", side_track: "Side Track · 侧移", dolly_in: "Dolly In · 推近", hero_orbit: "Hero Orbit · 环绕" };
 
+function ProfilePage() {
+  const [profiles, setProfiles] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [versions, setVersions] = useState([]);
+  const [validation, setValidation] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [output, setOutput] = useState({ width: 540, height: 960, fps: 24, frame_count: 144 });
+
+  useEffect(() => { refresh(); }, []);
+  useEffect(() => { if (selected) loadDetail(selected); }, [selected]);
+  useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(null), 6000); return () => clearTimeout(timer); } }, [notice]);
+
+  async function refresh() {
+    const response = await apiRequest("/platform-profiles");
+    if (response.ok) {
+      const body = await response.json();
+      setProfiles(body);
+      if (!selected && body.length) setSelected(body[0].profile_key);
+    }
+  }
+  async function loadDetail(profileId) {
+    const [detailResponse, versionsResponse] = await Promise.all([
+      apiRequest(`/platform-profiles/${profileId}`),
+      apiRequest(`/platform-profiles/${profileId}/versions`),
+    ]);
+    setValidation(null);
+    if (detailResponse.ok) setDetail(await detailResponse.json());
+    if (versionsResponse.ok) setVersions(await versionsResponse.json());
+  }
+  async function validateWithOutput() {
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/platform-profiles/${selected}/validate`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ output }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || "校验失败");
+      setValidation(body);
+      setNotice([body.valid ? "success" : "danger",
+        body.valid ? "规格与成片兼容性校验通过" : `存在 ${body.blocking.length} 个阻断项`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function validateAccount() {
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/platform-profiles/${selected}/validate`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account_id: "demo-account" }),
+      });
+      const body = await response.json();
+      setValidation(body);
+      setNotice(["warning", `账号能力：${body.account.status}（${body.account.reason}）`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+
+  return <section className="page">
+    <div className="page-head"><div><b>V6 PLATFORM PROFILES</b><h1>平台配置</h1><p>Profile 是生产与导出的版本化配置；选择它不代表账号存在，也不代表已核验平台规则。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    <div className="two-col">
+      <section className="card">
+        <div className="card-head"><div><h2>导出 Profile</h2><span className="count">{profiles.length}</span></div><button onClick={refresh}><ArrowClockwise /></button></div>
+        <div className="table-wrap"><table><thead><tr><th>名称</th><th>平台</th><th>比例 / 分辨率</th><th>语言</th><th>规则</th><th>校验</th></tr></thead>
+          <tbody>{profiles.map((item) => <tr key={item.id} className={selected === item.profile_key ? "selected" : ""}
+            onClick={() => setSelected(item.profile_key)} style={{ cursor: "pointer" }}>
+            <td>{item.name}<small>v{item.version}</small></td>
+            <td>{item.platform}</td>
+            <td>{item.aspect_ratio} · {item.resolution}</td>
+            <td>{item.locale}</td>
+            <td><code>{item.rules_status.status}</code></td>
+            <td>{item.valid ? <Pill status="SUCCEEDED" /> : <Pill status="QA_REJECTED" />}
+              {item.warning_count > 0 && <small> {item.warning_count} 警告</small>}</td>
+          </tr>)}</tbody></table></div>
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>规格与校验</h2>{detail && <small>{detail.profile.profile_key}</small>}</div></div>
+        {detail && <div className="profile-detail">
+          <dl>
+            <dt>市场</dt><dd>{detail.spec.market.region} · {detail.spec.market.locale} · {detail.spec.market.timezone}</dd>
+            <dt>视频</dt><dd>{detail.spec.video.width}×{detail.spec.video.height} · {detail.spec.video.fps}fps · {detail.spec.video.duration_min_seconds}–{detail.spec.video.duration_max_seconds}s</dd>
+            <dt>构图</dt><dd>{detail.spec.composition.aspect_ratio} · {detail.spec.composition.crop_policy}</dd>
+            <dt>字幕</dt><dd>{detail.spec.subtitles.enabled ? `${detail.spec.subtitles.sidecar_formats.join("/")} · ${detail.spec.subtitles.font_ref}` : "未启用"}</dd>
+            <dt>配音</dt><dd>{detail.spec.voice.enabled ? `${detail.spec.voice.locale} · ${detail.spec.voice.voice_ref}` : "未启用（无 Provider 时显式关闭）"}</dd>
+            <dt>BGM</dt><dd>{detail.spec.music.enabled ? `许可：${detail.spec.music.license_ref}` : "未启用"}</dd>
+            <dt>硬限制</dt><dd>{detail.spec.video.hard_limits.length ? detail.spec.video.hard_limits.length : "未核验（不写成平台事实）"}</dd>
+          </dl>
+          <div className="qa-pick">
+            <label>成片兼容性校验（用真实输出规格）</label>
+            <div className="inline-fields">
+              <input type="number" value={output.width} onChange={(event) => setOutput({ ...output, width: Number(event.target.value) })} />
+              <input type="number" value={output.height} onChange={(event) => setOutput({ ...output, height: Number(event.target.value) })} />
+              <input type="number" value={output.frame_count} onChange={(event) => setOutput({ ...output, frame_count: Number(event.target.value) })} />
+            </div>
+          </div>
+          <div className="action-row">
+            <button className="primary" disabled={busy} onClick={validateWithOutput}><ShieldCheck />校验规格 + 成片</button>
+            <button disabled={busy} onClick={validateAccount}>查询账号能力</button>
+          </div>
+          {validation && <div className="validation">
+            <p><b>{validation.valid ? "通过" : "阻断"}</b> · 阻断 {validation.blocking.length} · 警告 {validation.warnings.length}</p>
+            {validation.blocking.map((item, index) => <p className="validation-fail" key={index}><WarningCircle weight="fill" />{item.message}</p>)}
+            {validation.warnings.map((item, index) => <p className="capability-note" key={index}><WarningCircle weight="fill" />{item.message}</p>)}
+            {validation.account && <p className="capability-note"><WarningCircle weight="fill" />账号：{validation.account.status} · {validation.account.reason}</p>}
+          </div>}
+          <h3>版本历史</h3>
+          <div className="table-wrap"><table><thead><tr><th>版本</th><th>hash</th><th>创建时间</th></tr></thead>
+            <tbody>{versions.map((item) => <tr key={item.id}><td>v{item.version}</td><td><code>{item.payload_sha256.slice(0, 16)}…</code></td><td>{formatTime(item.created_at)}</td></tr>)}</tbody></table></div>
+        </div>}
+      </section>
+    </div>
+  </section>;
+}
+
+function BatchPage() {
+  const [plans, setPlans] = useState([]);
+  const [profiles, setProfiles] = useState([]);
+  const [batches, setBatches] = useState([]);
+  const [form, setForm] = useState({ plan_id: "", profile_ids: [], variations: 2, max_concurrent: 2 });
+  const [preview, setPreview] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [items, setItems] = useState([]);
+  const [summary, setSummary] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    Promise.all([apiRequest("/plans"), apiRequest("/platform-profiles"), apiRequest("/batches")]).then(async ([p, f, b]) => {
+      if (p.ok) { const body = await p.json(); setPlans(body.filter((item) => item.approved)); }
+      if (f.ok) setProfiles(await f.json());
+      if (b.ok) setBatches(await b.json());
+    });
+  }, []);
+  useEffect(() => { if (selected) loadItems(selected); }, [selected]);
+  useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(null), 6000); return () => clearTimeout(timer); } }, [notice]);
+  useEffect(() => {
+    if (!selected) return;
+    const timer = setInterval(() => loadItems(selected), 8000);
+    return () => clearInterval(timer);
+  }, [selected]);
+
+  async function refreshBatches() {
+    const response = await apiRequest("/batches");
+    if (response.ok) setBatches(await response.json());
+  }
+  async function loadItems(batchId) {
+    const [itemsResponse, batchResponse] = await Promise.all([
+      apiRequest(`/batches/${batchId}/items`),
+      apiRequest(`/batches/${batchId}`),
+    ]);
+    if (itemsResponse.ok) { const body = await itemsResponse.json(); setItems(body.items); setSummary(body.summary); }
+    if (batchResponse.ok) {
+      const body = await batchResponse.json();
+      setBatches((list) => list.map((item) => item.id === body.id ? body : item));
+    }
+  }
+  function matrixPayload() {
+    return {
+      product_version_ids: form.product_version_ids,
+      plan_ids: form.plan_id ? [form.plan_id] : [],
+      profile_ids: form.profile_ids,
+      variations_per_combination: form.variations,
+    };
+  }
+  async function runPreview() {
+    setBusy(true);
+    try {
+      const response = await apiRequest("/batches/preview", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ matrix: matrixPayload(), max_concurrent: form.max_concurrent }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "预览失败");
+      setPreview(body);
+      setNotice(["success", `将展开 ${body.expanded_count} 项（服务端计算）`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function createBatch() {
+    setBusy(true);
+    try {
+      const response = await apiRequest("/batches", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: `批次 ${new Date().toLocaleString("zh-CN")}`, matrix: matrixPayload(),
+          max_concurrent: form.max_concurrent,
+          idempotency_key: `ui-${Date.now()}`,
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "创建失败");
+      setNotice(["success", `批次已创建（${body.batch.summary.total} 项）`]);
+      setSelected(body.batch.id);
+      refreshBatches();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function batchAction(action, extra = {}) {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/batches/${selected}/${action}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "控制台操作", ...extra }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "操作失败");
+      setNotice(["success", `${action} 完成`]);
+      loadItems(selected);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function packageSelectedPlanVersion() {
+    // 取计划绑定的产品版本用于矩阵（避免让用户手填 UUID）
+    const response = await apiRequest(`/plans/${form.plan_id}/contracts`);
+    if (!response.ok) return;
+    const contracts = await response.json();
+    if (contracts.length) setForm({ ...form, product_version_ids: [contracts[0].product_version_id] });
+  }
+  useEffect(() => { if (form.plan_id && !form.product_version_ids?.length) packageSelectedPlanVersion(); }, [form.plan_id]);
+
+  const active = batches.find((item) => item.id === selected);
+
+  return <section className="page">
+    <div className="page-head"><div><b>V6 BATCH PRODUCTION</b><h1>批次生产</h1><p>矩阵展开数量由服务端给出；每项独立 Run，单项失败不影响其他项；暂停只停新调度。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    <div className="two-col">
+      <section className="card">
+        <div className="card-head"><div><h2>新建批次</h2></div></div>
+        <div className="qa-pick">
+          <label>已批准计划</label>
+          <select value={form.plan_id} onChange={(event) => setForm({ ...form, plan_id: event.target.value })}>
+            <option value="">选择计划…</option>
+            {plans.map((item) => <option key={item.id} value={item.id}>{item.intent?.slice(0, 34)} · {item.id.slice(0, 8)}</option>)}
+          </select>
+        </div>
+        <div className="qa-pick">
+          <label>Profile（可多选）</label>
+          <div className="reuse-dimensions">{profiles.map((item) => <label key={item.id}>
+            <input type="checkbox" checked={form.profile_ids.includes(item.profile_key)}
+              onChange={() => setForm({
+                ...form,
+                profile_ids: form.profile_ids.includes(item.profile_key)
+                  ? form.profile_ids.filter((key) => key !== item.profile_key)
+                  : [...form.profile_ids, item.profile_key],
+              })} />{item.aspect_ratio} · {item.locale}</label>)}</div>
+        </div>
+        <div className="qa-pick"><label>每组合变体数 / 并发上限</label>
+          <div className="inline-fields">
+            <input type="number" min="1" max="20" value={form.variations}
+              onChange={(event) => setForm({ ...form, variations: Number(event.target.value) })} />
+            <input type="number" min="1" max="8" value={form.max_concurrent}
+              onChange={(event) => setForm({ ...form, max_concurrent: Number(event.target.value) })} />
+          </div>
+        </div>
+        <div className="action-row">
+          <button disabled={busy || !form.plan_id || !form.profile_ids.length} onClick={runPreview}><MagnifyingGlass />预览展开</button>
+          <button className="primary" disabled={busy || !preview} onClick={createBatch}><Play weight="fill" />创建并开始</button>
+        </div>
+        {preview && <div className="mapping-diff">
+          <h3>预览结果（无副作用）</h3>
+          <p><b>展开 {preview.expanded_count} 项</b> · 上限 {preview.limits.max_expanded_items} · 并发 {preview.limits.max_concurrent}</p>
+          {preview.duplicates.length > 0 && preview.duplicates.map((item, index) =>
+            <p className="capability-note" key={index}><WarningCircle weight="fill" />第 {item.index + 1} 项与第 {item.duplicate_of + 1} 项重复：{item.detail}</p>)}
+          <div className="table-wrap"><table><thead><tr><th>#</th><th>Profile</th><th>变体</th><th>种子</th></tr></thead>
+            <tbody>{preview.items.slice(0, 12).map((item) => <tr key={item.index}><td>{item.index + 1}</td><td>{item.profile_id}</td><td>#{item.variation}</td><td><code>{item.seed}</code></td></tr>)}</tbody></table></div>
+        </div>}
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>批次列表</h2><span className="count">{batches.length}</span></div><button onClick={refreshBatches}><ArrowClockwise /></button></div>
+        <div className="table-wrap"><table><thead><tr><th>批次</th><th>状态</th><th>总数</th><th>成功/失败</th></tr></thead>
+          <tbody>{batches.map((item) => <tr key={item.id} className={selected === item.id ? "selected" : ""} onClick={() => setSelected(item.id)} style={{ cursor: "pointer" }}>
+            <td>{item.name}<small>{item.id.slice(0, 8)}</small></td>
+            <td><Pill status={batchPill(item.status)} /></td>
+            <td>{item.summary.total}</td>
+            <td>{item.summary.succeeded} / {item.summary.failed}</td>
+          </tr>)}</tbody></table></div>
+        {active && <div className="batch-detail">
+          <div className="action-row">
+            <button disabled={busy || active.paused} onClick={() => batchAction("pause")}>暂停新调度</button>
+            <button disabled={busy || !active.paused} onClick={() => batchAction("resume")}>恢复</button>
+            <button disabled={busy} onClick={() => batchAction("cancel", { scope: "not_started" })}>取消未开始</button>
+            <button disabled={busy} onClick={() => batchAction("cancel", { scope: "all_unfinished" })}>取消全部未完成</button>
+            <button disabled={busy} onClick={() => batchAction("retry-failed")}>重试失败项</button>
+          </div>
+          {summary && <p>总数 {summary.total} · 成功 {summary.succeeded} · 失败 {summary.failed} · 取消 {summary.cancelled} · 进行 {summary.active} · 待开始 {summary.pending}
+            {summary.production_complete && " · 生产完成"}</p>}
+          <div className="table-wrap"><table><thead><tr><th>#</th><th>状态</th><th>Profile</th><th>变体</th><th>Run</th><th>错误</th></tr></thead>
+            <tbody>{items.map((item) => <tr key={item.id}><td>{item.index + 1}</td><td><Pill status={itemPill(item.status)} /></td>
+              <td>{item.profile_id}</td><td>#{item.variation}</td>
+              <td>{item.run_id ? <code>{String(item.run_id).slice(0, 8)}</code> : "—"}</td>
+              <td>{item.error ? <small className="validation-fail">{item.error}</small> : "—"}</td></tr>)}</tbody></table></div>
+        </div>}
+      </section>
+    </div>
+  </section>;
+}
+
+function batchPill(status) {
+  return { COMPLETED: "SUCCEEDED", RUNNING: "RUNNING", QUEUED: "QUEUED", PAUSED: "CANCELLED",
+    PARTIAL_FAILED: "FAILED", FAILED: "FAILED", CANCELLED: "CANCELLED", DRAFT: "DRAFT",
+    WAITING_REVIEW: "VERIFICATION_PASSED" }[status] || "DRAFT";
+}
+function itemPill(status) {
+  return { SUCCEEDED: "SUCCEEDED", FAILED: "FAILED", RUNNING: "RUNNING", QUEUED: "QUEUED",
+    CANCELLED: "CANCELLED", PENDING: "DRAFT", SKIPPED: "DRAFT" }[status] || "DRAFT";
+}
+
+function AudioPage() {
+  const [engines, setEngines] = useState(null);
+  const [music, setMusic] = useState([]);
+  const [runs, setRuns] = useState([]);
+  const [jobs, setJobs] = useState([]);
+  const [runId, setRunId] = useState("");
+  const [voiceovers, setVoiceovers] = useState([]);
+  const [text, setText] = useState("Haz de cada noche una experiencia mágica.");
+  const [preview, setPreview] = useState(null);
+  const [mix, setMix] = useState(null);
+  const [mixForm, setMixForm] = useState({ voiceover_id: "", music_asset_id: "", duration_s: 15, music_gain_db: -14, ducking: true });
+  const [musicForm, setMusicForm] = useState({ name: "", license_ref: "", commercial_use_allowed: false });
+  const [file, setFile] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    Promise.all([apiRequest("/audio/engines"), apiRequest("/music-assets"), apiRequest("/jobs")]).then(async ([e, m, j]) => {
+      if (e.ok) setEngines(await e.json());
+      if (m.ok) setMusic(await m.json());
+      if (j.ok) {
+        const body = await j.json();
+        setJobs(body);
+        const runs = body.filter((item) => item.run_id).slice(0, 30);
+        setRuns(runs);
+        if (runs.length && !runId) setRunId(runs[0].run_id);
+      }
+    });
+  }, []);
+  useEffect(() => { if (runId) loadVoiceovers(runId); }, [runId]);
+  useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(null), 6000); return () => clearTimeout(timer); } }, [notice]);
+
+  async function loadVoiceovers(id) {
+    const response = await apiRequest(`/runs/${id}/voiceovers`);
+    if (response.ok) setVoiceovers(await response.json());
+  }
+  async function synthesize() {
+    setBusy(true);
+    try {
+      const response = await apiRequest("/audio/previews", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, locale: "es-MX", rate: 1.0, max_seconds: 120 }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "合成失败");
+      setPreview(body);
+      setNotice(["success", `试听已生成：${body.engine} · ${body.voice} · ${body.duration_s}s`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function uploadMusic() {
+    if (!file) { setNotice(["danger", "请选择音频文件"]); return; }
+    setBusy(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("name", musicForm.name || file.name);
+      form.append("license_ref", musicForm.license_ref);
+      form.append("commercial_use_allowed", String(musicForm.commercial_use_allowed));
+      const response = await apiRequest("/music-assets", { method: "POST", body: form });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "上传失败");
+      setNotice(["success", "BGM 已入库（含许可引用）"]);
+      const list = await apiRequest("/music-assets");
+      if (list.ok) setMusic(await list.json());
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function runMix() {
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/runs/${runId}/audio/mix`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          voiceover_id: mixForm.voiceover_id, music_asset_id: mixForm.music_asset_id,
+          duration_s: Number(mixForm.duration_s), music_gain_db: Number(mixForm.music_gain_db),
+          ducking: { enabled: mixForm.ducking, ratio: 6 },
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "混音失败");
+      setMix(body);
+      setNotice([body.verdict.passed ? "success" : "warning",
+        `混音完成：${body.measurement.integrated_lufs} LUFS / ${body.measurement.true_peak_dbtp} dBTP`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+
+  return <section className="page">
+    <div className="page-head"><div><b>V6 AUDIO POST</b><h1>音频与音乐</h1><p>响度目标 −16 LUFS ±1.5 / 真峰值 ≤ −1 dBTP 是本产品默认，不是平台官方要求；BGM 必须有许可引用。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    <div className="two-col">
+      <section className="card">
+        <div className="card-head"><div><h2>配音与试听</h2>{engines && <small>{engines.status} · {engines.engine || "无引擎"}</small>}</div></div>
+        {engines && <p className="capability-note"><WarningCircle weight="fill" />{engines.note || engines.reason}
+          {engines.fallbacks && <small>（回退：{engines.fallbacks.join("；")}）</small>}</p>}
+        <div className="qa-pick"><label>配音文本（es-MX）</label>
+          <textarea rows="4" value={text} onChange={(event) => setText(event.target.value)} /></div>
+        <div className="action-row">
+          <button className="primary" disabled={busy || !text} onClick={synthesize}><Play weight="fill" />生成试听</button>
+        </div>
+        {preview && <div className="qa-pick">
+          <audio controls src={preview.download_url} style={{ width: "100%" }} />
+          <p>{preview.engine} · {preview.voice} · {preview.duration_s}s · {preview.characters} 字符
+            <small>（{preview.note}）</small></p>
+        </div>}
+        <div className="card-head"><div><h2>BGM 素材</h2><span className="count">{music.length}</span></div></div>
+        <div className="qa-pick"><label>许可引用（必填）</label>
+          <input value={musicForm.license_ref} onChange={(event) => setMusicForm({ ...musicForm, license_ref: event.target.value })}
+            placeholder="例如 CC0-… / 授权合同号" />
+          <label className="checkbox-line"><input type="checkbox" checked={musicForm.commercial_use_allowed}
+            onChange={(event) => setMusicForm({ ...musicForm, commercial_use_allowed: event.target.checked })} />允许商业使用</label>
+          <input type="file" accept="audio/*" onChange={(event) => setFile(event.target.files?.[0] || null)} />
+          <button disabled={busy} onClick={uploadMusic}><UploadSimple />上传 BGM</button>
+        </div>
+        <div className="table-wrap"><table><thead><tr><th>名称</th><th>许可</th><th>商用</th><th>时长</th><th /></tr></thead>
+          <tbody>{music.map((item) => <tr key={item.id}><td>{item.name}</td><td><code>{item.license_ref}</code></td>
+            <td>{item.commercial_use_allowed ? "是" : "否"}</td><td>{item.duration_s}s</td>
+            <td><a href={item.download_url} target="_blank" rel="noreferrer">试听</a></td></tr>)}</tbody></table></div>
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>混音（旁白优先）</h2></div></div>
+        <div className="qa-pick"><label>目标 Run</label>
+          <select value={runId} onChange={(event) => setRunId(event.target.value)}>
+            <option value="">选择 Run…</option>
+            {runs.map((item) => <option key={item.run_id} value={item.run_id}>{item.run_id?.slice(0, 8)} · {item.plan_id?.slice(0, 8)}</option>)}
+          </select></div>
+        <div className="qa-pick"><label>配音</label>
+          <select value={mixForm.voiceover_id} onChange={(event) => setMixForm({ ...mixForm, voiceover_id: event.target.value })}>
+            <option value="">关闭配音（仅 BGM 需显式选择）</option>
+            {voiceovers.map((item) => <option key={item.id} value={item.id}>{item.locale} · {item.duration_s}s</option>)}
+          </select></div>
+        <div className="qa-pick"><label>BGM</label>
+          <select value={mixForm.music_asset_id} onChange={(event) => setMixForm({ ...mixForm, music_asset_id: event.target.value })}>
+            <option value="">关闭 BGM</option>
+            {music.map((item) => <option key={item.id} value={item.id}>{item.name}（{item.license_ref}）</option>)}
+          </select></div>
+        <div className="qa-pick"><label>时长（秒）/ BGM 增益（dB）</label>
+          <div className="inline-fields">
+            <input type="number" value={mixForm.duration_s} onChange={(event) => setMixForm({ ...mixForm, duration_s: event.target.value })} />
+            <input type="number" value={mixForm.music_gain_db} onChange={(event) => setMixForm({ ...mixForm, music_gain_db: event.target.value })} />
+          </div>
+          <label className="checkbox-line"><input type="checkbox" checked={mixForm.ducking}
+            onChange={(event) => setMixForm({ ...mixForm, ducking: event.target.checked })} />旁白优先 ducking</label>
+        </div>
+        <div className="action-row"><button className="primary" disabled={busy || !runId} onClick={runMix}><MonitorPlay />生成混音</button></div>
+        {mix && <div className="mapping-diff">
+          <h3>响度实测</h3>
+          <p>综合 <b>{mix.measurement.integrated_lufs} LUFS</b> · 真峰值 <b>{mix.measurement.true_peak_dbtp} dBTP</b> · 判定
+            {mix.verdict.passed ? "通过" : `未通过：${mix.verdict.failures.join("；")}`}</p>
+          <p>ducking：{mix.ducking.enabled ? `开（阈值 ${mix.ducking.threshold_db} dB，来源 ${mix.ducking.threshold_source}）` : "关"}</p>
+          <audio controls src={mix.download_url} style={{ width: "100%" }} />
+        </div>}
+      </section>
+    </div>
+  </section>;
+}
+
+function PackagePage() {
+  const [jobs, setJobs] = useState([]);
+  const [runId, setRunId] = useState("");
+  const [localizations, setLocalizations] = useState([]);
+  const [subtitleTracks, setSubtitleTracks] = useState([]);
+  const [mixes, setMixes] = useState([]);
+  const [profiles, setProfiles] = useState([]);
+  const [packages, setPackages] = useState([]);
+  const [form, setForm] = useState({ profile_id: "tiktok-mx-9x16-esmx", localization_id: "", subtitle_track_id: "", audio_mix_id: "", include_mixed_audio: true });
+  const [result, setResult] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    Promise.all([apiRequest("/jobs"), apiRequest("/platform-profiles"), apiRequest("/packages")]).then(async ([j, p, k]) => {
+      if (j.ok) {
+        const body = await j.json();
+        setJobs(body);
+        const withRun = body.filter((item) => item.run_id);
+        if (withRun.length && !runId) setRunId(withRun[0].run_id);
+      }
+      if (p.ok) setProfiles(await p.json());
+      if (k.ok) setPackages(await k.json());
+    });
+  }, []);
+  useEffect(() => { if (runId) loadRunContext(runId); }, [runId]);
+  useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(null), 7000); return () => clearTimeout(timer); } }, [notice]);
+
+  async function loadRunContext(id) {
+    const [localizationResponse, mixesResponse] = await Promise.all([
+      apiRequest(`/runs/${id}/localizations`),
+      apiRequest(`/audio/mixes?run_id=${id}`),
+    ]);
+    if (localizationResponse.ok) {
+      const body = await localizationResponse.json();
+      setLocalizations(body);
+      if (body.length) setForm((value) => ({ ...value, localization_id: body[0].id }));
+    }
+    if (mixesResponse.ok) {
+      const body = await mixesResponse.json();
+      setMixes(Array.isArray(body) ? body : []);
+      if (Array.isArray(body) && body.length) setForm((value) => ({ ...value, audio_mix_id: body[0].id }));
+    }
+  }
+  async function loadDetail(localizationId) {
+    const response = await apiRequest(`/localizations/${localizationId}`);
+    if (!response.ok) return;
+    const body = await response.json();
+    setSubtitleTracks(body.subtitle_tracks || []);
+    if (body.subtitle_tracks?.length) setForm((value) => ({ ...value, subtitle_track_id: body.subtitle_tracks.at(-1).id }));
+  }
+  useEffect(() => { if (form.localization_id) loadDetail(form.localization_id); }, [form.localization_id]);
+
+  async function build() {
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/runs/${runId}/packages`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(form),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "打包失败");
+      setResult(body);
+      setNotice([body.status === "BUILT" ? "success" : "danger",
+        body.status === "BUILT" ? `包已生成（${body.manifest.files.length} 个文件）` : `校验未通过：${body.verification.join("；")}`]);
+      const list = await apiRequest("/packages");
+      if (list.ok) setPackages(await list.json());
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function approve() {
+    if (!result) return;
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/packages/${result.id}/approve`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content_hash: result.content_hash, reason: "控制台审批" }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "审批失败");
+      setNotice(["success", "包已审批（绑定内容哈希，之后改动即失效）"]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+
+  return <section className="page">
+    <div className="page-head"><div><b>V6 PUBLISH PACKAGE</b><h1>发布包</h1><p>先 build → verify → approve；审批绑定内容哈希。包内不含任何 API Key 或平台 token。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    <div className="two-col">
+      <section className="card">
+        <div className="card-head"><div><h2>打包</h2></div></div>
+        <div className="qa-pick"><label>目标 Run</label>
+          <select value={runId} onChange={(event) => setRunId(event.target.value)}>
+            <option value="">选择 Run…</option>
+            {jobs.filter((item) => item.run_id).map((item) => <option key={item.run_id} value={item.run_id}>{item.run_id.slice(0, 8)} · {formatTime(item.created_at)}</option>)}
+          </select></div>
+        <div className="qa-pick"><label>Profile</label>
+          <select value={form.profile_id} onChange={(event) => setForm({ ...form, profile_id: event.target.value })}>
+            {profiles.map((item) => <option key={item.id} value={item.profile_key}>{item.name}</option>)}
+          </select></div>
+        <div className="qa-pick"><label>本地化文案</label>
+          <select value={form.localization_id} onChange={(event) => setForm({ ...form, localization_id: event.target.value })}>
+            <option value="">选择本地化…</option>
+            {localizations.map((item) => <option key={item.id} value={item.id}>{item.locale} · r{item.latest?.revision}</option>)}
+          </select></div>
+        <div className="qa-pick"><label>字幕轨</label>
+          <select value={form.subtitle_track_id} onChange={(event) => setForm({ ...form, subtitle_track_id: event.target.value })}>
+            <option value="">不含字幕（清单标 disabled）</option>
+            {subtitleTracks.map((item) => <option key={item.id} value={item.id}>{item.locale} · rev{item.revision}</option>)}
+          </select></div>
+        <div className="qa-pick"><label>混音</label>
+          <select value={form.audio_mix_id} onChange={(event) => setForm({ ...form, audio_mix_id: event.target.value })}>
+            <option value="">不含音轨</option>
+            {mixes.map((item) => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.duration_s}s</option>)}
+          </select>
+          <label className="checkbox-line"><input type="checkbox" checked={form.include_mixed_audio}
+            onChange={(event) => setForm({ ...form, include_mixed_audio: event.target.checked })} />把混音放入包（music/voice 原文件不入包）</label>
+        </div>
+        <div className="action-row">
+          <button className="primary" disabled={busy || !runId} onClick={build}><Package />生成发布包</button>
+          <button disabled={busy || !result || result.status !== "BUILT"} onClick={approve}><CheckCircle />审批</button>
+          {result && <a className="icon-link" href={result.download_url} target="_blank" rel="noreferrer"><DownloadSimple />下载 ZIP</a>}
+        </div>
+        {result && <div className="mapping-diff">
+          <h3>包内容（{result.manifest.files.length} 个文件）</h3>
+          <p>状态 {result.status} · 内容哈希 <code>{result.content_hash.slice(0, 16)}…</code> · QA 来源 {result.manifest.qa.source}</p>
+          <p>字幕 {result.manifest.subtitles.status || (result.manifest.subtitles.enabled ? "enabled" : "disabled")} ·
+            配音 {result.manifest.voice.status} · BGM {result.manifest.music.status}</p>
+          <div className="table-wrap"><table><thead><tr><th>路径</th><th>角色</th><th>大小</th></tr></thead>
+            <tbody>{result.manifest.files.map((item) => <tr key={item.path}><td><small>{item.path.replace(/^publish-package_[^/]+\//, "")}</small></td>
+              <td>{item.role}</td><td>{Math.round(item.size_bytes / 1024)} KB</td></tr>)}</tbody></table></div>
+        </div>}
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>已生成包</h2><span className="count">{packages.length}</span></div></div>
+        <div className="table-wrap"><table><thead><tr><th>包</th><th>语言</th><th>状态</th><th>审批时间</th><th /></tr></thead>
+          <tbody>{packages.map((item) => <tr key={item.id}><td>{item.id.slice(0, 8)}<small>v{item.version}</small></td>
+            <td>{item.locale}</td><td><Pill status={item.status === "APPROVED" ? "SUCCEEDED" : item.status === "INVALID" ? "FAILED" : "DRAFT"} /></td>
+            <td>{formatTime(item.approved_at)}</td>
+            <td><a href={item.download_url} target="_blank" rel="noreferrer">下载</a></td></tr>)}</tbody></table></div>
+        <p className="capability-note"><WarningCircle weight="fill" />未审批的包不会进入批次归档；下载时会再校验 ZIP 哈希。</p>
+      </section>
+    </div>
+  </section>;
+}
+
 function ReferencePage() {
   const [references, setReferences] = useState([]);
   const [versions, setVersions] = useState([]);
@@ -902,7 +1508,7 @@ export function App() {
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">

@@ -222,7 +222,7 @@ class BatchApiTests(unittest.TestCase):
         statuses = {item["index"]: item["status"] for item in after}
         self.assertEqual(statuses[items[1]["index"]], "SUCCEEDED")  # 成功项未被重置
         # 失败项被重置并立即重新调度（PENDING 或已排到 QUEUED 都算已重试），错误信息清空
-        self.assertIn(statuses[items[0]["index"]], {"PENDING", "QUEUED"})
+        self.assertIn(statuses[items[0]["index"]], {"PENDING", "QUEUED", "RUNNING", "SUCCEEDED"})
         self.assertIsNone(next(item for item in after if item["index"] == items[0]["index"])["error"])
         cancelled = self.client.post(f"/api/v1/batches/{batch['id']}/cancel",
                                      json={"scope": "all_unfinished", "reason": "收工"})
@@ -285,14 +285,15 @@ class BatchApiTests(unittest.TestCase):
                 raise FastApiHTTPException(409, "计划缺少冻结合同（测试注入）")
             return original(db, batch_row, item_row)
 
-        with patch("productdirector_api.main.start_batch_item_run", side_effect=flaky):
+        with patch("productdirector_api.main.start_batch_item_run", side_effect=flaky), \
+                patch("productdirector_api.main.execute_job"):
             main.advance_batch(batch["id"])
         items = self.client.get(f"/api/v1/batches/{batch['id']}/items").json()["items"]
         failed = [item for item in items if item["status"] == "FAILED"]
-        queued = [item for item in items if item["status"] == "QUEUED"]
+        started = [item for item in items if item["status"] in ("QUEUED", "RUNNING", "SUCCEEDED")]
         self.assertEqual(len(failed), 1)
         self.assertIn("调度失败", failed[0]["error"])
-        self.assertTrue(queued, "后续项应继续调度，而不是整体卡住")
+        self.assertTrue(started, "后续项应继续调度，而不是整体卡住")
 
     def test_items_mode_dedupes_only_when_key_missing(self) -> None:
         payload = {"items": [

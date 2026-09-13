@@ -7179,7 +7179,7 @@ def list_jobs(owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJEC
     with connect() as db:
         rows = db.execute(
             """
-            SELECT j.*
+            SELECT j.*, MAX(r.id) AS run_id
             FROM jobs j
             INNER JOIN runs r ON r.job_id = j.id
             INNER JOIN plan_contracts pc ON pc.id = r.plan_contract_id
@@ -8513,6 +8513,66 @@ def get_audio_preview_content(preview_id: str) -> FileResponse:
     return FileResponse(path, media_type="audio/wav", filename=f"preview-{preview_id}.wav")
 
 
+@app.get("/api/v1/runs/{run_id}/voiceovers")
+def list_voiceovers(run_id: str) -> list[dict]:
+    """该 Run 的授权配音列表（控制台选择配音用）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        run = _resolve_run_scope(db, run_id)
+        if run["owner_id"] != owner_id or run["project_id"] != project_id:
+            raise HTTPException(403, "越权访问 Run")
+        rows = db.execute(
+            "SELECT * FROM voiceovers WHERE run_id = ? ORDER BY created_at DESC", (run_id,),
+        ).fetchall()
+    return [{"id": row["id"], "locale": row["locale"], "license_ref": row["license_ref"],
+             "created_at": row["created_at"], "download_url": f"/api/v1/voiceovers/{row['id']}/content",
+             **json.loads(row["payload"])} for row in rows]
+
+
+@app.get("/api/v1/voiceovers/{voiceover_id}/content")
+def get_voiceover_content(voiceover_id: str) -> FileResponse:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM voiceovers WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (voiceover_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "配音不存在")
+    path = Path(row["path"])
+    if not path.exists():
+        raise HTTPException(404, "配音文件已不存在")
+    return FileResponse(path, media_type="audio/wav", filename=path.name)
+
+
+@app.get("/api/v1/audio/mixes")
+def list_audio_mixes(run_id: str = "") -> list[dict]:
+    """混音列表（可按 Run 过滤）；控制台打包时选择混音用。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        if run_id:
+            rows = db.execute(
+                "SELECT * FROM audio_mixes WHERE run_id = ? AND owner_id = ? AND project_id = ? "
+                "ORDER BY created_at DESC", (run_id, owner_id, project_id),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM audio_mixes WHERE owner_id = ? AND project_id = ? ORDER BY created_at DESC LIMIT 100",
+                (owner_id, project_id),
+            ).fetchall()
+    mixes = []
+    for row in rows:
+        payload = json.loads(row["payload"])
+        mixes.append({
+            "id": row["id"], "run_id": row["run_id"], "created_at": row["created_at"],
+            "path": row["path"], "duration_s": payload.get("duration_s"),
+            "measurement": payload.get("measurement"), "verdict": payload.get("verdict"),
+            "ducking": payload.get("ducking"), "voice": payload.get("voice"), "music": payload.get("music"),
+            "download_url": f"/api/v1/audio/mixes/{row['id']}/content",
+        })
+    return mixes
+
+
 @app.post("/api/v1/runs/{run_id}/voiceovers", status_code=201)
 async def upload_voiceover(
     run_id: str,
@@ -9400,6 +9460,7 @@ def start_batch_item_run(db, batch_row, item_row) -> dict:
     asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan_row["product_asset_id"],)).fetchone()
     if not asset:
         raise HTTPException(409, "计划绑定的产品素材不存在")
+    plan_snapshot = json.loads(plan_row["payload"])
     run_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     now = utc_now()
@@ -9431,7 +9492,53 @@ def start_batch_item_run(db, batch_row, item_row) -> dict:
         "VALUES (?, ?, 1, 'CREATED', ?, NULL, NULL, NULL)",
         (str(uuid.uuid4()), run_job_id, now),
     )
+    # 执行器从 run 目录读取冻结计划快照：不写它，任务会在领取后立刻失败
+    ensure_run_plan_snapshot(job_id, plan_snapshot)
     return {"run_id": run_id, "job_id": job_id, "plan_contract_id": contract["id"]}
+
+
+def ensure_run_plan_snapshot(job_id: str, plan_payload: dict) -> Path:
+    """执行前必须存在 run 目录与 director_plan.json：执行器就是从这里读冻结计划快照的。"""
+    run_dir = RUNS / job_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = run_dir / "director_plan.json"
+    if not plan_path.exists():
+        plan_path.write_text(json.dumps(plan_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return plan_path
+
+
+def reconcile_batch_items(db, batch_id: str) -> None:
+    """把关联 Run/Job 的终态回写到批次项：项状态不能只等下一次调度才更新。"""
+    items = db.execute(
+        "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
+    ).fetchall()
+    for item in items:
+        if not item["job_id"] or item["status"] not in ("QUEUED", "RUNNING"):
+            continue
+        job = db.execute("SELECT * FROM jobs WHERE id = ?", (item["job_id"],)).fetchone()
+        if not job:
+            continue
+        if job["status"] in ("SUCCEEDED", "VERIFICATION_PASSED", "FAILED", "CANCELLED", "QA_REJECTED"):
+            new_status = {
+                "SUCCEEDED": "SUCCEEDED", "VERIFICATION_PASSED": "SUCCEEDED",
+                "FAILED": "FAILED", "QA_REJECTED": "FAILED", "CANCELLED": "CANCELLED",
+            }[job["status"]]
+            db.execute("UPDATE batch_items SET status = ?, error = ?, updated_at = ? WHERE id = ?",
+                       (new_status, job["error"], utc_now(), item["id"]))
+        elif job["status"] == "RUNNING" and item["status"] != "RUNNING":
+            db.execute("UPDATE batch_items SET status = 'RUNNING', updated_at = ? WHERE id = ?",
+                       (utc_now(), item["id"]))
+
+
+def refresh_batch_status(db, batch_id: str) -> sqlite3.Row:
+    """对账批次项并重算聚合状态（读取批次/项之前都调用，避免状态滞后）。"""
+    reconcile_batch_items(db, batch_id)
+    rows = db.execute("SELECT status FROM batch_items WHERE batch_id = ?", (batch_id,)).fetchall()
+    batch = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    status = batch_rules.aggregate_status([row["status"] for row in rows],
+                                         paused=bool(batch["paused"]), cancelled=bool(batch["cancelled"]))
+    db.execute("UPDATE batches SET status = ?, updated_at = ? WHERE id = ?", (status, utc_now(), batch_id))
+    return db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
 
 
 def advance_batch(batch_id: str) -> dict:
@@ -9443,27 +9550,7 @@ def advance_batch(batch_id: str) -> dict:
             raise HTTPException(404, "批次不存在")
         batch_payload = json.loads(batch["payload"])
         max_concurrent = int(batch_payload.get("max_concurrent") or batch_rules.DEFAULT_MAX_CONCURRENT)
-        items = db.execute(
-            "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
-        ).fetchall()
-        active = [item for item in items if item["status"] in ("QUEUED", "RUNNING")]
-        # 与批次项关联的 Run 状态回写
-        for item in items:
-            if item["run_id"] and item["status"] in ("QUEUED", "RUNNING"):
-                run = db.execute("SELECT * FROM runs WHERE id = ?", (item["run_id"],)).fetchone()
-                job = db.execute("SELECT * FROM jobs WHERE id = ?", (item["job_id"],)).fetchone() if item["job_id"] else None
-                if job and job["status"] in ("SUCCEEDED", "VERIFICATION_PASSED", "FAILED", "CANCELLED", "QA_REJECTED"):
-                    new_status = {
-                        "SUCCEEDED": "SUCCEEDED", "VERIFICATION_PASSED": "SUCCEEDED",
-                        "FAILED": "FAILED", "QA_REJECTED": "FAILED", "CANCELLED": "CANCELLED",
-                    }[job["status"]]
-                    db.execute(
-                        "UPDATE batch_items SET status = ?, error = ?, updated_at = ? WHERE id = ?",
-                        (new_status, job["error"], utc_now(), item["id"]),
-                    )
-                elif job and job["status"] == "RUNNING" and item["status"] != "RUNNING":
-                    db.execute("UPDATE batch_items SET status = 'RUNNING', updated_at = ? WHERE id = ?",
-                               (utc_now(), item["id"]))
+        reconcile_batch_items(db, batch_id)
         items = db.execute(
             "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
         ).fetchall()
@@ -9525,6 +9612,7 @@ def get_batch(batch_id: str) -> dict:
         ).fetchone()
         if not row:
             raise HTTPException(404, "批次不存在")
+        row = refresh_batch_status(db, batch_id)
         return _batch_public(db, row)
 
 
@@ -9539,6 +9627,7 @@ def list_batch_items(batch_id: str, cursor: int = 0, limit: int = 50, status: st
         ).fetchone()
         if not row:
             raise HTTPException(404, "批次不存在")
+        refresh_batch_status(db, batch_id)
         query = "SELECT * FROM batch_items WHERE batch_id = ? AND item_index >= ?"
         params: list = [batch_id, cursor]
         if status:
