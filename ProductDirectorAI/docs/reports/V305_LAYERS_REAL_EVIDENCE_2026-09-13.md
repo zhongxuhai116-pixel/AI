@@ -1,6 +1,6 @@
 # V3-05 独立层真实闭环证据（2026-09-13，云端）
 
-结论：**V3-05 的“真实 AI 背景 + 阴影/反射/遮挡独立层”在云端真实数据上闭环 PASS；遮挡层以全零层形态通过（场景无遮挡物），真实遮挡资产仍未验证。** 产物全部在云端隔离目录 `/home/ubuntu/pd-v305-layers-20260913/`（不入 Git）。执行前云端 `main` 为合并提交 `b260f1f`（主线 Strict 运行时工作 × V3-05 独立层工作），随后修复 `edc2df7`（build_layers 帧号）。全程未动 systemd 服务；H3 生成前查询 ComfyUI 队列为空。
+结论：**V3-05 的“真实 AI 背景 + 阴影/反射/遮挡独立层”在云端真实数据上闭环 PASS，含真实遮挡物验证。** 产物全部在云端隔离目录 `/home/ubuntu/pd-v305-layers-20260913/`（不入 Git）。执行前云端 `main` 为合并提交 `b260f1f`（主线 Strict 运行时工作 × V3-05 独立层工作），随后修复 `edc2df7`（build_layers 帧号）与新增 `c8f0396`（`--occluder` 独立遮挡物 GLB）。全程未动 systemd 服务；H3 生成前查询 ComfyUI 队列为空。
 
 ## 1. 本轮代码变化（合并两条开发线）
 
@@ -8,8 +8,9 @@
 | --- | --- |
 | `b260f1f` | 合并主线（冻结计划合同、可信 Alpha、预检隔离、Strict 运行时）与云端 V3-05 独立层工作：`--layers shadow/reflection/occlusion`、遮挡区像素锁定豁免计数、中性层逐字节回归、`render_product.py --layers`（plate_full/plate/occlusion）、`validate_fidelity_passes.py --layers`、`build_layers.py`、`h3_background.py`、`tests/test_v305_layers.py`；`tests/test_strict_composite.py` 的层夹具同步到新层合同（阴影=16 位灰度因子，遮挡层必须带可信 Alpha） |
 | `edc2df7` | 修复 `build_layers.py`：输出帧号沿用输入帧号（此前按 0 起编号，与 Blender 的 frame_0001 起编号在冻结帧集合合同下被正确拒绝——真实跑出来的缺陷） |
+| `c8f0396` | 新增 `render_product.py --occluder <GLB>`：独立遮挡物 GLB（网格标记 `pd_occluder`、名称 `Occluder` 前缀），不属于产品、不参与产品包围盒，但随产品同一坐标对齐；**只收集本次导入新增的网格**（初版把已导入产品网格误标成遮挡物的缺陷在真实运行中暴露并修复，合同测试已钉住 `obj.name not in existing`） |
 
-合并后的全量后端回归：**339/339 OK**（云端 195.7s）。
+合并后的全量后端回归：**341/341 OK**（云端 222.0s）。
 
 ## 2. 真实渲染（CC0 相机，540×960，72 帧，3 镜头 ×24）
 
@@ -66,10 +67,24 @@
 
 `scripts/dual_product_check.py --frames <ev>/composite --product passes/beauty --mask passes/mask --dilate 2`：**72/72 PASS，零误报**（真实 AI 背景上没有把背景纹理误判成多余产品）。
 
-## 8. 范围说明（如实记录）
+## 8. 真实遮挡物验证（--occluder，render_occ）
 
-1. **遮挡层**本轮以“全零层”形态通过（场景没有遮挡物）；遮挡乘算/豁免计数的数学与像素锁定豁免由 `tests/test_v305_layers.py` 的合成夹具验证（含中性层与基线逐字节一致），真实人物/物体遮挡素材仍未验证，属 V3-05 剩余项。
-2. **色彩语义**：shadow 因子与 reflection 能量来自 EXR 底板差分（原始线性值），按层合同编码为 PNG；合成在 display-linear 工作空间执行（背景 sRGB 解码）。该跨空间语义已在报告与本文档如实记录，scene-linear 全链路映射仍是后续工作。
-3. 反射层 `coverage_mean≈0` 但 `energy_max=2.4883`：能量集中在产品下方局部区域，覆盖阈值统计如实记录极值，不把“无大面积反射”写成“无反射”。
-4. 本轮为 540×960 / 72 帧口径；1080×1920 与更长镜头未在本轮复验。
-5. 首次 `build_layers` 运行暴露帧号缺陷（输出 0 起编号被冻结帧集合合同拒绝），修复提交 `edc2df7` 后重跑通过——缺陷与修复都记录在案。
+场景增加独立遮挡物 GLB（0.28m 方块，位于相机与产品之间、画面下方），`render_product.py --passes --layers --occluder <ev>/occluder.glb` 重渲 72 帧：
+
+| 指标 | 结果 |
+| --- | --- |
+| 遮挡层（occlusion） | 72/72，`occluders=OccluderCube`；平均覆盖率 4.17%，遮挡像素 1,555,824（其中 342,917 在产品掩码内） |
+| 五通道隔离 | `DIRECTOR_PASS_UNCHANGED files=288`（第二遍未改写五通道） |
+| build_layers | shadow/reflection 与非遮挡运行完全一致（factor_min 0.0714 / energy_max 2.4883）——底板差分对两个 plate 都含遮挡物，正确抵消；occlusion coverage 0.0417 |
+| strict_composite（冻结计划 + 三层全帧必需） | **passed=true / pixel_lock_ok=true / output_written=true**；`occlusion_exempted_pixels_total=348,881`；display 产品对照 PASS |
+| 数值复核（帧 36） | 锁定区（掩码内未被遮挡）composite 与可信产品平均绝对差 0.00289（≤1/255 门）；遮挡区 composite 与遮挡层颜色平均绝对差 0.00207（遮挡物确实盖在产品上方） |
+| 双产品检测 | composite_occ 72/72 PASS，零误报 |
+
+## 9. 范围说明（如实记录）
+
+1. 遮挡层已从“全零层”升级为**真实遮挡物验证**（合成夹具 + 真实渲染双重证据）。仍未验证：真实人物遮挡素材、遮挡物自身的投影（遮挡层只含遮挡物本体，遮挡物在背景上投下的阴影属后续工作，见下条）。
+2. **遮挡物阴影语义**：plate 差分对里两个 plate 都包含遮挡物，因此遮挡物本身被抵消；但其在背景地面上的投影会残留在 shadow/reflection 层中（plate_full 有产品投影 + 遮挡物投影，plate 只有遮挡物投影——差值即产品效应，方向正确）。遮挡物投影在最终合成中出现的程度取决于 shadow 层强度，本轮未单独人工比对，属如实记录项。
+3. **色彩语义**：shadow 因子与 reflection 能量来自 EXR 底板差分（原始线性值），按层合同编码为 PNG；合成在 display-linear 工作空间执行（背景 sRGB 解码）。该跨空间语义已在报告与本文档如实记录，scene-linear 全链路映射仍是后续工作。
+4. 反射层 `coverage_mean≈0` 但 `energy_max=2.4883`：能量集中在产品下方局部区域，覆盖阈值统计如实记录极值，不把“无大面积反射”写成“无反射”。
+5. 本轮为 540×960 / 72 帧口径；1080×1920 与更长镜头未在本轮复验。
+6. 真实运行暴露并修复的两个缺陷都记录在案：`build_layers` 帧号（`edc2df7`）、`import_occluders` 误把产品网格标成遮挡物（`c8f0396`）。

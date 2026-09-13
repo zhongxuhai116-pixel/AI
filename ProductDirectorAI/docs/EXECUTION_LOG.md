@@ -131,6 +131,7 @@
 - 合并两条开发线：云端未提交工作先提交到 `wip-v305-layers`，主线快进到 `59e99bd` 后合并，三个冲突文件（`render_product.py` / `validate_fidelity_passes.py` / `strict_composite.py`）以“主线冻结合同为基 + 云端分层语义”重写，层合同统一为：shadow=16 位灰度因子乘算、reflection=sRGB 能量加算、occlusion=RGBA 盖回 + 像素锁定豁免计数；有冻结计划时层可声明部分覆盖，无计划时提供层必须覆盖全部处理帧（fail-closed）。合并提交 `b260f1f`，全量后端 **339/339 OK**（云端 195.7s）。
 - 真实闭环（云端，CC0 相机素材，540×960，72 帧）：`--passes --layers` 真实渲染（288 个五通道文件未被第二遍改写；plate_full/plate/occlusion 各 72）→ `build_layers.py` 差分（shadow 因子 min 0.0714、reflection 能量 max 2.4883、occlusion 全零注明）→ `validate_fidelity_passes.py --layers` **passed**（mask↔alpha IoU≈1、法线模长≈1、五层帧号与全片一致）→ `h3_background.py` 真实 H3 背景（SUCCEEDED，源视频 sha `fbe1cca4…`，72 帧）→ `strict_composite.py`（冻结计划 + 三层全帧必需）**passed**、`pixel_lock_ok=true`、掩码内与可信产品逐像素差 0.0；独立数值复核掩码外 composite↔H3 背景相关 0.9929、掩码内差 0.0。
 - 双产品检测正例回归（真实 H3 背景）：`dual_product_check.py` 72/72 PASS 零误报。
+- **真实遮挡物验证**：新增 `render_product.py --occluder`（独立遮挡物 GLB，`c8f0396`；真实运行还抓出初版把产品网格误标成遮挡物的缺陷）。0.28m 方块遮挡物真实重渲 72 帧：遮挡层覆盖率 4.17%、遮挡像素 1,555,824（342,917 在产品掩码内）；合成 `occlusion_exempted_pixels_total=348,881`、pixel_lock_ok、锁定区与可信产品平均绝对差 0.00289（≤1/255）、遮挡区与遮挡层颜色平均绝对差 0.00207；双产品检测仍 72/72 零误报。
 - 真实缺陷与修复：`build_layers.py` 输出帧号从 0 起编号，被冻结帧集合合同正确拒绝（fail-closed 生效），修复为沿用输入帧号（提交 `edc2df7`）后重跑通过。
-- 推送：`b260f1f`、`edc2df7` 已推送到 GitHub `main`；云端 `wip-v305-layers` 分支保留本地。
-- 未完成（如实记录）：遮挡层真实遮挡资产（本轮为全零层）；scene-linear 全链路映射；1080×1920 口径；V3 其余阶段门（版本审核界面、问题帧跳转、完整 V3 验收报告）。
+- 推送：`b260f1f`、`edc2df7`、`c8f0396` 已推送到 GitHub `main`；云端 `wip-v305-layers` 分支保留本地。
+- 未完成（如实记录）：遮挡物自身投影的逐帧人工比对、真实人物遮挡素材；scene-linear 全链路映射；1080×1920 口径；V3 其余阶段门（版本审核界面、问题帧跳转、完整 V3 验收报告）。

@@ -321,9 +321,10 @@ INPUTS_BEFORE ['']                                  # 新建时只有一个空�
 
 ## 13. V3-05 独立层真实闭环（2026-09-13，云端）
 
-任务书 V3-05 的两条未完成项——"真实 AI 生成背景"与"阴影/反射/遮挡独立层"——已在云端真实数据上闭环：
+任务书 V3-05 的两条未完成项——"真实 AI 生成背景"与"阴影/反射/遮挡独立层"——已在云端真实数据上闭环（含真实遮挡物）：
 
-- 主线 Strict 运行时工作与云端独立层工作合并（提交 `b260f1f`、修复 `edc2df7`），后端 339/339 OK；
-- 真实流水线：`render_product.py --passes --layers`（72 帧，plate_full/plate/occlusion）→ `build_layers.py`（shadow 因子/reflection 能量差分）→ `validate_fidelity_passes.py --layers`（passed）→ `h3_background.py`（真实 H3 背景，自托管不收费）→ `strict_composite.py`（冻结计划 + 三层全帧必需，pixel_lock_ok，掩码内与可信产品逐像素差 0.0）→ `dual_product_check.py`（72/72 零误报）。
+- 主线 Strict 运行时工作与云端独立层工作合并（提交 `b260f1f`、修复 `edc2df7`、新增 `--occluder` 的 `c8f0396`），后端 341/341 OK；
+- 真实流水线：`render_product.py --passes --layers`（72 帧，plate_full/plate/occlusion）→ `build_layers.py`（shadow 因子/reflection 能量差分）→ `validate_fidelity_passes.py --layers`（passed）→ `h3_background.py`（真实 H3 背景，自托管不收费）→ `strict_composite.py`（冻结计划 + 三层全帧必需，pixel_lock_ok，掩码内与可信产品逐像素差 0.0）→ `dual_product_check.py`（72/72 零误报）；
+- 真实遮挡物：`--occluder` 独立 GLB（0.28m 方块）重渲 72 帧，遮挡像素 1,555,824（342,917 在产品掩码内），合成豁免计数 348,881、锁定区/遮挡区数值复核通过、双产品检测仍零误报。
 
-完整命令、哈希与范围说明见 [V3-05 独立层真实闭环证据](V305_LAYERS_REAL_EVIDENCE_2026-09-13.md)。剩余：真实遮挡资产（本轮遮挡层为全零层）、scene-linear 全链路映射、1080×1920 口径。
+完整命令、哈希与范围说明见 [V3-05 独立层真实闭环证据](V305_LAYERS_REAL_EVIDENCE_2026-09-13.md)。剩余：遮挡物自身投影的逐帧人工比对、真实人物遮挡素材、scene-linear 全链路映射、1080×1920 口径。
