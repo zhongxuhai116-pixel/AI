@@ -559,3 +559,63 @@ CREATE TABLE IF NOT EXISTS publish_packages (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+-- V6-06：资源与成本账本（用量事件去重 / 预算预留与对账 / 四类金额）
+CREATE TABLE IF NOT EXISTS budgets (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  currency TEXT NOT NULL,
+  limit_amount DOUBLE PRECISION,
+  revision INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS usage_events (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  billing_item TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  unit TEXT NOT NULL,
+  quantity DOUBLE PRECISION NOT NULL,
+  run_id TEXT,
+  batch_id TEXT,
+  capability TEXT,
+  internal_estimate INTEGER NOT NULL DEFAULT 0,
+  amount DOUBLE PRECISION,
+  amount_source TEXT,
+  currency TEXT,
+  occurred_at TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (dedupe_key)
+);
+
+CREATE TABLE IF NOT EXISTS cost_ledger (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  budget_id TEXT,
+  kind TEXT NOT NULL,
+  amount DOUBLE PRECISION NOT NULL,
+  currency TEXT NOT NULL,
+  run_id TEXT,
+  batch_id TEXT,
+  usage_event_id TEXT,
+  note TEXT NOT NULL DEFAULT '',
+  settled_at TEXT,
+  settled_entry_id TEXT,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- 已有安装补齐 V6-06 预留对账列（幂等：防止同一条预留被重复结算）
+ALTER TABLE cost_ledger ADD COLUMN IF NOT EXISTS settled_at TEXT;
+ALTER TABLE cost_ledger ADD COLUMN IF NOT EXISTS settled_entry_id TEXT;

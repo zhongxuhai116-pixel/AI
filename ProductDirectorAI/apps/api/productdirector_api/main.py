@@ -57,6 +57,7 @@ from . import audio_post
 from . import batch as batch_rules
 from . import interaction_geometry
 from . import interaction_validation
+from . import ledger
 from . import localization
 from . import platform_profiles
 from . import publish_package
@@ -728,7 +729,59 @@ def initialize_db() -> None:
               UNIQUE (batch_id, item_index),
               FOREIGN KEY(batch_id) REFERENCES batches(id)
             );
-            CREATE TABLE IF NOT EXISTS publish_packages (
+            CREATE TABLE IF NOT EXISTS budgets (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              currency TEXT NOT NULL,
+              limit_amount REAL,
+              revision INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS usage_events (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              operation_id TEXT NOT NULL,
+              billing_item TEXT NOT NULL,
+              event_id TEXT NOT NULL,
+              dedupe_key TEXT NOT NULL,
+              unit TEXT NOT NULL,
+              quantity REAL NOT NULL,
+              run_id TEXT,
+              batch_id TEXT,
+              capability TEXT,
+              internal_estimate INTEGER NOT NULL DEFAULT 0,
+              amount REAL,
+              amount_source TEXT,
+              currency TEXT,
+              occurred_at TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE (dedupe_key)
+            );
+            CREATE TABLE IF NOT EXISTS cost_ledger (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              budget_id TEXT,
+              kind TEXT NOT NULL,
+              amount REAL NOT NULL,
+              currency TEXT NOT NULL,
+              run_id TEXT,
+              batch_id TEXT,
+              usage_event_id TEXT,
+              note TEXT NOT NULL DEFAULT '',
+              settled_at TEXT,
+              settled_entry_id TEXT,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );            CREATE TABLE IF NOT EXISTS publish_packages (
               id TEXT PRIMARY KEY,
               run_id TEXT NOT NULL,
               batch_id TEXT,
@@ -762,6 +815,9 @@ def initialize_db() -> None:
         for column in ("product_review_id", "product_review_sha256", "fidelity_policy_id", "fidelity_policy_sha256", "fidelity_snapshot_json", "strict_source_manifest_json", "strict_source_manifest_sha256", "controlled_render_evidence_json", "controlled_render_evidence_sha256"):
             ensure_column(db, "runs", column, "TEXT")
         ensure_column(db, "runs", "fidelity_policy_version", "INTEGER")
+        # V6-06：预留对账标记，防止同一条预留被重复结算（重复结算会双计成本）。
+        ensure_column(db, "cost_ledger", "settled_at", "TEXT")
+        ensure_column(db, "cost_ledger", "settled_entry_id", "TEXT")
         for column in ("verified_dimensions", "view_coverage", "unverified_regions", "logo_regions", "camera_visibility_constraints"):
             ensure_column(db, "product_versions", column, "TEXT")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
@@ -4310,7 +4366,25 @@ def execute_job(job_id: str) -> None:
     claim = claim_job("local-background", job_id)
     if not claim.get("claimed"):
         return
-    execute_claimed_job(job_id, "local-background", int(claim["lease_epoch"]))
+    started = time.monotonic()
+    try:
+        execute_claimed_job(job_id, "local-background", int(claim["lease_epoch"]))
+    finally:
+        _record_render_usage(job_id, started)
+
+
+def _record_render_usage(job_id: str, started: float) -> None:
+    """把真实渲染耗时登记为自管 GPU 用量（V6-06）：失败/QA_REJECTED 的任务同样计入消耗。"""
+    elapsed = max(0.0, time.monotonic() - started)
+    try:
+        status = get_job(job_id)["status"]
+    except HTTPException:
+        status = "UNKNOWN"
+    record_internal_usage(
+        provider="productdirector.blender", unit="gpu_second", quantity=round(elapsed, 3),
+        operation_id=job_id, capability="render", run_id=job_id,
+        note=f"渲染任务 {job_id} 墙钟时长折算的 GPU 秒（内部估算，状态 {status}）",
+    )
 
 
 def run_worker_once(worker_id: str) -> dict:
@@ -4318,7 +4392,11 @@ def run_worker_once(worker_id: str) -> dict:
     claim = claim_job(worker_id)
     if not claim.get("claimed"):
         return {"claimed": False}
-    execute_claimed_job(claim["job_id"], worker_id, int(claim["lease_epoch"]))
+    started = time.monotonic()
+    try:
+        execute_claimed_job(claim["job_id"], worker_id, int(claim["lease_epoch"]))
+    finally:
+        _record_render_usage(claim["job_id"], started)
     return {"claimed": True, "job_id": claim["job_id"], "lease_epoch": claim["lease_epoch"], "status": get_job(claim["job_id"])["status"]}
 
 
@@ -4736,6 +4814,10 @@ def collect_video_artifact(row: dict, record: dict, owner_id: str) -> dict:
         "asset_id": asset_id,
         "library_url": f"/api/v1/assets/{asset_id}/content",
         "download_url": f"/api/v1/providers/h3/jobs/{provider_job_id}/artifact",
+        "usage": record_internal_usage(
+            provider="h3-comfyui", unit="video_generation_request", quantity=1.0,
+            operation_id=provider_job_id, capability="video_generation",
+            note=f"H3 视频生成请求 {provider_job_id}（自管 ComfyUI，内部估算）"),
     }
     return result
 
@@ -8494,8 +8576,11 @@ def create_audio_preview(request: AudioPreviewRequest) -> dict:
              hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
         )
     return {"id": preview_id, "path": str(out_path), "sha256": _file_sha256(out_path), **payload,
-            "download_url": f"/api/v1/audio/previews/{preview_id}/content"}
-
+            "download_url": f"/api/v1/audio/previews/{preview_id}/content",
+            "usage": record_internal_usage(
+                provider=result["engine"], unit="tts_character", quantity=float(result["characters"]),
+                operation_id=preview_id, capability="tts_preview",
+                note=f"离线预览合成 {result['engine']}（{result['engine_kind']}），仅内部估算")}
 
 @app.get("/api/v1/audio/previews/{preview_id}/content")
 def get_audio_preview_content(preview_id: str) -> FileResponse:
@@ -8865,7 +8950,11 @@ def mix_run_audio(run_id: str, request: AudioMixRequest) -> dict:
              hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
         )
     return {"id": mix_id, "path": str(out_path), "sha256": _file_sha256(out_path),
-            "download_url": f"/api/v1/audio/mixes/{mix_id}/content", **payload}
+            "download_url": f"/api/v1/audio/mixes/{mix_id}/content", **payload,
+            "usage": record_internal_usage(
+                provider="ffmpeg", unit="cpu_second", quantity=float(duration),
+                operation_id=mix_id, capability="audio_mix", run_id=run_id,
+                note=f"混音 {mix_id} 的 CPU 秒（按输出时长折算，内部估算）")}
 
 
 @app.get("/api/v1/audio/mixes/{mix_id}/content")
@@ -10290,6 +10379,535 @@ def download_batch_archive(batch_id: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(404, "批次归档不存在，请先生成")
     return FileResponse(path, media_type="application/zip", filename=path.name)
+
+
+# ---------------------------------------------------------------------------
+# V6-06 资源与成本账本：用量事件去重、预算预留与对账、四类金额与可用额度
+# 诚实边界：预估不是强制封顶；无已知报价不得假设 0；自管资源标注内部估算。
+# ---------------------------------------------------------------------------
+
+class UsageEventRequest(BaseModel):
+    provider: str
+    operation_id: str
+    unit: str
+    quantity: float
+    billing_item: str = "default"
+    event_id: str = ""
+    capability: str | None = None
+    run_id: str | None = None
+    batch_id: str | None = None
+    budget_id: str | None = None
+    explicit_price: float | None = None
+    currency: str | None = None
+    occurred_at: str | None = None
+    note: str = ""
+
+
+class BudgetCreateRequest(BaseModel):
+    name: str
+    currency: str = "USD"
+    limit_amount: float | None = None
+    note: str = ""
+
+
+class BudgetUpdateRequest(BaseModel):
+    revision: int
+    limit_amount: float | None = None
+    reason: str = ""
+
+
+class BudgetReserveRequest(BaseModel):
+    estimate_upper_bound: float
+    run_id: str | None = None
+    batch_id: str | None = None
+    note: str = ""
+
+
+class BudgetSettleRequest(BaseModel):
+    reservation_id: str
+    actual_amount: float
+    usage_event_id: str | None = None
+    note: str = ""
+
+
+def _ledger_entry_public(row: sqlite3.Row) -> dict:
+    try:
+        payload = json.loads(row["payload"])
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    return {
+        "id": row["id"], "budget_id": row["budget_id"], "kind": row["kind"],
+        "amount": row["amount"], "currency": row["currency"], "run_id": row["run_id"],
+        "batch_id": row["batch_id"], "usage_event_id": row["usage_event_id"],
+        "note": row["note"], "created_at": row["created_at"], "refs": payload.get("refs", {}),
+        "settled_at": (row["settled_at"] if "settled_at" in row.keys() else None),
+        "settled_entry_id": (row["settled_entry_id"] if "settled_entry_id" in row.keys() else None),
+    }
+
+
+def _budget_rows(db: sqlite3.Connection, owner_id: str, project_id: str,
+                 budget_id: str | None = None) -> list[sqlite3.Row]:
+    if budget_id:
+        return db.execute(
+            "SELECT * FROM budgets WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (budget_id, owner_id, project_id),
+        ).fetchall()
+    return db.execute(
+        "SELECT * FROM budgets WHERE owner_id = ? AND project_id = ? ORDER BY created_at ASC",
+        (owner_id, project_id),
+    ).fetchall()
+
+
+def _budget_public(row: sqlite3.Row, entries: list[dict]) -> dict:
+    snapshot = ledger.budget_snapshot(entries, row["limit_amount"])
+    return {
+        "id": row["id"], "name": row["name"], "currency": row["currency"],
+        "limit_amount": row["limit_amount"], "revision": row["revision"],
+        "created_at": row["created_at"], "updated_at": row["updated_at"],
+        "entries": len(entries), **snapshot,
+    }
+
+
+def _insert_ledger_entry(db: sqlite3.Connection, *, owner_id: str, project_id: str, budget_id: str | None,
+                         kind: str, amount: float, currency: str, run_id: str | None = None,
+                         batch_id: str | None = None, usage_event_id: str | None = None,
+                         note: str = "", refs: dict | None = None) -> str:
+    entry = ledger.ledger_entry(kind=kind, amount=amount, currency=currency, refs=refs or {}, note=note)
+    entry_id = str(uuid.uuid4())
+    payload_text = _canonical_json_text({
+        "kind": entry["kind"], "amount": entry["amount"], "currency": entry["currency"],
+        "refs": entry["refs"], "note": note,
+    })
+    db.execute(
+        "INSERT INTO cost_ledger(id, owner_id, project_id, budget_id, kind, amount, currency, run_id, batch_id, "
+        "usage_event_id, note, payload, payload_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (entry_id, owner_id, project_id, budget_id, entry["kind"], entry["amount"], entry["currency"],
+         run_id, batch_id, usage_event_id, note, payload_text,
+         hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), utc_now()),
+    )
+    return entry_id
+
+
+def _budget_entries(db: sqlite3.Connection, budget_ids: list[str]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {budget_id: [] for budget_id in budget_ids}
+    if not budget_ids:
+        return grouped
+    placeholders = ", ".join("?" for _ in budget_ids)
+    rows = db.execute(
+        f"SELECT * FROM cost_ledger WHERE budget_id IN ({placeholders}) ORDER BY created_at ASC",
+        tuple(budget_ids),
+    ).fetchall()
+    for row in rows:
+        grouped.setdefault(row["budget_id"], []).append(_ledger_entry_public(row))
+    return grouped
+
+
+def record_internal_usage(*, provider: str, unit: str, quantity: float, operation_id: str,
+                          capability: str, run_id: str | None = None, batch_id: str | None = None,
+                          event_id: str = "", note: str = "") -> dict | None:
+    """自管资源用量自动登记：真实生产动作（渲染/合成/合成音频）也进入账本。
+
+    账本失败绝不阻断生产流程，但也绝不伪造金额：无已知报价时 amount 为 None 并给出原因。
+    """
+    try:
+        if quantity is None or float(quantity) <= 0:
+            return None
+        owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+        billing_item = unit
+        dedupe_key = ledger.usage_event_key(
+            provider=provider, operation_id=operation_id, billing_item=billing_item,
+            event_id=event_id or f"{provider}:{operation_id}",
+        )
+        with connect() as db:
+            existing = db.execute("SELECT * FROM usage_events WHERE dedupe_key = ?", (dedupe_key,)).fetchone()
+            if existing:
+                return {"id": existing["id"], "deduplicated": True, "amount": existing["amount"]}
+            price = ledger.price_for_event(provider, unit, float(quantity))
+            currency = price.get("currency") or "USD"
+            budget_row = db.execute(
+                "SELECT id FROM budgets WHERE owner_id = ? AND project_id = ? ORDER BY created_at ASC LIMIT 1",
+                (owner_id, project_id),
+            ).fetchone()
+            usage_id = str(uuid.uuid4())
+            occurred = utc_now()
+            payload = {
+                "provider": provider, "operation_id": operation_id, "billing_item": billing_item,
+                "unit": unit, "quantity": round(float(quantity), 6), "capability": capability,
+                "run_id": run_id, "batch_id": batch_id, "amount": price["amount"],
+                "amount_source": price["source"], "currency": currency, "note": note,
+                "internal_estimate": provider in ledger.INTERNAL_PROVIDERS,
+                "collected_by": "system",
+            }
+            payload_text = _canonical_json_text(payload)
+            db.execute(
+                "INSERT INTO usage_events(id, owner_id, project_id, provider, operation_id, billing_item, event_id, "
+                "dedupe_key, unit, quantity, run_id, batch_id, capability, internal_estimate, amount, amount_source, "
+                "currency, occurred_at, payload, payload_sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (usage_id, owner_id, project_id, provider, operation_id, billing_item, event_id or operation_id,
+                 dedupe_key, unit, round(float(quantity), 6), run_id, batch_id, capability,
+                 1 if provider in ledger.INTERNAL_PROVIDERS else 0, price["amount"], price["source"], currency,
+                 occurred, payload_text, hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), occurred),
+            )
+            if price["priced"]:
+                _insert_ledger_entry(
+                    db, owner_id=owner_id, project_id=project_id,
+                    budget_id=budget_row["id"] if budget_row else None, kind="accrued",
+                    amount=float(price["amount"]), currency=currency, run_id=run_id, batch_id=batch_id,
+                    usage_event_id=usage_id, note=note or "自管资源用量自动登记（内部估算）",
+                    refs={"provider": provider, "unit": unit, "quantity": round(float(quantity), 6)},
+                )
+            return {"id": usage_id, "deduplicated": False, "priced": price["priced"],
+                    "amount": price["amount"], "amount_source": price["source"]}
+    except Exception as exc:  # 记账失败不影响生产，但会明确打印到 stderr
+        print(f"[ledger] 内部用量登记失败 {provider}/{unit}: {exc}", file=sys.stderr)
+        return None
+
+
+@app.get("/api/v1/rate-card")
+def get_internal_rate_card() -> dict:
+    """内部成本率：仅用于估算，不代表真实云账单；不构成对外报价。"""
+    return ledger.internal_rate_card()
+
+
+@app.post("/api/v1/usage-events", status_code=201)
+def register_usage_event(request: UsageEventRequest) -> dict:
+    """登记 Provider 用量：按 (provider, operation_id, billing_item, event_id) 去重，重放不重复计费。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    if request.unit not in ledger.RESOURCE_UNITS:
+        raise HTTPException(422, {"code": "UNKNOWN_UNIT", "detail": f"未知资源单位 {request.unit}",
+                                  "units": list(ledger.RESOURCE_UNITS)})
+    if request.quantity < 0:
+        raise HTTPException(422, {"code": "NEGATIVE_QUANTITY", "detail": "用量不能为负"})
+    if request.currency and request.currency not in ledger.CURRENCIES:
+        raise HTTPException(422, {"code": "UNKNOWN_CURRENCY", "detail": f"不支持的币种 {request.currency}",
+                                  "currencies": list(ledger.CURRENCIES)})
+    event_key = ledger.usage_event_key(
+        provider=request.provider, operation_id=request.operation_id,
+        billing_item=request.billing_item, event_id=request.event_id or f"{request.provider}:{request.operation_id}",
+    )
+    with connect() as db:
+        begin_immediate(db)
+        existing = db.execute("SELECT * FROM usage_events WHERE dedupe_key = ?", (event_key,)).fetchone()
+        if existing:
+            return {
+                "id": existing["id"], "deduplicated": True, "provider": existing["provider"],
+                "operation_id": existing["operation_id"], "unit": existing["unit"],
+                "quantity": existing["quantity"], "amount": existing["amount"],
+                "currency": existing["currency"], "occurred_at": existing["occurred_at"],
+                "note": "同一 Provider 同一次操作的重复回调不会重复计费（返回已登记事件）",
+            }
+        price = ledger.price_for_event(request.provider, request.unit, request.quantity,
+                                       explicit_price=request.explicit_price)
+        currency = request.currency or price.get("currency") or "USD"
+        budget_row = None
+        if request.budget_id:
+            budget_row = db.execute(
+                "SELECT * FROM budgets WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.budget_id, owner_id, project_id),
+            ).fetchone()
+            if not budget_row:
+                raise HTTPException(404, "预算账户不存在")
+        else:
+            budget_row = db.execute(
+                "SELECT * FROM budgets WHERE owner_id = ? AND project_id = ? ORDER BY created_at ASC LIMIT 1",
+                (owner_id, project_id),
+            ).fetchone()
+        usage_id = str(uuid.uuid4())
+        occurred = request.occurred_at or utc_now()
+        payload = {
+            "provider": request.provider, "operation_id": request.operation_id,
+            "billing_item": request.billing_item, "unit": request.unit,
+            "quantity": round(float(request.quantity), 6), "capability": request.capability,
+            "run_id": request.run_id, "batch_id": request.batch_id, "amount": price["amount"],
+            "amount_source": price["source"], "currency": currency, "note": request.note,
+            "internal_estimate": request.provider in ledger.INTERNAL_PROVIDERS,
+            "collected_by": "api",
+        }
+        payload_text = _canonical_json_text(payload)
+        db.execute(
+            "INSERT INTO usage_events(id, owner_id, project_id, provider, operation_id, billing_item, event_id, "
+            "dedupe_key, unit, quantity, run_id, batch_id, capability, internal_estimate, amount, amount_source, "
+            "currency, occurred_at, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (usage_id, owner_id, project_id, request.provider, request.operation_id, request.billing_item,
+             request.event_id or request.operation_id, event_key, request.unit, round(float(request.quantity), 6),
+             request.run_id, request.batch_id, request.capability,
+             1 if request.provider in ledger.INTERNAL_PROVIDERS else 0,
+             price["amount"], price["source"], currency, occurred, payload_text,
+             hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), utc_now()),
+        )
+        ledger_entry_id = None
+        if price["priced"]:
+            ledger_entry_id = _insert_ledger_entry(
+                db, owner_id=owner_id, project_id=project_id,
+                budget_id=budget_row["id"] if budget_row else None, kind="accrued",
+                amount=float(price["amount"]), currency=currency, run_id=request.run_id,
+                batch_id=request.batch_id, usage_event_id=usage_id,
+                note=request.note or f"{request.provider} 用量登记（{price['source']}）",
+                refs={"provider": request.provider, "unit": request.unit,
+                      "quantity": round(float(request.quantity), 6)},
+            )
+    return {
+        "id": usage_id, "deduplicated": False, "provider": request.provider,
+        "operation_id": request.operation_id, "billing_item": request.billing_item, "unit": request.unit,
+        "quantity": round(float(request.quantity), 6), "amount": price["amount"], "currency": currency,
+        "amount_source": price["source"], "priced": price["priced"],
+        "internal_estimate": request.provider in ledger.INTERNAL_PROVIDERS,
+        "budget_id": budget_row["id"] if budget_row else None,
+        "ledger_entry_id": ledger_entry_id,
+        "unpriced_reason": None if price["priced"] else price.get("reason"),
+        "occurred_at": occurred,
+    }
+
+
+@app.get("/api/v1/usage")
+def list_usage(run_id: str = "", batch_id: str = "", provider: str = "", unit: str = "",
+               limit: int = 200) -> dict:
+    """用量查询：服务端聚合，UI 不自行相加；未定价事件单独列出，不按 0 计入。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    query = "SELECT * FROM usage_events WHERE owner_id = ? AND project_id = ?"
+    params: list = [owner_id, project_id]
+    if run_id:
+        query += " AND run_id = ?"
+        params.append(run_id)
+    if batch_id:
+        query += " AND batch_id = ?"
+        params.append(batch_id)
+    if provider:
+        query += " AND provider = ?"
+        params.append(provider)
+    if unit:
+        query += " AND unit = ?"
+        params.append(unit)
+    query += " ORDER BY occurred_at DESC LIMIT ?"
+    params.append(max(1, min(int(limit), 500)))
+    with connect() as db:
+        rows = db.execute(query, tuple(params)).fetchall()
+    events = [{
+        "id": row["id"], "provider": row["provider"], "operation_id": row["operation_id"],
+        "billing_item": row["billing_item"], "unit": row["unit"], "quantity": row["quantity"],
+        "run_id": row["run_id"], "batch_id": row["batch_id"], "capability": row["capability"],
+        "amount": row["amount"], "amount_source": row["amount_source"], "currency": row["currency"],
+        "internal_estimate": bool(row["internal_estimate"]), "occurred_at": row["occurred_at"],
+        "unpriced": row["amount"] is None,
+    } for row in rows]
+    summary = ledger.resource_summary(events)
+    priced_total = round(sum(float(e["amount"]) for e in events if e["amount"] is not None), 6)
+    return {
+        "summary": summary, "events": events,
+        "priced_total": priced_total,
+        "unpriced_event_ids": [e["id"] for e in events if e["unpriced"]],
+        "filters": {"run_id": run_id or None, "batch_id": batch_id or None,
+                    "provider": provider or None, "unit": unit or None},
+        "note": "未定价事件不按 0 计入金额；自管资源按内部成本率估算并标注 internal_estimate",
+    }
+
+
+@app.get("/api/v1/costs")
+def get_costs(budget_id: str = "", run_id: str = "", batch_id: str = "") -> dict:
+    """成本视图：预算快照 + 账本明细（四类金额分开显示，reserved 不与 settled 相加）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        budgets = _budget_rows(db, owner_id, project_id, budget_id or None)
+        if budget_id and not budgets:
+            raise HTTPException(404, "预算账户不存在")
+        grouped = _budget_entries(db, [row["id"] for row in budgets])
+        entry_query = "SELECT * FROM cost_ledger WHERE owner_id = ? AND project_id = ?"
+        entry_params: list = [owner_id, project_id]
+        if budget_id:
+            entry_query += " AND budget_id = ?"
+            entry_params.append(budget_id)
+        if run_id:
+            entry_query += " AND run_id = ?"
+            entry_params.append(run_id)
+        if batch_id:
+            entry_query += " AND batch_id = ?"
+            entry_params.append(batch_id)
+        entry_query += " ORDER BY created_at DESC LIMIT 500"
+        entry_rows = db.execute(entry_query, tuple(entry_params)).fetchall()
+        unattached_rows = db.execute(
+            "SELECT * FROM cost_ledger WHERE owner_id = ? AND project_id = ? AND budget_id IS NULL "
+            "ORDER BY created_at ASC LIMIT 500",
+            (owner_id, project_id),
+        ).fetchall()
+    unattached = [_ledger_entry_public(row) for row in unattached_rows]
+    by_kind: dict[str, float] = {kind: 0.0 for kind in ledger.LEDGER_KINDS}
+    by_currency: dict[str, float] = {}
+    for row in entry_rows:
+        by_kind[row["kind"]] = round(by_kind.get(row["kind"], 0.0) + float(row["amount"]), 6)
+        if row["kind"] in ("settled", "accrued"):
+            by_currency[row["currency"]] = round(by_currency.get(row["currency"], 0.0) + float(row["amount"]), 6)
+    return {
+        "budgets": [_budget_public(row, grouped.get(row["id"], [])) for row in budgets],
+        "entries": [_ledger_entry_public(row) for row in entry_rows],
+        "by_kind": by_kind,
+        "actual_by_currency": by_currency,
+        "unattached_snapshot": ledger.budget_snapshot(unattached, None),
+        "rate_card": ledger.internal_rate_card(),
+        "filters": {"budget_id": budget_id or None, "run_id": run_id or None, "batch_id": batch_id or None},
+        "note": "actual = settled + accrued_unreserved；reserved 是承诺未对账，单独显示，不与 actual 相加",
+    }
+
+
+@app.get("/api/v1/budgets")
+def list_budgets() -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        rows = _budget_rows(db, owner_id, project_id)
+        grouped = _budget_entries(db, [row["id"] for row in rows])
+    return [_budget_public(row, grouped.get(row["id"], [])) for row in rows]
+
+
+@app.post("/api/v1/budgets", status_code=201)
+def create_budget(request: BudgetCreateRequest) -> dict:
+    """建立预算账户。无上限预算不能用于付费路线（无已知报价不得按 0 估算）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    if request.currency not in ledger.CURRENCIES:
+        raise HTTPException(422, {"code": "UNKNOWN_CURRENCY", "detail": f"不支持的币种 {request.currency}",
+                                  "currencies": list(ledger.CURRENCIES)})
+    if request.limit_amount is not None and request.limit_amount < 0:
+        raise HTTPException(422, {"code": "NEGATIVE_LIMIT", "detail": "预算上限不能为负"})
+    budget_id = str(uuid.uuid4())
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO budgets(id, owner_id, project_id, name, currency, limit_amount, revision, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (budget_id, owner_id, project_id, request.name, request.currency, request.limit_amount, 1, now, now),
+        )
+    return {
+        "id": budget_id, "name": request.name, "currency": request.currency,
+        "limit_amount": request.limit_amount, "revision": 1, "created_at": now, "updated_at": now,
+        "entries": 0, **ledger.budget_snapshot([], request.limit_amount),
+        "note": request.note or "预算上限变更只影响后续提交与预留，不追溯已发生金额",
+    }
+
+
+@app.patch("/api/v1/budgets/{budget_id}")
+def update_budget(budget_id: str, request: BudgetUpdateRequest) -> dict:
+    """调整预算上限：乐观锁（revision）+ 只影响后续提交；已发生的 settled 不被改写。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    if request.limit_amount is not None and request.limit_amount < 0:
+        raise HTTPException(422, {"code": "NEGATIVE_LIMIT", "detail": "预算上限不能为负"})
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM budgets WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (budget_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "预算账户不存在")
+        if int(request.revision) != int(row["revision"]):
+            raise HTTPException(409, {
+                "code": "revision_conflict",
+                "detail": f"revision 不一致（提交 {request.revision}，当前 {row['revision']}）：请重新读取后再改",
+                "current_revision": row["revision"],
+            })
+        now = utc_now()
+        revision = int(row["revision"]) + 1
+        db.execute("UPDATE budgets SET limit_amount = ?, revision = ?, updated_at = ? WHERE id = ?",
+                   (request.limit_amount, revision, now, budget_id))
+        grouped = _budget_entries(db, [budget_id])
+        updated = db.execute("SELECT * FROM budgets WHERE id = ?", (budget_id,)).fetchone()
+    return {
+        **_budget_public(updated, grouped.get(budget_id, [])),
+        "previous_limit_amount": row["limit_amount"], "reason": request.reason,
+        "note": "上限调整只影响后续预留与提交；已确认金额保持不变（不追溯改写历史）",
+    }
+
+
+@app.post("/api/v1/budgets/{budget_id}/reserve")
+def reserve_budget(budget_id: str, request: BudgetReserveRequest) -> dict:
+    """提交前预留：可用额度不足则阻断（409），不静默降级也不假设 0 成本。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    if request.estimate_upper_bound <= 0:
+        raise HTTPException(422, {"code": "INVALID_ESTIMATE", "detail": "预估上界必须大于 0"})
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM budgets WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (budget_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "预算账户不存在")
+        grouped = _budget_entries(db, [budget_id])
+        entries = grouped.get(budget_id, [])
+        check = ledger.check_budget({"limit_amount": row["limit_amount"]}, entries, request.estimate_upper_bound)
+        if not check["allowed"]:
+            raise HTTPException(409, {"code": check["code"], "detail": check["reason"],
+                                      "snapshot": check.get("snapshot")})
+        reservation_id = _insert_ledger_entry(
+            db, owner_id=owner_id, project_id=project_id, budget_id=budget_id, kind="reserved",
+            amount=float(request.estimate_upper_bound), currency=row["currency"], run_id=request.run_id,
+            batch_id=request.batch_id, note=request.note or "提交前预留（预估上界）",
+            refs={"estimate_upper_bound": round(float(request.estimate_upper_bound), 6)},
+        )
+        grouped_after = _budget_entries(db, [budget_id])
+    snapshot = ledger.budget_snapshot(grouped_after.get(budget_id, []), row["limit_amount"])
+    return {
+        "budget_id": budget_id, "reservation_id": reservation_id,
+        "reserved_amount": round(float(request.estimate_upper_bound), 6), "currency": row["currency"],
+        "snapshot": snapshot,
+        "note": "预留不是实际支出；对账后必须按实际金额 settle，超支记入 additional_accrual",
+    }
+
+
+@app.post("/api/v1/budgets/{budget_id}/settle")
+def settle_budget(budget_id: str, request: BudgetSettleRequest) -> dict:
+    """对账：冲销预留并记入实际金额；实际高于预留时如实报告超支（预估不是封顶）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    if request.actual_amount < 0:
+        raise HTTPException(422, {"code": "NEGATIVE_AMOUNT", "detail": "实际金额不能为负"})
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM budgets WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (budget_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "预算账户不存在")
+        reservation = db.execute(
+            "SELECT * FROM cost_ledger WHERE id = ? AND budget_id = ? AND kind = 'reserved'",
+            (request.reservation_id, budget_id),
+        ).fetchone()
+        if not reservation:
+            raise HTTPException(404, {"code": "reservation_not_found",
+                                      "detail": f"预留记录 {request.reservation_id} 不存在于该预算"})
+        reserved_amount = float(reservation["amount"])
+        if reservation["settled_at"]:
+            raise HTTPException(409, {
+                "code": "reservation_settled",
+                "detail": f"该预留已于 {reservation['settled_at']} 对账，不能重复结算（避免双计成本）",
+                "settled_entry_id": reservation["settled_entry_id"],
+            })
+        if reserved_amount <= 0:
+            raise HTTPException(409, {"code": "reservation_settled",
+                                      "detail": "该预留金额为 0 或已冲销，不能重复结算"})
+        settle = ledger.settle_reservation(reserved_amount=reserved_amount,
+                                          actual_amount=float(request.actual_amount))
+        _insert_ledger_entry(
+            db, owner_id=owner_id, project_id=project_id, budget_id=budget_id, kind="reserved",
+            amount=-reserved_amount, currency=row["currency"], run_id=reservation["run_id"],
+            batch_id=reservation["batch_id"], note=f"预留对账冲销 {request.reservation_id}",
+            refs={"reversal_of": request.reservation_id},
+        )
+        settled_id = _insert_ledger_entry(
+            db, owner_id=owner_id, project_id=project_id, budget_id=budget_id, kind="settled",
+            amount=float(request.actual_amount), currency=row["currency"], run_id=reservation["run_id"],
+            batch_id=reservation["batch_id"], usage_event_id=request.usage_event_id,
+            note=request.note or "对账确认实际金额",
+            refs={"reservation_id": request.reservation_id, "overrun": settle["overrun"]},
+        )
+        db.execute("UPDATE cost_ledger SET settled_at = ?, settled_entry_id = ? WHERE id = ?",
+                   (utc_now(), settled_id, request.reservation_id))
+        grouped_after = _budget_entries(db, [budget_id])
+    snapshot = ledger.budget_snapshot(grouped_after.get(budget_id, []), row["limit_amount"])
+    return {
+        "budget_id": budget_id, "reservation_id": request.reservation_id, "settled_entry_id": settled_id,
+        "currency": row["currency"], **settle, "snapshot": snapshot,
+        "note": "取消不等于无费用：已提交的调用仍需按实际金额对账",
+    }
 
 
 class ProductionShotInput(BaseModel):

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive, ArrowClockwise, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
-  Clock, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
+  Clock, Coins, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
   MagnifyingGlass, MonitorPlay, Package, PencilSimple, Play, Plus, Queue,
   ShieldCheck, SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, User, VideoCamera, WarningCircle, X,
 } from "@phosphor-icons/react";
@@ -19,7 +19,7 @@ const navItems = [
   ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck],
   ["interaction", "人物互动", User], ["reference", "参考重演", VideoCamera],
   ["profiles", "平台配置", SquaresFour], ["batch", "批次生产", Queue],
-  ["audio", "音频与音乐", MonitorPlay], ["packages", "发布包", Package], ["settings", "设置", Gear],
+  ["audio", "音频与音乐", MonitorPlay], ["packages", "发布包", Package], ["costs", "成本与用量", Coins], ["settings", "设置", Gear],
 ];
 const defaultShots = [
   { id: "shot_01", name: "正面推近", camera: "dolly_in", focal_length_mm: 35, duration_frames: 48 },
@@ -1167,6 +1167,253 @@ function PackagePage() {
   </section>;
 }
 
+function CostPage() {
+  const [budgets, setBudgets] = useState([]);
+  const [usage, setUsage] = useState(null);
+  const [costs, setCosts] = useState(null);
+  const [rateCard, setRateCard] = useState(null);
+  const [runs, setRuns] = useState([]);
+  const [runId, setRunId] = useState("");
+  const [budgetForm, setBudgetForm] = useState({ name: "月度生产预算", currency: "USD", limit_amount: 20 });
+  const [editForm, setEditForm] = useState({ budget_id: "", revision: "", limit_amount: "" });
+  const [reserveForm, setReserveForm] = useState({ estimate_upper_bound: 1.5, note: "" });
+  const [usageForm, setUsageForm] = useState({
+    provider: "h3-comfyui", operation_id: "", unit: "video_generation_request", quantity: 1,
+    explicit_price: "", currency: "USD", note: "",
+  });
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { load(); }, [runId]);
+  useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(null), 8000); return () => clearTimeout(timer); } }, [notice]);
+
+  const money = (value, currency) => (value === null || value === undefined ? "—" : `${value} ${currency || ""}`.trim());
+
+  async function load() {
+    const query = runId ? `?run_id=${runId}` : "";
+    const [b, r, u, c, j] = await Promise.all([
+      apiRequest("/budgets"), apiRequest("/rate-card"), apiRequest(`/usage${query}`),
+      apiRequest(`/costs${query}`), apiRequest("/jobs"),
+    ]);
+    if (b.ok) {
+      const body = await b.json();
+      setBudgets(body);
+      setEditForm((value) => (value.budget_id ? value : {
+        budget_id: body[0]?.id || "", revision: body[0]?.revision ?? "", limit_amount: body[0]?.limit_amount ?? "",
+      }));
+    }
+    if (r.ok) setRateCard(await r.json());
+    if (u.ok) setUsage(await u.json());
+    if (c.ok) setCosts(await c.json());
+    if (j.ok) setRuns((await j.json()).filter((item) => item.run_id));
+  }
+  function pickBudget(budget) {
+    setEditForm({ budget_id: budget.id, revision: budget.revision, limit_amount: budget.limit_amount ?? "" });
+  }
+  async function createBudget() {
+    setBusy(true);
+    try {
+      const response = await apiRequest("/budgets", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: budgetForm.name, currency: budgetForm.currency,
+          limit_amount: budgetForm.limit_amount === "" ? null : Number(budgetForm.limit_amount),
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "建立预算失败");
+      setNotice(["success", `预算已建立（revision ${body.revision}）${body.limit_amount === null ? "：未设上限，付费路线会被阻断" : ""}`]);
+      await load();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function updateBudget() {
+    if (!editForm.budget_id) { setNotice(["danger", "请先选择预算账户"]); return; }
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/budgets/${editForm.budget_id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          revision: Number(editForm.revision),
+          limit_amount: editForm.limit_amount === "" ? null : Number(editForm.limit_amount),
+          reason: "控制台调整",
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "调整失败");
+      setNotice(["success", `上限已更新为 ${money(body.limit_amount, body.currency)}（revision ${body.revision}，不追溯已发生金额）`]);
+      await load();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function reserve() {
+    if (!editForm.budget_id) { setNotice(["danger", "请先选择预算账户"]); return; }
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/budgets/${editForm.budget_id}/reserve`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ estimate_upper_bound: Number(reserveForm.estimate_upper_bound), note: reserveForm.note }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "预留失败");
+      setNotice(["success", `预留成功：可用额度剩余 ${money(body.snapshot.available, body.currency)}`]);
+      await load();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function settle(reservation) {
+    const actual = window.prompt(`对账实际金额（预留 ${reservation.amount} ${reservation.currency}）`,
+      String(reservation.amount));
+    if (actual === null) return;
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/budgets/${reservation.budget_id}/settle`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reservation_id: reservation.id, actual_amount: Number(actual), note: "控制台对账" }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "对账失败");
+      setNotice([body.overrun ? "warning" : "success",
+        body.overrun
+          ? `对账完成：实际超出预留 ${money(body.additional_accrual, body.currency)}（预估不是封顶，差异已如实记录）`
+          : `对账完成：释放预留 ${money(body.release, body.currency)}`]);
+      await load();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function registerUsage() {
+    setBusy(true);
+    try {
+      const response = await apiRequest("/usage-events", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: usageForm.provider, operation_id: usageForm.operation_id || `manual-${Date.now()}`,
+          unit: usageForm.unit, quantity: Number(usageForm.quantity),
+          explicit_price: usageForm.explicit_price === "" ? null : Number(usageForm.explicit_price),
+          currency: usageForm.currency, capability: "manual_entry", note: usageForm.note,
+          run_id: runId || null,
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "登记失败");
+      setNotice([body.priced ? "success" : "warning",
+        body.priced
+          ? `用量已登记：${money(body.amount, body.currency)}（${body.amount_source}${body.internal_estimate ? " · 内部估算" : ""}）`
+          : `用量已登记但未定价：${body.unpriced_reason}`]);
+      await load();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+
+  const reservations = (costs?.entries || []).filter((item) => item.kind === "reserved" && item.amount > 0 && !item.settled_at);
+  const totals = costs?.by_kind || {};
+
+  return <section className="page">
+    <div className="page-head"><div><b>V6 COST LEDGER</b><h1>成本与用量</h1>
+      <p>可用额度 = 上限 − 已确认 − 未结预留 − 未预留已发生；预留是承诺不是支出，控制台不会把两者相加。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    <div className="two-col">
+      <section className="card">
+        <div className="card-head"><div><h2>预算账户</h2><small>{costs?.note}</small></div></div>
+        <table className="table"><thead><tr><th>预算</th><th>上限</th><th>已确认</th><th>未结预留</th><th>未预留已发生</th><th>可用</th></tr></thead>
+          <tbody>{budgets.map((item) => <tr key={item.id} onClick={() => pickBudget(item)} style={{ cursor: "pointer" }}>
+            <td>{item.name}<small>rev {item.revision} · {item.currency}</small></td>
+            <td>{money(item.limit_amount, item.currency)}</td>
+            <td>{item.settled}</td>
+            <td>{item.reserved_outstanding}</td>
+            <td>{item.accrued_unreserved}</td>
+            <td><b>{money(item.available, item.currency)}</b></td></tr>)}</tbody></table>
+        {!budgets.length && <p className="capability-note"><WarningCircle weight="fill" />还没有预算账户：付费路线必须先建立预算，系统不会假设 0 成本。</p>}
+        <div className="action-row">
+          <div className="inline-fields">
+            <label>名称<input value={budgetForm.name} onChange={(event) => setBudgetForm({ ...budgetForm, name: event.target.value })} /></label>
+            <label>币种<select value={budgetForm.currency} onChange={(event) => setBudgetForm({ ...budgetForm, currency: event.target.value })}>
+              <option value="USD">USD</option><option value="MXN">MXN</option><option value="CNY">CNY</option></select></label>
+            <label>上限<input value={budgetForm.limit_amount} onChange={(event) => setBudgetForm({ ...budgetForm, limit_amount: event.target.value })} /></label>
+          </div>
+          <button className="primary" onClick={createBudget} disabled={busy}><Plus />建立预算</button>
+        </div>
+        <div className="action-row">
+          <div className="inline-fields">
+            <label>选中预算<input value={editForm.budget_id} onChange={(event) => setEditForm({ ...editForm, budget_id: event.target.value })} /></label>
+            <label>revision<input value={editForm.revision} onChange={(event) => setEditForm({ ...editForm, revision: event.target.value })} /></label>
+            <label>新上限<input value={editForm.limit_amount} onChange={(event) => setEditForm({ ...editForm, limit_amount: event.target.value })} /></label>
+          </div>
+          <button onClick={updateBudget} disabled={busy}><PencilSimple />调整上限</button>
+        </div>
+        <p className="capability-note"><WarningCircle weight="fill" />上限调整需要当前 revision（乐观锁）；过期的 revision 会被拒绝，避免覆盖他人的预算改动。</p>
+      </section>
+
+      <section className="card">
+        <div className="card-head"><div><h2>预留与对账</h2><small>预估不是强制封顶</small></div></div>
+        <div className="inline-fields">
+          <label>预估上界<input value={reserveForm.estimate_upper_bound} onChange={(event) => setReserveForm({ ...reserveForm, estimate_upper_bound: event.target.value })} /></label>
+          <label>说明<input value={reserveForm.note} onChange={(event) => setReserveForm({ ...reserveForm, note: event.target.value })} /></label>
+        </div>
+        <div className="action-row"><button className="primary" onClick={reserve} disabled={busy}><CheckCircle />提交前预留</button></div>
+        <table className="table"><thead><tr><th>预留</th><th>金额</th><th>关联</th><th>操作</th></tr></thead>
+          <tbody>{reservations.map((item) => <tr key={item.id}>
+            <td>{item.id.slice(0, 8)}<small>{formatTime(item.created_at)}</small></td>
+            <td>{money(item.amount, item.currency)}</td>
+            <td><small>{item.run_id ? `run ${item.run_id.slice(0, 8)}` : "未绑定运行"}</small></td>
+            <td><button onClick={() => settle(item)} disabled={busy}>对账</button></td></tr>)}</tbody></table>
+        {!reservations.length && <p className="capability-note">当前没有未结预留（已对账的预留会保留 settled_at 与结算记录，无法重复结算）。</p>}
+      </section>
+    </div>
+
+    <div className="two-col">
+      <section className="card">
+        <div className="card-head"><div><h2>用量登记</h2><small>{usage?.note}</small></div></div>
+        <div className="inline-fields">
+          <label>运行<select value={runId} onChange={(event) => setRunId(event.target.value)}>
+            <option value="">全部运行</option>
+            {runs.map((item) => <option value={item.run_id} key={item.run_id}>{item.run_id.slice(0, 8)}</option>)}</select></label>
+          <label>Provider<input value={usageForm.provider} onChange={(event) => setUsageForm({ ...usageForm, provider: event.target.value })} /></label>
+          <label>单位<select value={usageForm.unit} onChange={(event) => setUsageForm({ ...usageForm, unit: event.target.value })}>
+            {(usage?.summary?.units_supported || ["gpu_second", "cpu_second", "video_generation_request", "tts_character"]).map((unit) =>
+              <option value={unit} key={unit}>{unit}</option>)}</select></label>
+          <label>数量<input value={usageForm.quantity} onChange={(event) => setUsageForm({ ...usageForm, quantity: event.target.value })} /></label>
+          <label>显式单价（可空）<input value={usageForm.explicit_price} onChange={(event) => setUsageForm({ ...usageForm, explicit_price: event.target.value })} /></label>
+          <label>operation_id<input value={usageForm.operation_id} onChange={(event) => setUsageForm({ ...usageForm, operation_id: event.target.value })} placeholder="上游操作 ID" /></label>
+        </div>
+        <div className="action-row"><button className="primary" onClick={registerUsage} disabled={busy}><Plus />登记用量</button></div>
+        <p className="capability-note"><WarningCircle weight="fill" />同一 Provider 的同一次操作重复回调不会重复计费；没有已知报价时金额留空并标注原因，不按 0 计入。</p>
+        {rateCard && <div className="profile-detail">
+          <dl>
+            <dt>费率卡</dt><dd>{rateCard.kind}</dd>
+            <dt>说明</dt><dd>{rateCard.note}</dd>
+            {Object.entries(rateCard.rates).flatMap(([provider, rate]) => [
+              <dt key={`${provider}-k`}>{provider}</dt>,
+              <dd key={`${provider}-v`}>{rate.amount_per_unit} {rate.currency} / {rate.unit}</dd>,
+            ])}
+          </dl>
+        </div>}
+      </section>
+
+      <section className="card">
+        <div className="card-head"><div><h2>用量与成本汇总</h2><small>{usage?.summary?.event_count || 0} 条用量事件</small></div></div>
+        <div className="profile-detail">
+          <dl>
+            <dt>已确认 settled</dt><dd>{totals.settled ?? 0}</dd>
+            <dt>未结预留 reserved</dt><dd>{totals.reserved ?? 0}</dd>
+            <dt>未预留已发生 accrued</dt><dd>{totals.accrued ?? 0}</dd>
+            <dt>已定价合计</dt><dd>{usage?.priced_total ?? 0}</dd>
+          </dl>
+        </div>
+        <table className="table"><thead><tr><th>Provider</th><th>单位</th><th>数量</th><th>事件</th><th>口径</th></tr></thead>
+          <tbody>{Object.entries(usage?.summary?.by_provider || {}).map(([provider, item]) => <tr key={provider}>
+            <td>{provider}</td><td>{item.unit}</td><td>{item.quantity}</td><td>{item.events}</td>
+            <td>{item.internal_estimate ? <Pill status="DRAFT" /> : <small>Provider 报价</small>}</td></tr>)}</tbody></table>
+        {!!usage?.unpriced_event_ids?.length && <p className="capability-note danger">
+          <WarningCircle weight="fill" />{usage.unpriced_event_ids.length} 条用量没有已知报价：不按 0 计费，需要管理员给出上限或阻断该付费路线。</p>}
+        <table className="table"><thead><tr><th>账本</th><th>类型</th><th>金额</th><th>标的</th><th>时间</th></tr></thead>
+          <tbody>{(costs?.entries || []).slice(0, 25).map((item) => <tr key={item.id}>
+            <td>{item.id.slice(0, 8)}<small>{item.note}</small></td>
+            <td>{item.kind}{item.settled_at ? <small>已对账</small> : null}</td>
+            <td>{money(item.amount, item.currency)}</td>
+            <td><small>{item.run_id ? `run ${item.run_id.slice(0, 8)}` : item.batch_id ? `batch ${item.batch_id.slice(0, 8)}` : "—"}</small></td>
+            <td>{formatTime(item.created_at)}</td></tr>)}</tbody></table>
+        {!costs?.entries?.length && <p className="capability-note">账本为空：真实渲染、混音、配音与 H3 生成都会自动登记为内部估算用量。</p>}
+      </section>
+    </div>
+  </section>;
+}
+
 function ReferencePage() {
   const [references, setReferences] = useState([]);
   const [versions, setVersions] = useState([]);
@@ -1508,7 +1755,7 @@ export function App() {
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "costs" ? <CostPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">
