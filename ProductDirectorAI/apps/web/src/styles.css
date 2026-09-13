@@ -244,3 +244,25 @@ td code { font-size: 9px; color: #4b5a6e; }
   font-size: 11px; word-break: break-all; white-space: pre-wrap; color: #23303f; }
 .card-head h3, .two-col h3 { font-size: 11px; margin: 12px 14px 4px; color: #596579; }
 @media (max-width: 1100px) { .two-col { grid-template-columns: 1fr; } }
+
+/* V6-16 独立复核修复：窄窗口导航可展开、生产计划面板、外观状态、输出规格摘要 */
+.nav-toggle { display: none; margin: 0 12px 6px; height: 30px; border: 1px solid #2b3b58; border-radius: 6px;
+  background: transparent; color: #9ba8bd; align-items: center; gap: 6px; font-size: 10px; cursor: pointer; }
+.nav-toggle:hover { color: #fff; background: #192944; }
+.sidebar .nav-toggle { justify-content: center; }
+.production-plan { margin: 12px 0 0; padding: 10px 12px; border: 1px dashed #d4dae5; border-radius: 8px; background: #fbfcfe; }
+.production-plan h3 { font-size: 11px; margin: 0 0 8px; color: #354055; }
+.production-plan .inline-fields { flex-wrap: wrap; }
+.production-plan p { font-size: 10px; color: #4b5a6e; margin: 4px 0; }
+.output-summary { font-size: 10px; color: #0e7a55; background: #e8f7f0; border-left: 2px solid #bfe8d6;
+  padding: 6px 9px; border-radius: 4px; margin: 6px 0; }
+.library button em.capability-note { font-style: normal; font-size: 9px; margin: 4px 0 0; }
+.capability-note.danger { color: #b3303f !important; background: #fdecee !important; border-left-color: #f3c3c9 !important; }
+.capability-note ul { margin: 4px 0 0; padding-left: 16px; }
+@media (max-width: 1120px) {
+  .sidebar .nav-toggle { display: flex; }
+  .sidebar.expanded { width: 224px; z-index: 40; box-shadow: 12px 0 30px rgba(12, 22, 40, .18); }
+  .sidebar.expanded .brand > div, .sidebar.expanded nav span, .sidebar.expanded .version > div { display: block; }
+  .sidebar.expanded nav button { justify-content: flex-start; padding: 0 14px; }
+  .sidebar.expanded + .main { margin-left: 224px; width: calc(100% - 224px); }
+}

@@ -19,6 +19,9 @@ from pydantic import BaseModel, Field, TypeAdapter
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DIRECTOR_PLAN_SCHEMA_PATH = REPO_ROOT / "contracts" / "director-plan.v1.schema.json"
+# V6-16：v1.1 是诚实报告版本（区分 requested/executed/verification，无占位 UUID）。
+# v1.0 保留为历史合同（固定 fidelity_mode=STRICT 与三镜头上限），不再用于导出。
+DIRECTOR_PLAN_SCHEMA_V11_PATH = REPO_ROOT / "contracts" / "director-plan.v1.1.schema.json"
 
 Vector3 = tuple[float, float, float]
 
@@ -109,8 +112,10 @@ def _as_tuples(value):
     return value
 
 
-def load_target_schema() -> dict:
-    return json.loads(DIRECTOR_PLAN_SCHEMA_PATH.read_text(encoding="utf-8"))
+def load_target_schema(version: str = "1.1") -> dict:
+    """加载目标合同 schema；默认 1.1（诚实报告），可显式取 "1.0" 做历史对照。"""
+    path = DIRECTOR_PLAN_SCHEMA_PATH if str(version) == "1.0" else DIRECTOR_PLAN_SCHEMA_V11_PATH
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _path_from_shot(shot: dict) -> dict:
@@ -132,12 +137,20 @@ def _path_as_lists(path: dict) -> dict:
     return _as_lists(path)
 
 
-def to_target_document(snapshot: dict) -> dict:
+def to_target_document(snapshot: dict, *, executed_mode: str | None = None,
+                       verification_status: str | None = None,
+                       product_version_id: str | None = None) -> dict:
     """运行时快照 → 符合根 Schema 的 3D 文档。
 
     目标合同把 `product_pose.scale` 限定为 1、`sensor_width_mm` 限定为 36。
     运行时已经支持更大范围，因此这里**显式报错**而不是悄悄裁剪或输出一份
     不合规的文档：合同与实现的范围差异必须可见（见 contracts/README.md）。
+
+    V6-16 修复（独立复核 BUG-05）：基础预演导出**不再固定写 STRICT**。
+    `fidelity_mode` 取**实际执行模式**（调用方传入），并额外给出
+    `requested_mode` / `executed_mode` / `verification_status` 三元组；
+    `product_version_id` 缺失时不再使用占位 UUID，而是显式 `null` +
+    `product_version_binding="UNKNOWN"`（合同 schema v1.1 允许）。
     """
     scene = SceneSpec.model_validate(snapshot.get("scene") or {})
     pose = ProductPose.model_validate(snapshot.get("product_pose") or {})
@@ -145,6 +158,15 @@ def to_target_document(snapshot: dict) -> dict:
         raise TargetContractError(
             f"目标合同要求 product_pose.scale = {TARGET_CONTRACT_PRODUCT_SCALE}，实际 {pose.scale}"
         )
+    requested_mode = str(snapshot.get("fidelity_mode") or "UNKNOWN")
+    resolved_executed = _normalize_executed_mode(executed_mode) if executed_mode else _executed_mode_from_requested(requested_mode)
+    resolved_product_version = product_version_id or snapshot.get("product_version_id") or None
+    # 验证状态：调用方明确给出时优先；否则按执行模式推导——非 STRICT 的执行必然是"未验证"，
+    # STRICT 但没有证据时只能是"未知"（不能默认 VERIFIED）。
+    resolved_verification = verification_status or (
+        "NOT_VERIFIED" if resolved_executed != "STRICT" else "UNKNOWN")
+    if resolved_verification not in ("VERIFIED", "NOT_VERIFIED", "UNKNOWN"):
+        resolved_verification = "UNKNOWN"
     output = snapshot.get("output") or {}
     shots = []
     for shot in snapshot.get("shots", []):
@@ -175,8 +197,9 @@ def to_target_document(snapshot: dict) -> dict:
             },
         })
     return {
-        "schema_version": "1.0",
-        "product_version_id": snapshot.get("product_version_id", "33333333-3333-4333-8333-333333333333"),
+        "schema_version": "1.1",
+        "product_version_id": resolved_product_version,
+        "product_version_binding": "VERSIONED" if resolved_product_version else "UNKNOWN",
         "intent": snapshot.get("intent", ""),
         "output": {
             "width": output.get("width", 540),
@@ -186,9 +209,36 @@ def to_target_document(snapshot: dict) -> dict:
             "video_codec": "h264",
             "pixel_format": "yuv420p",
         },
-        "fidelity_mode": "STRICT",
+        # fidelity_mode = 实际执行模式（不再固定 STRICT）
+        "fidelity_mode": resolved_executed,
+        "fidelity": {
+            "requested_mode": requested_mode,
+            "executed_mode": resolved_executed,
+            "verification_status": resolved_verification,
+            "note": ("executed_mode 是本次实际执行的模式；verification_status 只有真实严格链路通过才是 VERIFIED。"
+                     "基础预演不得被解读为已验收 Strict。"),
+        },
         "shots": shots,
     }
+
+
+EXECUTED_MODES = ("STRICT", "CONTROLLED", "CREATIVE")
+_REQUESTED_TO_EXECUTED = {
+    "STRICT_REQUESTED": "CONTROLLED",
+    "STRICT": "STRICT",
+    "CONTROLLED": "CONTROLLED",
+    "CREATIVE": "CREATIVE",
+}
+
+
+def _normalize_executed_mode(value: str) -> str:
+    mode = str(value).upper()
+    return mode if mode in EXECUTED_MODES else "CONTROLLED"
+
+
+def _executed_mode_from_requested(requested: str) -> str:
+    """请求了 STRICT 但没有严格链路证据时，实际执行模式只能是 CONTROLLED。"""
+    return _REQUESTED_TO_EXECUTED.get(str(requested).upper(), "CONTROLLED")
 
 
 def from_target_document(document: dict) -> dict:
@@ -210,6 +260,9 @@ def from_target_document(document: dict) -> dict:
     first_scene = document["shots"][0].get("scene") if document.get("shots") else None
     return {
         "intent": document.get("intent", ""),
+        # V6-16：往返时保留版本绑定（缺失就是缺失，不再落回占位 UUID）
+        "product_version_id": document.get("product_version_id"),
+        "fidelity_mode": document.get("fidelity_mode", "UNKNOWN"),
         "output": {
             "width": document["output"]["width"],
             "height": document["output"]["height"],

@@ -7,6 +7,11 @@ import {
 } from "@phosphor-icons/react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import {
+  PREVIEW_DURATION_OPTIONS, PREVIEW_SHOT_COUNT, batchFormFingerprint, buildPlanUpdateBody,
+  buildProductionPlanBody, buildTemplatePlanBody, detectUnsupportedRequirements, durationLabel,
+  navAccessibility, planStaleness, previewState, profileOptionLabel,
+} from "./lib/v6ui.js";
 
 const API_BASE = (import.meta.env.VITE_API_BASE || "").trim().replace(/\/$/, "");
 const API = `${API_BASE}/api/v1`;
@@ -96,9 +101,23 @@ function ModelPreview({ url }) {
 }
 
 function Sidebar({ active, onSelect }) {
-  return <aside className="sidebar">
+  // BUG-08：窄窗口会隐藏文字，必须保留可访问名称与悬浮提示（此前出现无名按钮）
+  const [expanded, setExpanded] = useState(false);
+  const nav = navAccessibility(navItems, active);
+  return <aside className={`sidebar${expanded ? " expanded" : ""}`}>
     <div className="brand"><img src="/assets/productdirector-mark.png" alt="" /><div><strong>ProductDirector<span>AI</span></strong><small>From product to story</small></div></div>
-    <nav>{navItems.map(([id, label, Icon]) => <button className={active === id ? "active" : ""} onClick={() => onSelect(id)} key={id}><Icon weight={active === id ? "fill" : "regular"} /><span>{label}</span></button>)}</nav>
+    <button className="nav-toggle" onClick={() => setExpanded((value) => !value)}
+      aria-expanded={expanded} aria-label={expanded ? "收起导航" : "展开导航"}
+      title={expanded ? "收起导航" : "展开导航（窄窗口下查看完整名称）"}>
+      {expanded ? <CaretRight /> : <CaretDown />}<span>导航</span>
+    </button>
+    <nav aria-label="主导航">{nav.map((item, index) => {
+      const Icon = navItems[index][2];
+      return <button className={active === item.id ? "active" : ""} onClick={() => onSelect(item.id)}
+        key={item.id} aria-label={item.ariaLabel} title={item.title} aria-current={item.ariaCurrent}>
+        <Icon weight={active === item.id ? "fill" : "regular"} /><span>{item.label}</span>
+      </button>;
+    })}</nav>
     <div className="version"><Cube /><div><strong>ProductDirectorAI</strong><small>V1 · 3D Director MVP</small></div></div>
   </aside>;
 }
@@ -141,22 +160,38 @@ function AssetCard({ asset, assetUrl, onUpload, onDemo, busy }) {
   </section>;
 }
 
-function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnchor, onCropAnchorChange, assetUrl, onGenerate, onAiGenerate, busy }) {
+function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnchor, onCropAnchorChange, assetUrl, onGenerate, onAiGenerate, busy, durationSeconds, onDurationChange, planState, unsupported, production }) {
   return <section className="card director-card">
-    <div className="card-head"><div><h2>导演描述</h2><span>V1 模板导演</span></div><button>高级设置 <CaretRight /></button></div>
+    <div className="card-head"><div><h2>导演描述</h2><span>V1 模板导演 · 基础预演</span></div><button>高级设置 <CaretRight /></button></div>
     <textarea value={intent} onChange={(e) => setIntent(e.target.value)} />
     <div className="counter"><span>{intent.length} / 4000</span><span>AI 导演：本地生成 + 服务端校验</span></div>
+    {planState?.stale && <p className="capability-note danger"><WarningCircle weight="fill" />{planState.reason}</p>}
+    {!!unsupported?.length && <div className="capability-note danger">
+      <WarningCircle weight="fill" />
+      <div><b>当前管线不支持的要求（不会被静默降级）</b>
+        <ul className="notes">{unsupported.map((item) => <li key={item.capability}><b>{item.capability}</b>：{item.detail}</li>)}</ul>
+      </div>
+    </div>}
     <div className="director-actions">
       <button className="primary" disabled={busy || !intent.trim()} onClick={onAiGenerate}><Sparkle weight="fill" />用描述生成分镜</button>
+      {production}
     </div>
     <div className="outputs">
-      {[["视频比例", "9:16 竖屏"], ["总时长", "6 秒"], ["帧率", "24 fps"]].map(([label, value]) => <label key={label}><span>{label}</span><button>{value}<CaretDown /></button></label>)}
+      {/* BUG-01：总时长是真实可操作的下拉；比例/帧率是固定规格，明确标为只读 */}
+      <label><span>总时长（基础预演）</span>
+        <select value={durationSeconds} onChange={(event) => onDurationChange(Number(event.target.value))}>
+          {PREVIEW_DURATION_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{durationLabel(seconds)}</option>)}
+        </select>
+      </label>
+      <label><span>镜头数（V1 合同固定）</span><button disabled title="V1 产品合同要求恰好 3 个镜头">{PREVIEW_SHOT_COUNT} SHOTS（只读）</button></label>
+      <label><span>视频比例 / 帧率（只读）</span><button disabled title="V1 输出规格：9:16 竖屏 @ 24fps">9:16 竖屏 · 24 fps</button></label>
       <label>
         <span>输出分辨率</span>
         <select value={`${output.width}x${output.height}`} onChange={(event) => onOutputChange(event.target.value)}>
           {outputPresets.map((item) => <option key={`${item.width}x${item.height}`} value={`${item.width}x${item.height}`}>{item.label}</option>)}
         </select>
       </label>
+      {plan && <p className="output-summary">本次实际输出规格：<b>{plan.output?.width}×{plan.output?.height}</b> · {plan.output?.fps}fps · {plan.output?.frame_count} 帧 · {((plan.output?.frame_count || 0) / (plan.output?.fps || 24)).toFixed(1)}s（来自冻结计划）</p>}
       <label>
         <span>裁切锚点（图片预演：横/竖素材进 9:16 保留哪一侧）</span>
         <select value={cropAnchor} onChange={(event) => onCropAnchorChange(event.target.value)}>
@@ -233,9 +268,28 @@ function Jobs({ jobs, selected, onOpen }) {
 }
 
 function Library({ assets, onSelect }) {
+  const appearanceTone = (info) => {
+    if (!info) return null;
+    return {
+      VERIFIED_APPEARANCE: ["success", "外观信息可核验"],
+      PARTIAL_APPEARANCE: ["warning", "外观部分覆盖（多材质纯色）"],
+      APPEARANCE_UNVERIFIED: ["danger", "外观未核验（无贴图/顶点色/UV）"],
+    }[info.appearance_level] || ["warning", `外观状态：${info.appearance_level || "未知"}`];
+  };
   return <section className="page">
     <div className="page-head"><div><b>V1 PRODUCT LIBRARY</b><h1>产品素材库</h1><p>每个上传文件都是独立产品素材。产品可以是任意品类，演示拳击机不会写入业务规则。</p></div><button className="primary"><UploadSimple />上传新产品</button></div>
-    <div className="library">{assets.length ? assets.map((asset) => <button key={asset.id} onClick={() => onSelect(asset)}><div>{asset.kind === "image" ? <img src={`${API}/assets/${asset.id}/content`} alt="" /> : asset.kind === "video" ? <video src={`${API}/assets/${asset.id}/content`} muted playsInline /> : <Cube />}</div><strong>{asset.name}</strong><span>{asset.kind === "model" ? "GLB 三维产品" : asset.kind === "video" ? "H3 生成视频" : "产品图片"} · {formatBytes(asset.size_bytes)}</span></button>) : <div className="library-empty"><Package /><strong>等待你的第一个产品</strong><span>支持 PNG、JPEG、WebP 或 GLB。</span></div>}</div>
+    <div className="library">{assets.length ? assets.map((asset) => {
+      const tone = asset.kind === "model" ? appearanceTone(asset.media_info) : null;
+      return <button key={asset.id} onClick={() => onSelect(asset)}>
+        <div>{asset.kind === "image" ? <img src={`${API}/assets/${asset.id}/content`} alt="" /> : asset.kind === "video" ? <video src={`${API}/assets/${asset.id}/content`} muted playsInline /> : <Cube />}</div>
+        <strong>{asset.name}</strong>
+        <span>{asset.kind === "model" ? "GLB 三维产品" : asset.kind === "video" ? "H3 生成视频" : "产品图片"} · {formatBytes(asset.size_bytes)}</span>
+        {/* BUG-04：模型必须暴露外观覆盖，避免"能三维环绕"被当成外观已核验 */}
+        {tone && <em className={`capability-note ${tone[0] === "danger" ? "danger" : ""}`} title={asset.media_info?.appearance_note || ""}>
+          {tone[1]} · {asset.media_info?.appearance_coverage}
+        </em>}
+      </button>;
+    }) : <div className="library-empty"><Package /><strong>等待你的第一个产品</strong><span>支持 PNG、JPEG、WebP 或 GLB。</span></div>}</div>
   </section>;
 }
 
@@ -684,11 +738,16 @@ function BatchPage() {
   const [batches, setBatches] = useState([]);
   const [form, setForm] = useState({ plan_id: "", profile_ids: [], variations: 2, max_concurrent: 2 });
   const [preview, setPreview] = useState(null);
+  const [previewFingerprint, setPreviewFingerprint] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState(null);
+  const [contractLoading, setContractLoading] = useState(false);
   const [selected, setSelected] = useState(null);
   const [items, setItems] = useState([]);
   const [summary, setSummary] = useState(null);
   const [notice, setNotice] = useState(null);
   const [busy, setBusy] = useState(false);
+  const contractToken = useRef(0);
 
   useEffect(() => {
     Promise.all([apiRequest("/plans"), apiRequest("/platform-profiles"), apiRequest("/batches")]).then(async ([p, f, b]) => {
@@ -704,6 +763,19 @@ function BatchPage() {
     const timer = setInterval(() => loadItems(selected), 8000);
     return () => clearInterval(timer);
   }, [selected]);
+
+  // BUG-06/07：参数指纹变化（含并发、变体、计划、Profile、产品版本）自动使旧预览失效
+  const currentFingerprint = batchFormFingerprint({
+    planId: form.plan_id, profileIds: form.profile_ids, variations: form.variations,
+    maxConcurrent: form.max_concurrent, productVersionIds: form.product_version_ids || [],
+  });
+  const previewStatus = previewState({
+    preview, previewFingerprint, currentFingerprint, loading: previewLoading, error: previewError,
+  });
+  function patchForm(updates) {
+    setForm((value) => ({ ...value, ...updates }));
+    setPreviewError(null);
+  }
 
   async function refreshBatches() {
     const response = await apiRequest("/batches");
@@ -730,6 +802,9 @@ function BatchPage() {
   }
   async function runPreview() {
     setBusy(true);
+    setPreviewLoading(true);
+    setPreviewError(null);
+    const fingerprintAtRequest = currentFingerprint;
     try {
       const response = await apiRequest("/batches/preview", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -738,10 +813,21 @@ function BatchPage() {
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail?.detail || body.detail || "预览失败");
       setPreview(body);
+      setPreviewFingerprint(fingerprintAtRequest);
       setNotice(["success", `将展开 ${body.expanded_count} 项（服务端计算）`]);
-    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+    } catch (error) {
+      // BUG-06：预览失败必须清空旧预览，不能沿用上一次结果
+      setPreview(null);
+      setPreviewFingerprint(null);
+      setPreviewError(error.message);
+      setNotice(["danger", error.message]);
+    } finally { setPreviewLoading(false); setBusy(false); }
   }
   async function createBatch() {
+    if (!previewStatus.valid) {
+      setNotice(["danger", `不能创建：${previewStatus.message}`]);
+      return;
+    }
     setBusy(true);
     try {
       const response = await apiRequest("/batches", {
@@ -749,6 +835,7 @@ function BatchPage() {
         body: JSON.stringify({
           name: `批次 ${new Date().toLocaleString("zh-CN")}`, matrix: matrixPayload(),
           max_concurrent: form.max_concurrent,
+          preview_hash: preview?.preview_hash,
           idempotency_key: `ui-${Date.now()}`,
         }),
       });
@@ -756,6 +843,8 @@ function BatchPage() {
       if (!response.ok) throw new Error(body.detail?.detail || body.detail || "创建失败");
       setNotice(["success", `批次已创建（${body.batch.summary.total} 项）`]);
       setSelected(body.batch.id);
+      setPreview(null);
+      setPreviewFingerprint(null);
       refreshBatches();
     } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
   }
@@ -773,14 +862,36 @@ function BatchPage() {
       loadItems(selected);
     } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
   }
-  async function packageSelectedPlanVersion() {
-    // 取计划绑定的产品版本用于矩阵（避免让用户手填 UUID）
-    const response = await apiRequest(`/plans/${form.plan_id}/contracts`);
-    if (!response.ok) return;
-    const contracts = await response.json();
-    if (contracts.length) setForm({ ...form, product_version_ids: [contracts[0].product_version_id] });
+  async function loadPlanContract(planId) {
+    // BUG-07：切换计划必须重新取该计划自己的产品版本，并丢弃过期响应
+    contractToken.current += 1;
+    const token = contractToken.current;
+    if (!planId) {
+      setForm((value) => ({ ...value, product_version_ids: [] }));
+      return;
+    }
+    setContractLoading(true);
+    try {
+      const response = await apiRequest(`/plans/${planId}/contracts`);
+      if (token !== contractToken.current) return;  // 过期响应：用户已切到别的计划
+      if (!response.ok) { setForm((value) => ({ ...value, product_version_ids: [] })); return; }
+      const contracts = await response.json();
+      setForm((value) => ({
+        ...value,
+        product_version_ids: contracts.length ? [contracts[0].product_version_id] : [],
+      }));
+    } finally {
+      if (token === contractToken.current) setContractLoading(false);
+    }
   }
-  useEffect(() => { if (form.plan_id && !form.product_version_ids?.length) packageSelectedPlanVersion(); }, [form.plan_id]);
+  function selectPlan(planId) {
+    // 切计划：清空旧产品版本 + 旧预览（BUG-07）
+    setForm((value) => ({ ...value, plan_id: planId, product_version_ids: [] }));
+    setPreview(null);
+    setPreviewFingerprint(null);
+    setPreviewError(null);
+    loadPlanContract(planId);
+  }
 
   const active = batches.find((item) => item.id === selected);
 
@@ -792,35 +903,40 @@ function BatchPage() {
         <div className="card-head"><div><h2>新建批次</h2></div></div>
         <div className="qa-pick">
           <label>已批准计划</label>
-          <select value={form.plan_id} onChange={(event) => setForm({ ...form, plan_id: event.target.value })}>
+          <select value={form.plan_id} onChange={(event) => selectPlan(event.target.value)}>
             <option value="">选择计划…</option>
-            {plans.map((item) => <option key={item.id} value={item.id}>{item.intent?.slice(0, 34)} · {item.id.slice(0, 8)}</option>)}
+            {plans.map((item) => <option key={item.id} value={item.id}>{item.intent?.slice(0, 34)} · {item.id.slice(0, 8)}{item.payload?.output?.frame_count ? ` · ${item.payload.output.frame_count} 帧` : ""}</option>)}
           </select>
+          {contractLoading && <small>正在读取该计划的产品版本…（完成前不能预览/创建）</small>}
+          {!!form.product_version_ids?.length && <small>产品版本 {String(form.product_version_ids[0]).slice(0, 8)}（来自该计划冻结合同）</small>}
         </div>
         <div className="qa-pick">
-          <label>Profile（可多选）</label>
-          <div className="reuse-dimensions">{profiles.map((item) => <label key={item.id}>
+          <label>Profile（可多选，选项含平台/名称/版本）</label>
+          <div className="reuse-dimensions">{profiles.map((item) => <label key={item.id} title={profileOptionLabel(item)}>
             <input type="checkbox" checked={form.profile_ids.includes(item.profile_key)}
-              onChange={() => setForm({
-                ...form,
+              onChange={() => patchForm({
                 profile_ids: form.profile_ids.includes(item.profile_key)
                   ? form.profile_ids.filter((key) => key !== item.profile_key)
                   : [...form.profile_ids, item.profile_key],
-              })} />{item.aspect_ratio} · {item.locale}</label>)}</div>
+              })} />{profileOptionLabel(item)}</label>)}</div>
         </div>
-        <div className="qa-pick"><label>每组合变体数 / 并发上限</label>
+        <div className="qa-pick"><label>每组合变体数 / 并发上限（改动会使旧预览失效）</label>
           <div className="inline-fields">
             <input type="number" min="1" max="20" value={form.variations}
-              onChange={(event) => setForm({ ...form, variations: Number(event.target.value) })} />
+              onChange={(event) => patchForm({ variations: Number(event.target.value) })} />
             <input type="number" min="1" max="8" value={form.max_concurrent}
-              onChange={(event) => setForm({ ...form, max_concurrent: Number(event.target.value) })} />
+              onChange={(event) => patchForm({ max_concurrent: Number(event.target.value) })} />
           </div>
         </div>
         <div className="action-row">
-          <button disabled={busy || !form.plan_id || !form.profile_ids.length} onClick={runPreview}><MagnifyingGlass />预览展开</button>
-          <button className="primary" disabled={busy || !preview} onClick={createBatch}><Play weight="fill" />创建并开始</button>
+          <button disabled={busy || contractLoading || !form.plan_id || !form.profile_ids.length} onClick={runPreview}><MagnifyingGlass />预览展开</button>
+          <button className="primary" disabled={busy || contractLoading || !previewStatus.valid} onClick={createBatch}><Play weight="fill" />创建并开始</button>
         </div>
-        {preview && <div className="mapping-diff">
+        <p className={previewStatus.valid ? "capability-note" : "capability-note danger"}>
+          <WarningCircle weight="fill" />{previewStatus.message}
+          {preview?.preview_hash ? `（服务端预览指纹 ${preview.preview_hash.slice(0, 10)}…）` : ""}
+        </p>
+        {preview && previewStatus.valid && <div className="mapping-diff">
           <h3>预览结果（无副作用）</h3>
           <p><b>展开 {preview.expanded_count} 项</b> · 上限 {preview.limits.max_expanded_items} · 并发 {preview.limits.max_concurrent}</p>
           {preview.duplicates.length > 0 && preview.duplicates.map((item, index) =>
@@ -2155,6 +2271,13 @@ export function App() {
   const [intent, setIntent] = useState("在干净的现代工作室中，用三个清晰镜头展示产品外观、侧面结构与整体比例。");
   const [output, setOutput] = useState(outputPresets[0]);
   const [cropAnchor, setCropAnchor] = useState("center");
+  // V6-16（复核 BUG-01）：基础预演时长真实可选；生产计划单独走 /plans/production
+  const [durationSeconds, setDurationSeconds] = useState(6);
+  const [profiles, setProfiles] = useState([]);
+  const [productionProfile, setProductionProfile] = useState("");
+  const [productionStatus, setProductionStatus] = useState(null);
+  const [appearance, setAppearance] = useState(null);
+  const [acceptAppearance, setAcceptAppearance] = useState(false);
   const [plan, setPlan] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [provider, setProvider] = useState(null);
@@ -2217,26 +2340,73 @@ export function App() {
     if (!asset) return setToast(["danger", "请先上传产品图片或 GLB。"]);
     setBusy(true);
     try {
+      // BUG-01/03：时长与输出规格一起下发，不再写死 6 秒
       const response = await apiRequest("/plans/template", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ product_asset_id: asset.id, intent, ratio: "9:16", duration_seconds: 6, output, crop_anchor: cropAnchor }),
+        body: JSON.stringify(buildTemplatePlanBody({
+          assetId: asset.id, intent, durationSeconds, output, cropAnchor,
+        })),
       });
       if (!response.ok) throw new Error((await response.json()).detail || "计划生成失败");
       const created = await response.json();
       setPlan(created); setCropAnchor(created.crop_anchor || "center");
-      setToast(["success", "三镜头计划已生成，可以继续调整。"]);
+      setOutput({ width: created.output.width, height: created.output.height, fps: created.output.fps,
+                  duration_seconds: created.output.duration_seconds });
+      setToast(["success", `三镜头计划已生成：${created.shots.length} 镜头 · ${created.output.frame_count} 帧 · ${(created.output.frame_count / created.output.fps).toFixed(1)}s`]);
+    } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function createProductionPlan() {
+    if (!asset) return setToast(["danger", "请先上传产品素材。"]);
+    if (!productionProfile) return setToast(["danger", "请选择 Platform Profile。"]);
+    const frames = durationSeconds * 24;
+    const shotCount = Math.min(8, Math.max(2, Number(productionStatus?.shotCount) || 5));
+    const base = Math.floor(frames / shotCount);
+    const shots = Array.from({ length: shotCount }, (_, index) => ({
+      name: `场景 ${index + 1}`, camera: index === shotCount - 1 ? "static" : "dolly_in",
+      focal_length_mm: 35, duration_frames: index === shotCount - 1 ? frames - base * (shotCount - 1) : base,
+      caption_text: "",
+    }));
+    setBusy(true);
+    try {
+      const response = await apiRequest("/plans/production", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildProductionPlanBody({
+          assetId: asset.id, profileId: productionProfile, intent, shots, locale: "es-MX",
+          voiceoverText: productionStatus?.voiceoverText || "",
+          acceptUnverifiedAppearance: acceptAppearance,
+        })),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "生产计划创建失败");
+      setPlan(body);
+      setProductionStatus({ ...(productionStatus || {}), created: body });
+      setToast(["success", `生产计划已创建：${body.shots.length} 镜头 · ${body.total_frames} 帧 · ${body.duration_seconds}s（Profile ${body.production_plan.profile_id}）`]);
     } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
   }
   async function run() {
+    // BUG-02：描述改动后必须先重新生成/保存，不能直接沿用旧分镜与旧确认
+    const staleness = planStaleness({ intent, plan });
+    if (staleness.stale) {
+      setToast(["danger", `${staleness.reason}：请先“重新生成三镜头”或保存计划，再启动渲染。`]);
+      return;
+    }
     setBusy(true);
     try {
       const saved = await apiRequest(`/plans/${plan.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ intent, shots: plan.shots, crop_anchor: cropAnchor }),
+        body: JSON.stringify(buildPlanUpdateBody({
+          intent, shots: plan.shots, cropAnchor, output,
+          durationSeconds: plan.output?.duration_seconds || durationSeconds,
+        })),
       });
       if (!saved.ok) throw new Error("分镜保存失败");
+      const savedPlan = await saved.json();
+      setPlan(savedPlan);
+      if (savedPlan.output_changed) {
+        setToast(["success", "输出规格已写入冻结合同（原审批失效，正在重新确认）。"]);
+      }
       const approval = await apiRequest(`/plans/${plan.id}/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2258,6 +2428,54 @@ export function App() {
     const [width, height] = eventValue.split("x").map((value) => Number(value));
     setOutput(outputPresets.find((item) => item.width === width && item.height === height) || outputPresets[0]);
   }
+  useEffect(() => {
+    // BUG-04：选中模型素材时立刻读取真实外观覆盖，不让"可执行三维环绕"掩盖材质缺口
+    if (!asset || asset.kind !== "model") { setAppearance(null); return; }
+    apiRequest(`/assets/${asset.id}/appearance`).then(async (response) => {
+      if (response.ok) setAppearance(await response.json());
+    }).catch(() => setAppearance(null));
+  }, [asset]);
+  useEffect(() => {
+    apiRequest("/platform-profiles").then(async (response) => {
+      if (!response.ok) return;
+      const body = await response.json();
+      setProfiles(body);
+      if (body.length && !productionProfile) setProductionProfile(body[0].profile_key);
+    }).catch(() => {});
+  }, []);
+  const unsupported = detectUnsupportedRequirements(intent);
+  const planState = planStaleness({ intent, plan });
+  const productionPanel = <div className="production-plan">
+    <h3>V6 生产计划（多场景广告，走 /plans/production）</h3>
+    <div className="inline-fields">
+      <label>Platform Profile
+        <select value={productionProfile} onChange={(event) => setProductionProfile(event.target.value)}>
+          {profiles.map((item) => <option key={item.profile_key} value={item.profile_key}>{profileOptionLabel(item)}</option>)}
+        </select></label>
+      <label>场景数（2–8）
+        <input type="number" min="2" max="8" value={productionStatus?.shotCount || 5}
+          onChange={(event) => setProductionStatus({ ...(productionStatus || {}), shotCount: Number(event.target.value) })} /></label>
+      <label>西语文案
+        <input value={productionStatus?.voiceoverText || ""} placeholder="可留空，稍后在音频页生成"
+          onChange={(event) => setProductionStatus({ ...(productionStatus || {}), voiceoverText: event.target.value })} /></label>
+    </div>
+    {appearance && appearance.appearance_level !== "VERIFIED_APPEARANCE" && <div className="capability-note danger">
+      <WarningCircle weight="fill" />
+      <div><b>模型外观未核验：{appearance.appearance_coverage}</b>
+        <p>{appearance.appearance_note}</p>
+        <ul className="notes">{(appearance.checks || []).map((item) => <li key={item.item}>{item.item}：{item.status}</li>)}</ul>
+        <label className="checkbox-line"><input type="checkbox" checked={acceptAppearance}
+          onChange={() => setAcceptAppearance(!acceptAppearance)} />
+          <span>我确认只做几何预演，接受外观未核验（正式广告需先完成材质/几何核验）</span></label>
+      </div>
+    </div>}
+    <div className="action-row">
+      <button className="primary" disabled={busy || !productionProfile || (appearance && appearance.appearance_level !== "VERIFIED_APPEARANCE" && !acceptAppearance)}
+        onClick={createProductionPlan}><Sparkle weight="fill" />创建 {(durationSeconds)} 秒生产计划（{Math.min(8, Math.max(2, Number(productionStatus?.shotCount) || 5))} 场景 / {durationSeconds * 24} 帧）</button>
+      {appearance && <a className="icon-link" title="查看外观核验明细" href={`${API}/assets/${asset?.id}/appearance`} target="_blank" rel="noreferrer"><BoxArrowDown />外观明细</a>}
+    </div>
+    {productionStatus?.created && <p className="output-summary">已创建生产计划：<b>{productionStatus.created.id.slice(0, 8)}</b> · {productionStatus.created.shots.length} 场景 · {productionStatus.created.total_frames} 帧 · {productionStatus.created.duration_seconds}s · Profile {productionStatus.created.production_plan.profile_id}（v{productionStatus.created.production_plan.profile_version}）</p>}
+  </div>;
   async function cancel() { if (job) { await apiRequest(`/jobs/${job.id}/cancel`, { method: "POST" }); refresh(); } }
   async function retry() { if (job) { await apiRequest(`/jobs/${job.id}/retry`, { method: "POST" }); refresh(); } }
   async function aiGenerate() {
@@ -2274,14 +2492,9 @@ export function App() {
       const created = await apiRequest("/plans/template", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          product_asset_id: asset.id,
-          intent: generated.plan.intent,
-          ratio: "9:16",
-          duration_seconds: 6,
-          output,
-          crop_anchor: cropAnchor,
-        }),
+        body: JSON.stringify(buildTemplatePlanBody({
+          assetId: asset.id, intent: generated.plan.intent, durationSeconds, output, cropAnchor,
+        })),
       });
       if (!created.ok) throw new Error((await created.json()).detail || "计划创建失败");
       const base = await created.json();
@@ -2382,6 +2595,11 @@ export function App() {
             onGenerate={generatePlan}
             onAiGenerate={aiGenerate}
             busy={busy}
+            durationSeconds={durationSeconds}
+            onDurationChange={setDurationSeconds}
+            planState={planState}
+            unsupported={unsupported}
+            production={productionPanel}
           />
           <RenderCard health={health} plan={plan} job={job} onRender={run} onCancel={cancel} onRetry={retry} />
           <ProviderJobs jobs={providerJobs} onCancel={cancelProviderJob} />

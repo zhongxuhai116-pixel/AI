@@ -41,7 +41,9 @@ def runtime_snapshot(**overrides) -> dict:
 @unittest.skipUnless(Draft202012Validator, "需要 jsonschema")
 class BridgeTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.validator = Draft202012Validator(director_plan.load_target_schema())
+        # 默认校验 v1.1（诚实报告版本）；v1.0 保留给历史合同示例做对照
+        self.validator = Draft202012Validator(director_plan.load_target_schema("1.1"))
+        self.legacy_validator = Draft202012Validator(director_plan.load_target_schema("1.0"))
 
     def errors(self, document: dict) -> list:
         return sorted(self.validator.iter_errors(document), key=lambda error: list(error.path))
@@ -49,7 +51,11 @@ class BridgeTests(unittest.TestCase):
     def test_default_snapshot_converts_to_a_valid_3d_document(self) -> None:
         document = director_plan.to_target_document(runtime_snapshot())
         self.assertEqual(self.errors(document), [])
-        self.assertEqual(document["fidelity_mode"], "STRICT")
+        # V6-16（复核 BUG-05）：请求 STRICT 但没有严格链路证据 → 实际执行 CONTROLLED、未验证
+        self.assertEqual(document["fidelity_mode"], "CONTROLLED")
+        self.assertEqual(document["fidelity"]["requested_mode"], "STRICT_REQUESTED")
+        self.assertEqual(document["fidelity"]["executed_mode"], "CONTROLLED")
+        self.assertEqual(document["fidelity"]["verification_status"], "NOT_VERIFIED")
         self.assertEqual(document["output"]["container"], "mp4")
         self.assertEqual([shot["camera"]["path"]["type"] for shot in document["shots"]],
                          ["static", "side_track", "hero_orbit"])
@@ -134,16 +140,23 @@ class BridgeTests(unittest.TestCase):
 
     def test_target_schema_example_still_round_trips(self) -> None:
         example = json.loads((PROJECT / "contracts" / "director-plan.v1.example.json").read_text(encoding="utf-8"))
-        self.assertEqual(self.errors(example), [])
+        # 历史示例属于 v1.0 合同：用 v1.0 校验器验证它本身仍然合法
+        self.assertEqual(sorted(self.legacy_validator.iter_errors(example), key=lambda e: list(e.path)), [])
         restored = director_plan.from_target_document(example)
         again = director_plan.to_target_document({
             "intent": restored["intent"],
+            "product_version_id": restored.get("product_version_id"),
+            "fidelity_mode": restored.get("fidelity_mode"),
             "output": restored["output"],
             "shots": restored["shots"],
             "product_pose": restored["product_pose"],
             "scene": restored["scene"],
         })
+        # 转换产物是新版诚实文档，按 v1.1 校验
         self.assertEqual(self.errors(again), [])
+        self.assertEqual(again["schema_version"], "1.1")
+        self.assertEqual(again["product_version_binding"], "VERSIONED", "示例里带了真实版本号，往返必须保留")
+        self.assertEqual(again["product_version_id"], example["product_version_id"])
 
 
 if __name__ == "__main__":

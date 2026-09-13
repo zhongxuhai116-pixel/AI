@@ -839,3 +839,6 @@ CREATE TABLE IF NOT EXISTS members (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- V6-16：素材外观覆盖分析（独立复核 BUG-04）
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS media_info TEXT;

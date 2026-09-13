@@ -1031,6 +1031,8 @@ def initialize_db() -> None:
         ensure_column(db, "cost_ledger", "actor_key_id", "TEXT")
         # V6-09：端点默认不回填历史事件（旧安装补齐该列）
         ensure_column(db, "webhook_endpoints", "backfill_history", "INTEGER NOT NULL DEFAULT 0")
+        # V6-16：模型外观覆盖分析结果（上传时解析一次，素材卡直接展示，避免"看起来能渲染就以为外观已核验"）
+        ensure_column(db, "assets", "media_info", "TEXT")
         for column in ("verified_dimensions", "view_coverage", "unverified_regions", "logo_regions", "camera_visibility_constraints"):
             ensure_column(db, "product_versions", column, "TEXT")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
@@ -1252,6 +1254,9 @@ class PlanUpdate(BaseModel):
     product_pose: ProductPose = Field(default_factory=ProductPose)
     scene: SceneSpec = Field(default_factory=SceneSpec)
     duration_seconds: Literal[5, 6, 7, 8] = 6
+    # V6-16（独立复核 BUG-03）：分辨率/输出规格必须能被真正保存，否则界面改了启动时又回到旧值。
+    # 传入时必须与 duration_seconds、shots 总帧数一致，否则 422。
+    output: OutputSpec | None = None
     project_id: str = DEFAULT_PROJECT_ID
     owner_id: str = DEFAULT_OWNER_ID
 
@@ -1260,6 +1265,8 @@ class PlanUpdate(BaseModel):
         expected = DEFAULT_FPS * self.duration_seconds
         if sum(shot.duration_frames for shot in self.shots) != expected:
             raise ValueError(f"三个镜头的总帧数必须恰好为 {expected} 帧（{self.duration_seconds} 秒 × 24fps）")
+        if self.output is not None and self.output.duration_seconds != self.duration_seconds:
+            raise ValueError("output.duration_seconds 与 duration_seconds 必须一致")
         return self
 
 
@@ -4519,7 +4526,21 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
         if not qa_report["passed"]:
             raise RuntimeError("媒体质量检查失败: " + "；".join(qa_report["failures"]))
         try:
-            director_plan_3d = director_plan.to_target_document(plan_snapshot)
+            # V6-16（独立复核 BUG-05）：如实报告保真三元组，不再固定写 STRICT。
+            # 基础预演（无 Strict 快照）的执行模式是 CONTROLLED、验证状态 NOT_VERIFIED；
+            # product_version_id 取冻结合同里的真实版本，缺失时标 UNKNOWN（不再用占位 UUID）。
+            with connect() as db:
+                contract_row = get_default_contract(job["plan_id"], db)
+            strict_bound = strict_snapshot is not None
+            executed_mode = "STRICT" if strict_bound else "CONTROLLED"
+            verification_status = ("VERIFIED" if strict_bound and qa_report.get("passed") else
+                                   ("NOT_VERIFIED" if not strict_bound else "UNKNOWN"))
+            director_plan_3d = director_plan.to_target_document(
+                plan_snapshot,
+                executed_mode=executed_mode,
+                verification_status=verification_status,
+                product_version_id=(contract_row["product_version_id"] if contract_row else None),
+            )
             director_plan_3d_error = None
         except director_plan.TargetContractError as exc:
             # 运行时支持但目标合同尚未放开的值：如实记录，不输出不合规文档。
@@ -4540,9 +4561,20 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             "ffprobe": {"duration": duration, "video_stream": stream},
             "qa": qa_report,
             "director_plan": plan_snapshot,
-            # 目标 3D 合同视图：把运行时快照映射成 contracts/director-plan.v1.schema.json 的形状
+            # 目标 3D 合同视图：把运行时快照映射成 contracts/director-plan.v1.1.schema.json 的形状
             "director_plan_3d": director_plan_3d,
             "director_plan_3d_error": director_plan_3d_error,
+            # V6-16：保真三元组放在 Manifest 顶层，避免只看 director_plan_3d 时被误读
+            "fidelity": {
+                "requested_mode": plan_snapshot.get("fidelity_mode"),
+                "executed_mode": executed_mode if director_plan_3d else None,
+                "verification_status": verification_status if director_plan_3d else "UNKNOWN",
+                "strict_snapshot_bound": strict_bound,
+                "product_version_id": contract_row["product_version_id"] if contract_row else None,
+                "product_version_binding": "VERSIONED" if contract_row else "UNKNOWN",
+                "note": ("基础预演不构成 Strict 验收：executed_mode 与 verification_status 才是实际状态"
+                         if not strict_bound else "Strict 链路：模式与验证状态来自真实快照与 QA"),
+            },
             "director_plan_snapshot_sha256": hashlib.sha256(plan_snapshot_bytes).hexdigest(),
             "blender": Path(BLENDER).name if BLENDER else None,
             "ffmpeg": Path(FFMPEG).name if FFMPEG else None,
@@ -5527,9 +5559,11 @@ async def create_asset(file: UploadFile = File(...)) -> dict:
     created = utc_now()
     with connect() as db:
         db.execute(
-            "INSERT INTO assets (id, name, kind, mime, size_bytes, sha256, path, created_at, owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO assets (id, name, kind, mime, size_bytes, sha256, path, created_at, owner_id, media_info) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (asset_id, file.filename or stored.name, kind, mime, len(data), digest, stored.name, created,
-             security.current_owner.get() or DEFAULT_OWNER_ID),
+             security.current_owner.get() or DEFAULT_OWNER_ID,
+             json.dumps(glb_info, ensure_ascii=False) if glb_info else None),
         )
     return {
         "id": asset_id,
@@ -5548,7 +5582,57 @@ def list_assets() -> list[dict]:
     with connect() as db:
         rows = db.execute("SELECT * FROM assets WHERE owner_id = ? ORDER BY created_at DESC",
                           (security.current_owner.get() or DEFAULT_OWNER_ID,)).fetchall()
-    return [{key: row[key] for key in row.keys() if key != "path"} for row in rows]
+    result = []
+    for row in rows:
+        item = {key: row[key] for key in row.keys() if key != "path"}
+        raw = item.pop("media_info", None)
+        try:
+            item["media_info"] = json.loads(raw) if raw else None
+        except (json.JSONDecodeError, TypeError):
+            item["media_info"] = None
+        result.append(item)
+    return result
+
+
+@app.get("/api/v1/assets/{asset_id}/appearance")
+def get_asset_appearance(asset_id: str) -> dict:
+    """模型外观覆盖（V6-16，复核 BUG-04）：真实解析文件，报告贴图/顶点色/材质覆盖与风险等级。"""
+    owner_id = security.current_owner.get() or DEFAULT_OWNER_ID
+    with connect() as db:
+        row = db.execute("SELECT * FROM assets WHERE id = ? AND owner_id = ?", (asset_id, owner_id)).fetchone()
+    if not row:
+        raise HTTPException(404, "素材不存在")
+    asset = row_to_dict(row)
+    if asset["kind"] != "model":
+        return {"asset_id": asset_id, "kind": asset["kind"], "appearance_level": "NOT_APPLICABLE",
+                "appearance_coverage": "IMAGE_SOURCE",
+                "appearance_note": "图片素材的外观来自拍摄/渲染原图，不做 3D 材质分析",
+                "checks": []}
+    try:
+        data = resolve_asset_path(asset).read_bytes()
+    except HTTPException as exc:
+        raise HTTPException(409, f"素材文件不可读：{exc.detail}") from exc
+    info = inspect_glb(data)
+    return {
+        "asset_id": asset_id,
+        "kind": "model",
+        "sha256": asset["sha256"],
+        "inspected_at": utc_now(),
+        **info,
+        "checks": [
+            {"item": "贴图/纹理引用", "status": "有" if info["has_textures"] else "无"},
+            {"item": "UV 坐标（TEXCOORD_0）", "status": "有" if info["has_uv"] else "无"},
+            {"item": "顶点色（COLOR_0）", "status": "有" if info["has_vertex_color"] else "无"},
+            {"item": "材质数", "status": str(info["materials"])},
+            {"item": "不同材质颜色数", "status": str(info["distinct_material_colors"])},
+        ],
+        "next_steps": (["对照授权参考逐项核对形状与外观（面罩/镜片/软管/喇叭/底座）",
+                        "修补可信材质与外观映射后再做正式广告",
+                        "正式发布前必须有同角度静帧对照证据"]
+                       if info["appearance_level"] != "VERIFIED_APPEARANCE" else
+                       ["外观信息可用于高保真渲染；仍需同角度静帧对照确认"],
+                       ),
+    }
 
 
 def inspect_glb(data: bytes) -> dict:
@@ -5593,12 +5677,71 @@ def inspect_glb(data: bytes) -> dict:
         raise HTTPException(422, "GLB 引用了外部纹理/缓冲文件；V1 只支持自包含 GLB，请导出时内嵌资源")
     if not document.get("meshes"):
         raise HTTPException(422, "GLB 不包含任何网格，无法渲染")
+    return {"version": version, **analyze_glb_appearance(document)}
+
+
+def analyze_glb_appearance(document: dict) -> dict:
+    """外观覆盖分析（V6-16，独立复核 BUG-04）。
+
+    诚实口径：**没有纹理不等于没有外观信息**——顶点色、多材质 PBR 参数也可以是有效外观。
+    这里只报告"有哪些外观来源"，并给出一个可行动的风险等级；不做"无纹理一律拒绝"。
+    """
+    materials = document.get("materials") or []
+    meshes = document.get("meshes") or []
+    has_textures = bool(document.get("images") or document.get("textures"))
+    base_colors = []
+    for material in materials:
+        factor = ((material.get("pbrMetallicRoughness") or {}).get("baseColorFactor")) or None
+        if factor:
+            base_colors.append([round(float(value), 4) for value in factor])
+    textured_materials = 0
+    for material in materials:
+        pbr = material.get("pbrMetallicRoughness") or {}
+        if pbr.get("baseColorTexture") or material.get("emissiveTexture") or material.get("normalTexture"):
+            textured_materials += 1
+    has_uv = False
+    has_vertex_color = False
+    for mesh in meshes:
+        for primitive in mesh.get("primitives") or []:
+            attributes = primitive.get("attributes") or {}
+            if "TEXCOORD_0" in attributes:
+                has_uv = True
+            if "COLOR_0" in attributes:
+                has_vertex_color = True
+    distinct_colors = {tuple(color) for color in base_colors}
+    if has_textures and textured_materials:
+        coverage, level = "TEXTURED", "VERIFIED_APPEARANCE"
+        note = "包含贴图与材质引用：外观信息可用于高保真渲染"
+    elif has_textures:
+        coverage, level = "TEXTURES_UNREFERENCED", "PARTIAL_APPEARANCE"
+        note = "文件里有贴图但没有任何材质引用它：渲染不会用到这些贴图，需要检查导出设置"
+    elif has_vertex_color:
+        coverage, level = "VERTEX_COLOR", "VERIFIED_APPEARANCE"
+        note = "使用顶点色表达外观：不依赖贴图也可以有真实外观"
+    elif len(distinct_colors) > 1:
+        coverage, level = "MULTI_MATERIAL_COLORS", "PARTIAL_APPEARANCE"
+        note = "多材质纯色：能区分部件，但无贴图细节（如镜片渐变、面罩高光）"
+    elif len(distinct_colors) == 1:
+        coverage, level = "SINGLE_FLAT_MATERIAL", "APPEARANCE_UNVERIFIED"
+        note = ("只有单一纯色材质且无贴图/顶点色/UV：几何预演可用，但**不能**据此声称外观保真；"
+                "需要对照授权参考逐项核对，或提供带贴图/多材质的模型")
+    else:
+        coverage, level = "UNKNOWN", "APPEARANCE_UNVERIFIED"
+        note = "未解析到材质信息：外观状态未知，需要人工核对"
     return {
-        "version": version,
-        "meshes": len(document.get("meshes", [])),
-        "materials": len(document.get("materials", [])),
-        "images": len(document.get("images", [])),
-        "has_textures": bool(document.get("images") or document.get("textures")),
+        "meshes": len(meshes),
+        "materials": len(materials),
+        "images": len(document.get("images") or []),
+        "has_textures": has_textures,
+        "has_uv": has_uv,
+        "has_vertex_color": has_vertex_color,
+        "base_color_factors": base_colors[:8],
+        "distinct_material_colors": len(distinct_colors),
+        "appearance_coverage": coverage,
+        "appearance_level": level,
+        "appearance_note": note,
+        "honest_boundary": ("外观等级只描述输入素材本身；渲染是否保真还需对照授权参考逐项核对"
+                            "（面罩/镜片/软管/喇叭/底座等）"),
     }
 
 
@@ -7490,6 +7633,14 @@ def update_plan(plan_id: str, request: PlanUpdate) -> dict:
         payload["crop_anchor"] = request.crop_anchor.value
         payload["product_pose"] = request.product_pose.model_dump()
         payload["scene"] = request.scene.model_dump()
+        output_changed = False
+        if request.output is not None:
+            previous_output = payload.get("output") or {}
+            payload["output"] = request.output.model_dump()
+            payload["output"]["duration_seconds"] = request.duration_seconds
+            payload["output"]["frame_count"] = sum(shot.duration_frames for shot in request.shots)
+            output_changed = (previous_output.get("width"), previous_output.get("height")) != (
+                request.output.width, request.output.height)
         _, payload_sha256 = plan_contract_payload_hash(payload)
         contract_version_id = create_product_version(
             current["product_asset_id"],
@@ -7507,6 +7658,10 @@ def update_plan(plan_id: str, request: PlanUpdate) -> dict:
             "contract_id": contract["contract_id"],
             "contract_version": contract["contract_version"],
             "snapshot_sha256": contract["snapshot_sha256"],
+            "output_changed": output_changed,
+            "approval_invalidated": True,
+            "note": ("输出规格已更新并写入冻结合同；原审批已失效，必须重新审批后再启动渲染"
+                     if output_changed else "计划已更新（新合同版本）；原审批已失效"),
             **payload,
         }
     return return_data
@@ -9761,6 +9916,9 @@ class BatchCreateRequest(BaseModel):
     publish_intent: dict = Field(default_factory=dict)
     max_concurrent: int = Field(default=batch_rules.DEFAULT_MAX_CONCURRENT, ge=1, le=8)
     notes: str = Field(default="", max_length=2000)
+    # V6-16（独立复核 BUG-06）：创建时必须带上前端预览返回的哈希；服务端复算不一致即拒绝，
+    # 防止"改了参数/预览失败后仍用旧预览创建"。
+    preview_hash: str | None = Field(default=None, max_length=80)
 
 
 class BatchPreviewRequest(BaseModel):
@@ -9908,21 +10066,40 @@ def _expand_batch_request(db, request: BatchPreviewRequest | BatchCreateRequest,
     return expanded
 
 
+def _batch_preview_hash(expanded: dict, max_concurrent: int) -> str:
+    """预览指纹：覆盖展开结果与并发上限，任何参数变化都会得到不同哈希。"""
+    material = {
+        "mode": expanded.get("mode"),
+        "expanded_count": expanded.get("expanded_count"),
+        "max_concurrent": int(max_concurrent),
+        "items": [
+            {key: item.get(key) for key in ("index", "plan_id", "profile_id", "product_version_id",
+                                            "profile_version_id", "variation", "seed", "cache_key")}
+            for item in expanded.get("items", [])
+        ],
+    }
+    return hashlib.sha256(_canonical_json_text(material).encode("utf-8")).hexdigest()
+
+
 @app.post("/api/v1/batches/preview")
 def preview_batch(request: BatchPreviewRequest) -> dict:
     """只做展开与校验，不创建任何任务（展开数量由服务端给出）。"""
     owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
     with connect() as db:
         expanded = _expand_batch_request(db, request, owner_id, project_id)
+    preview_hash = _batch_preview_hash(expanded, request.max_concurrent)
     return {
         "mode": expanded["mode"],
         "expanded_count": expanded["expanded_count"],
         "items": expanded["items"],
         "duplicates": expanded["duplicates"],
         "dedupe_note": expanded["dedupe_note"],
+        "preview_hash": preview_hash,
         "limits": {"max_expanded_items": batch_rules.MAX_EXPANDED_ITEMS,
                    "max_concurrent": request.max_concurrent},
         "side_effects": "none（预览不创建任务）",
+        "preview_note": ("创建批次时必须带同一个 preview_hash；矩阵/变体/并发任一变化都会得到新哈希，"
+                         "服务端会拒绝过期预览"),
     }
 
 
@@ -9957,6 +10134,16 @@ def _create_batch_record(request: BatchCreateRequest, background: BackgroundTask
             if existing:
                 return {"batch": _batch_public(db, existing), "reused_idempotent": True, "created": False}
         expanded = _expand_batch_request(db, request, owner_id, project_id)
+        # V6-16（BUG-06）：带 preview_hash 时服务端复算，拒绝过期预览（前端必须重跑预览）
+        if request.preview_hash:
+            recomputed = _batch_preview_hash(expanded, request.max_concurrent)
+            if recomputed != request.preview_hash:
+                raise HTTPException(409, {
+                    "code": "preview_stale",
+                    "detail": "预览已过期：参数（矩阵/变体/并发）与预览时不一致，请重新预览后再创建",
+                    "expected_preview_hash": recomputed,
+                    "submitted_preview_hash": request.preview_hash,
+                })
         batch_id = str(uuid.uuid4())
         now = utc_now()
         publish_intent = batch_rules.normalize_publish_intent(request.publish_intent)
@@ -9970,6 +10157,7 @@ def _create_batch_record(request: BatchCreateRequest, background: BackgroundTask
             "publish_status": "NOT_REQUESTED",
             "notes": request.notes,
             "requested_total": expanded.get("requested_total"),
+            "preview_hash": request.preview_hash,
         }
         payload_text = _canonical_json_text(payload)
         db.execute(
@@ -13135,6 +13323,8 @@ class ProductionPlanRequest(BaseModel):
     locale: str = Field(default="es-MX", max_length=20)
     voiceover_text: str = Field(default="", max_length=2000)
     notes: str = Field(default="", max_length=2000)
+    # V6-16（复核 BUG-04）：模型外观未核验时，正式生产计划必须显式接受风险，否则拒绝创建。
+    accept_unverified_appearance: bool = False
 
 
 @app.post("/api/v1/plans/production", status_code=201)
@@ -13158,6 +13348,26 @@ def create_production_plan(request: ProductionPlanRequest) -> dict:
                 "code": "duration_out_of_profile_range",
                 "detail": f"计划总时长 {seconds:.2f}s 不在 Profile {request.profile_id} 允许范围 {low}–{high}s 内",
             })
+        # V6-16（复核 BUG-04）：结构校验之后再做外观门——外观未核验的模型不能悄悄进入正式广告流程
+        appearance = None
+        if asset["kind"] == "model":
+            try:
+                appearance = inspect_glb(resolve_asset_path(row_to_dict(asset)).read_bytes())
+            except HTTPException:
+                appearance = {"appearance_level": "APPEARANCE_UNVERIFIED",
+                              "appearance_coverage": "UNREADABLE",
+                              "appearance_note": "模型文件无法解析外观信息"}
+            if appearance.get("appearance_level") != "VERIFIED_APPEARANCE" \
+                    and not request.accept_unverified_appearance:
+                raise HTTPException(409, {
+                    "code": "appearance_unverified",
+                    "detail": (f"该模型外观未核验（{appearance.get('appearance_coverage')}）："
+                               f"{appearance.get('appearance_note')}。"
+                               "要求真实外观的正式广告需要先完成材质/几何核验；"
+                               "如只做几何预演，请显式传 accept_unverified_appearance=true"),
+                    "asset_id": asset["id"],
+                    "appearance": appearance,
+                })
         shots = []
         for index, shot in enumerate(request.shots, start=1):
             payload = {
@@ -13196,6 +13406,19 @@ def create_production_plan(request: ProductionPlanRequest) -> dict:
                 "voiceover_text": request.voiceover_text,
                 "aspect_ratio": spec.composition.aspect_ratio,
             },
+            # V6-16：外观状态写进冻结计划，后续打包/发布能据此判断是否可宣称外观保真
+            "appearance": (
+                {
+                    "status": ("VERIFIED_APPEARANCE" if appearance.get("appearance_level") == "VERIFIED_APPEARANCE"
+                               else "UNVERIFIED_ACCEPTED"),
+                    "coverage": appearance.get("appearance_coverage"),
+                    "level": appearance.get("appearance_level"),
+                    "note": appearance.get("appearance_note"),
+                    "accepted_by_operator": bool(request.accept_unverified_appearance),
+                } if appearance is not None else
+                {"status": "IMAGE_SOURCE", "coverage": "IMAGE_SOURCE", "level": "NOT_APPLICABLE",
+                 "note": "图片素材：外观来自拍摄/渲染原图", "accepted_by_operator": False}
+            ),
         }
         validate_production_plan_snapshot(payload, spec)
         _, payload_sha256 = plan_contract_payload_hash(payload)

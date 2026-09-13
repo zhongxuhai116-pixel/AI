@@ -40,6 +40,8 @@ class ProductionPlanTests(unittest.TestCase):
             "intent": "Anuncio 15s lámpara astronauta", "locale": "es-MX",
             "shots": self._shots([72, 96, 72, 72, 48]),
             "voiceover_text": "Haz de cada noche una experiencia mágica.",
+            # V6-16：外观未核验的模型需要显式接受（复核 BUG-04 的门）
+            "accept_unverified_appearance": True,
         })
         self.assertEqual(response.status_code, 201, response.text)
         body = response.json()
@@ -69,6 +71,7 @@ class ProductionPlanTests(unittest.TestCase):
         created = self.client.post("/api/v1/plans/production", json={
             "product_asset_id": self.asset["id"], "profile_id": "tiktok-mx-9x16-esmx",
             "intent": "Anuncio 15s", "shots": self._shots([72, 96, 72, 72, 48]),
+            "accept_unverified_appearance": True,  # 外观门（复核 BUG-04）
         }).json()
         approved = self.client.post(f"/api/v1/plans/{created['id']}/approve", json={"approved": True})
         self.assertEqual(approved.status_code, 200, approved.text)
