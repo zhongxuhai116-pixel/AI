@@ -240,14 +240,22 @@ class ShotLocator:
 
     def __init__(self, plan_path: Path | None, first_frame: int):
         self.intervals: list[tuple[int, int, str, str]] = []
+        self._boundaries: set[int] = set()
         if plan_path is None:
             return
         plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
         start = first_frame
-        for shot in plan.get("shots", []):
+        for index, shot in enumerate(plan.get("shots", [])):
             duration = int(shot.get("duration_frames", 0))
             self.intervals.append((start, start + duration, str(shot.get("id", "")), str(shot.get("name", ""))))
+            if index > 0:
+                # 镜头边界（参考切镜/硬切）：跨边界相邻帧的轮廓与尺寸突变属预期构图变化
+                self._boundaries.add(start)
             start += duration
+
+    @property
+    def boundary_frames(self) -> set[int]:
+        return self._boundaries
 
     def locate(self, frame: int) -> dict:
         for start, end, shot_id, name in self.intervals:
@@ -309,11 +317,18 @@ def check_mask_integrity(frames: list[int], masks: dict[int, Path], beauty: dict
     return {"status": "FAIL" if problems else "PASS", "problems": problems}
 
 
-def check_size_stability(frames: list[int], masks_bool: dict[int, np.ndarray], size_tol: float) -> dict:
-    """尺寸变化：相邻帧掩码包围盒面积的相对突变超过 size_tol 即 FAIL。"""
+def check_size_stability(frames: list[int], masks_bool: dict[int, np.ndarray], size_tol: float,
+                         boundaries: set[int] | None = None) -> dict:
+    """尺寸变化：相邻帧掩码包围盒面积的相对突变超过 size_tol 即 FAIL。
+    镜头边界（硬切）相邻对按声明切镜豁免，不作伪影。"""
+    boundaries = boundaries or set()
     problems = []
+    skipped = []
     areas = {frame: bbox_area(masks_bool[frame]) for frame in frames}
     for prev, curr in zip(frames, frames[1:]):
+        if curr in boundaries:
+            skipped.append(curr)
+            continue
         area_prev, area_curr = areas[prev], areas[curr]
         if area_prev == 0 or area_curr == 0:
             continue  # 空掩码由 mask_integrity 报告
@@ -323,14 +338,24 @@ def check_size_stability(frames: list[int], masks_bool: dict[int, np.ndarray], s
                 "frame": curr,
                 "reason": f"掩码包围盒面积相对突变：{area_prev} → {area_curr}（变化 {change:.1%} > {size_tol:.1%}，参考帧 {prev}）",
             })
-    return {"status": "FAIL" if problems else "PASS", "problems": problems}
+    result = {"status": "FAIL" if problems else "PASS", "problems": problems}
+    if skipped:
+        result["skipped_shot_boundaries"] = skipped
+    return result
 
 
 def check_contour_anomaly(frames: list[int], masks_bool: dict[int, np.ndarray],
-                          out_dir: Path, iou_min: float, shift_max: float) -> dict:
-    """轮廓异常：相邻帧掩码 IoU 骤降或质心位移超阈值即 FAIL，输出轮廓对比叠图。"""
+                          out_dir: Path, iou_min: float, shift_max: float,
+                          boundaries: set[int] | None = None) -> dict:
+    """轮廓异常：相邻帧掩码 IoU 骤降或质心位移超阈值即 FAIL，输出轮廓对比叠图。
+    镜头边界（硬切）相邻对按声明切镜豁免，不作伪影。"""
+    boundaries = boundaries or set()
     problems = []
+    skipped = []
     for prev, curr in zip(frames, frames[1:]):
+        if curr in boundaries:
+            skipped.append(curr)
+            continue
         iou = mask_iou(masks_bool[prev], masks_bool[curr])
         shift = centroid_shift(masks_bool[prev], masks_bool[curr])
         reasons = []
@@ -346,7 +371,10 @@ def check_contour_anomaly(frames: list[int], masks_bool: dict[int, np.ndarray],
                 "reason": f"轮廓突变（参考帧 {prev}）：" + "；".join(reasons),
                 "artifact": artifact,
             })
-    return {"status": "FAIL" if problems else "PASS", "problems": problems}
+    result = {"status": "FAIL" if problems else "PASS", "problems": problems}
+    if skipped:
+        result["skipped_shot_boundaries"] = skipped
+    return result
 
 
 def check_logo_presence(frames: list[int], beauty: dict[int, Path], out_dir: Path,
@@ -449,8 +477,9 @@ def main(argv=None) -> int:
         "missing_frames": check_missing_frames(sequences, args.frames),
         "mask_integrity": check_mask_integrity(frames, sequences["mask"], sequences["beauty"],
                                                out_dir, args.binariness_min, args.coverage_tol),
-        "size_stability": check_size_stability(frames, masks_bool, args.size_tol),
-        "contour_anomaly": check_contour_anomaly(frames, masks_bool, out_dir, args.iou_min, args.centroid_shift),
+        "size_stability": check_size_stability(frames, masks_bool, args.size_tol, locator.boundary_frames),
+        "contour_anomaly": check_contour_anomaly(frames, masks_bool, out_dir, args.iou_min,
+                                                 args.centroid_shift, locator.boundary_frames),
         "logo_presence": check_logo_presence(frames, sequences["beauty"], out_dir,
                                              logo_region, args.reference, args.logo_threshold),
     }

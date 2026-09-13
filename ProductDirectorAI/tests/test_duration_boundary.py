@@ -57,8 +57,8 @@ class DurationContractTests(unittest.TestCase):
                 )
 
     def test_output_spec_frame_count_follows_the_duration(self) -> None:
-        self.assertEqual(OutputSpec(duration_seconds=5).frame_count, 120)
-        self.assertEqual(OutputSpec(duration_seconds=8).frame_count, 192)
+        self.assertEqual(OutputSpec(duration_seconds=5).total_frames, 120)
+        self.assertEqual(OutputSpec(duration_seconds=8).total_frames, 192)
         with self.assertRaises(ValidationError):
             OutputSpec(duration_seconds=4)
 

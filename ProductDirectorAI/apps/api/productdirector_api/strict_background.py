@@ -28,6 +28,11 @@ from typing import Callable, Iterable
 import numpy as np
 from PIL import Image
 
+
+def _resolved_frame_count(output_spec) -> int:
+    """输出帧数解析：运行时 OutputSpec 提供 total_frames；测试桩/外部调用可能只给 frame_count。"""
+    return int(getattr(output_spec, "total_frames", None) or getattr(output_spec, "frame_count", 0))
+
 from .providers import comfyui
 
 
@@ -442,7 +447,7 @@ def collect_background_only_h3_frames(
 ) -> dict:
     """轮询 background-only H3 SaveImage 产物，允许模型 grid 多出的尾部帧被明确丢弃。
 
-    冻结合同要求 raw_frame_count >= output_spec.frame_count；只登记并发布 1..frame_count。
+    冻结合同要求 raw_frame_count >= _resolved_frame_count(output_spec)；只登记并发布 1..frame_count。
     """
     external_id = submission["external_id"]
     deadline = time.time() + max_poll_seconds
@@ -460,10 +465,10 @@ def collect_background_only_h3_frames(
     if client.status_text(record) != "SUCCEEDED":
         raise BackgroundProducerError("背景工作流执行失败")
 
-    raw_frame_count = int(workflow.get("raw_frame_count") or workflow.get("length") or output_spec.frame_count)
-    if raw_frame_count < output_spec.frame_count:
+    raw_frame_count = int(workflow.get("raw_frame_count") or workflow.get("length") or _resolved_frame_count(output_spec))
+    if raw_frame_count < _resolved_frame_count(output_spec):
         raise BackgroundProducerError("background-only H3 raw_frame_count 小于计划帧数")
-    expected = set(range(1, output_spec.frame_count + 1))
+    expected = set(range(1, _resolved_frame_count(output_spec) + 1))
     items = [item for item in client.outputs(record) if item.get("filename", "").lower().endswith(".png")]
     if not items:
         raise BackgroundProducerError("背景工作流完成但没有 PNG 帧产物")
@@ -519,13 +524,13 @@ def collect_background_only_h3_frames(
         "graph_hash": background_only_h3_graph_hash(workflow.get("_graph", {})),
         "submission": submission,
         "raw_frame_count": raw_frame_count,
-        "selected_frame_count": output_spec.frame_count,
-        "tail_frames_dropped": raw_frame_count - output_spec.frame_count,
+        "selected_frame_count": _resolved_frame_count(output_spec),
+        "tail_frames_dropped": raw_frame_count - _resolved_frame_count(output_spec),
         "product_protection": "BACKGROUND_ONLY_H3_PIXEL_LOCK_REQUIRED",
         "pixel_lock_required": True,
         "frames": {
             "start_frame": 1,
-            "frame_count": output_spec.frame_count,
+            "frame_count": _resolved_frame_count(output_spec),
             "files": frames_evidence,
         },
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -671,7 +676,7 @@ def verify_background_evidence_files(strict_root: Path, evidence: dict, output_s
     frame_block = evidence.get("frames") or {}
     if frame_block.get("start_frame") != 1:
         failures.append("背景证据 start_frame 必须为 1")
-    expected_frames = set(range(1, int(output_spec.frame_count) + 1))
+    expected_frames = set(range(1, int(_resolved_frame_count(output_spec)) + 1))
     evidence_frames = {int(entry.get("frame")) for entry in frame_block.get("files", [])}
     if evidence_frames != expected_frames:
         failures.append(
@@ -873,7 +878,7 @@ def run_controlled_import(
         failures.append("未提供可信产品 Mask，不能执行受控背景导入")
         raise BackgroundProducerError("；".join(failures))
     mask_files = discover_frames(mask_dir.glob("*.png"), "product_mask", failures)
-    expected = set(range(1, output_spec.frame_count + 1))
+    expected = set(range(1, _resolved_frame_count(output_spec) + 1))
     if set(source_files) != expected:
         failures.append(
             f"background_source 帧集与冻结计划不一致：缺少 {sorted(expected - set(source_files))}，多出 {sorted(set(source_files) - expected)}"
@@ -932,7 +937,7 @@ def run_controlled_import(
         "pixel_lock_required": True,
         "frames": {
             "start_frame": 1,
-            "frame_count": output_spec.frame_count,
+            "frame_count": _resolved_frame_count(output_spec),
             "files": frames_evidence,
         },
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1006,7 +1011,7 @@ def collect_controlled_comfyui_frames(
     items = [item for item in client.outputs(record) if item.get("filename", "").lower().endswith(".png")]
     if not items:
         raise BackgroundProducerError("背景工作流完成但没有 PNG 帧产物")
-    expected = set(range(1, output_spec.frame_count + 1))
+    expected = set(range(1, _resolved_frame_count(output_spec) + 1))
     frame_items: dict[int, dict] = {}
     failures: list[str] = []
     for item in sorted(items, key=lambda entry: entry.get("filename", "")):
@@ -1057,7 +1062,7 @@ def collect_controlled_comfyui_frames(
         "pixel_lock_required": True,
         "frames": {
             "start_frame": 1,
-            "frame_count": output_spec.frame_count,
+            "frame_count": _resolved_frame_count(output_spec),
             "files": frames_evidence,
         },
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

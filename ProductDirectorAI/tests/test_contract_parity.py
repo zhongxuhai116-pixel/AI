@@ -62,7 +62,7 @@ class ImagePreviewContractTests(unittest.TestCase):
         )
         self.assertEqual(sum(shot.duration_frames for shot in plan.shots), 144)
         self.assertEqual(plan.crop_anchor.value, "left")
-        self.assertEqual(OutputSpec.model_validate(self.example["output"]).frame_count, 144)
+        self.assertEqual(OutputSpec.model_validate(self.example["output"]).total_frames, 144)
         request = PlanRequest.model_validate(
             {
                 "product_asset_id": self.example["product_asset_id"],

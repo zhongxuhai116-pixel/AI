@@ -184,6 +184,31 @@ class StrictQATest(unittest.TestCase):
         self.assertIn(6, self.problem_frames(report, "contour_anomaly"))
         self.assertTrue((out_dir / "contour_anomaly_frame_0006.png").exists())
 
+    # 8. 镜头边界豁免（V5 参考重演）：计划声明的切镜处（硬切）轮廓/尺寸突变属预期构图变化
+    def test_shot_boundary_contour_jump_exempted_with_plan(self):
+        def mutate(i, alpha, rgb):
+            if i >= 4:
+                mask = np.zeros((HEIGHT, WIDTH), dtype=bool)
+                mask[40:56, 20 + (i - 4):36 + (i - 4)] = True
+                alpha = mask.astype(np.uint8) * 255
+            return alpha, rgb
+
+        case = self.make_case("boundary", mutate)
+        plan = case / "plan.json"
+        plan.write_text(json.dumps({"intent": "两镜头切镜", "shots": [
+            {"id": "shot_01", "name": "镜头 A", "duration_frames": 4},
+            {"id": "shot_02", "name": "镜头 B", "duration_frames": 4},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        code, report, _ = run_qa(case, ["--plan", str(plan)])
+        self.assertEqual(code, 0, json.dumps(report, ensure_ascii=False))
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["checks"]["contour_anomaly"].get("skipped_shot_boundaries"), [4])
+        self.assertEqual(report["checks"]["size_stability"].get("skipped_shot_boundaries"), [4])
+        # 同一序列不带计划：豁免只来自声明切镜，仍按伪影阻断
+        code2, report2, _ = run_qa(self.make_case("boundary_noplan", mutate))
+        self.assertNotEqual(code2, 0)
+        self.assertEqual(report2["checks"]["contour_anomaly"]["status"], "FAIL")
+
     # 7. Logo 缺失负例：第 7 帧 Logo 区域被抹成纯色 → SSIM 骤降被阻断并出热图
     def test_logo_missing_blocked(self):
         def mutate(i, alpha, rgb):

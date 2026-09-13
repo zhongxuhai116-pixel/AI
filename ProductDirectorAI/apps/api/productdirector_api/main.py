@@ -652,8 +652,28 @@ class OutputSpec(BaseModel):
         return self
 
     @property
-    def frame_count(self) -> int:
+    def total_frames(self) -> int:
         return self.fps * self.duration_seconds
+
+
+class ReenactmentOutputSpec(OutputSpec):
+    """V5 参考重演输出：时长按目标 fps 量化为显式整帧帧数，fractional 时长只作记录。
+    独立子类，不改变 V1 ImagePreviewSpec 合同（OutputSpec 字段与 V1 Schema 严格同步）。"""
+
+    duration_seconds: float = Field(gt=0, le=120)
+    frame_count: int = Field(ge=1, le=100000)
+
+    @property
+    def total_frames(self) -> int:
+        return self.frame_count
+
+
+def output_spec_for_plan(plan_snapshot: dict) -> OutputSpec:
+    """按冻结计划选择输出合同：V5 重演计划携带显式 frame_count，V1 计划沿用 5–8 秒合同。"""
+    output = plan_snapshot.get("output") or {}
+    if plan_snapshot.get("from_reference") and isinstance(output.get("frame_count"), int):
+        return ReenactmentOutputSpec.model_validate(output)
+    return OutputSpec.model_validate(output)
 
 
 class PlanRequest(BaseModel):
@@ -2302,7 +2322,7 @@ def media_quality_report(video: Path, plan_snapshot: dict, output_spec: OutputSp
     workdir.mkdir(parents=True, exist_ok=True)
     failures: list[str] = []
     samples: list[dict] = []
-    for frame in qa_sample_frames(plan_snapshot, output_spec.frame_count):
+    for frame in qa_sample_frames(plan_snapshot, output_spec.total_frames):
         target = workdir / f"qa-{frame:04d}.png"
         result = subprocess.run(
             [FFMPEG, "-y", "-v", "error", "-i", str(video),
@@ -2361,7 +2381,7 @@ def render_image_job(job_id: str, asset: dict, output: Path, plan_snapshot: dict
         "-i", str(input_path),
         "-filter_complex", filtergraph,
         "-map", "[video]",
-        "-frames:v", str(output_spec.frame_count),
+        "-frames:v", str(output_spec.total_frames),
         "-r", str(output_spec.fps),
         "-s", f"{output_spec.width}x{output_spec.height}",
         "-c:v", "libx264",
@@ -2400,7 +2420,7 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_p
         "--output", str(frames),
         "--width", str(output_spec.width),
         "--height", str(output_spec.height),
-        "--frames", str(output_spec.frame_count),
+        "--frames", str(output_spec.total_frames),
         "--plan", str(plan_path),
     ]
     update_job(job_id, status="RUNNING", stage="RENDER", progress=12)
@@ -2413,9 +2433,9 @@ def render_glb_job(job_id: str, asset: dict, run_dir: Path, output: Path, plan_p
     for line in process.stdout:
         output_lines.append(line)
         if "Saved:" in line or "Time:" in line and "Rendering" not in line:
-            rendered = min(output_spec.frame_count, rendered + 1)
+            rendered = min(output_spec.total_frames, rendered + 1)
             if rendered % 4 == 0:
-                update_job(job_id, progress=12 + int(rendered / output_spec.frame_count * 70))
+                update_job(job_id, progress=12 + int(rendered / output_spec.total_frames * 70))
         if get_job(job_id)["cancel_requested"]:
             process.terminate()
             break
@@ -2550,7 +2570,7 @@ def _qa_run_context(db: sqlite3.Connection, run_id: str) -> dict:
     if not plan_row:
         raise HTTPException(404, "计划不存在")
     plan_payload = json.loads(plan_row["payload"])
-    output_spec = OutputSpec.model_validate(plan_payload.get("output", {}))
+    output_spec = output_spec_for_plan(plan_payload)
     policy_row = db.execute(
         "SELECT payload FROM fidelity_policies WHERE id = ?", (snapshot["fidelity_policy_id"],),
     ).fetchone()
@@ -2999,7 +3019,7 @@ def build_controlled_blender_command(
         "--output", str(strict_root),
         "--width", str(output_spec.width),
         "--height", str(output_spec.height),
-        "--frames", str(output_spec.frame_count),
+        "--frames", str(output_spec.total_frames),
         "--plan", str(plan_path),
         "--passes",
     ]
@@ -3070,7 +3090,7 @@ def _run_controlled_pass_validation(pass_root: Path, output_spec: OutputSpec) ->
     report_path = pass_root / "passes_report.json"
     cmd = [
         sys.executable, str(FIDELITY_PASS_VALIDATOR),
-        "--passes", str(pass_root), "--frames", str(output_spec.frame_count),
+        "--passes", str(pass_root), "--frames", str(output_spec.total_frames),
         "--start-frame", "1", "--json", str(report_path),
     ]
     result = subprocess.run(cmd, capture_output=True)
@@ -3236,7 +3256,7 @@ def _verify_strict_source_manifest(
     frames = manifest.get("frames") or {}
     if frames.get("start_frame") != 1:
         failures.append("Strict 输入来源 start_frame 必须为 1")
-    if frames.get("frame_count") != output_spec.frame_count:
+    if frames.get("frame_count") != output_spec.total_frames:
         failures.append("Strict 输入来源 frame_count 与冻结计划不一致")
     if manifest.get("background_frame_offset", 0) != 0:
         failures.append("Strict 输入来源 background_frame_offset 必须为 0")
@@ -3245,12 +3265,12 @@ def _verify_strict_source_manifest(
         failures.append("背景工作流未出现在已冻结 STRICT 保真策略的批准列表")
     layers = manifest.get("layers") or {}
     required_layer_frames, plan_contract_failures = _required_layer_frame_contracts(
-        plan_payload, output_spec.frame_count
+        plan_payload, output_spec.total_frames
     )
     failures.extend(plan_contract_failures)
     failures.extend(_strict_layer_contract_failures(
         layers, policy_payload, snapshot.get("required_strict_layers"), required_layer_frames,
-        set(range(1, output_spec.frame_count + 1)),
+        set(range(1, output_spec.total_frames + 1)),
     ))
     current_layers = _collect_strict_layer_files(strict_root)
     expected_files: dict[str, str] = {}
@@ -3342,7 +3362,7 @@ def run_controlled_blender_passes(
         "plan_snapshot_sha256": plan_contract_payload_hash(plan_snapshot)[1],
         "command": command,
         "exit_code": completed.returncode,
-        "frames_requested": output_spec.frame_count,
+        "frames_requested": output_spec.total_frames,
         "pass_semantics": parsed_channels,
         "pass_layout": passes_report.get("layout"),
         "generated_files": generated_files,
@@ -3369,7 +3389,7 @@ def run_controlled_blender_passes(
         "width": output_spec.width,
         "height": output_spec.height,
         "fps": output_spec.fps,
-        "frame_count": output_spec.frame_count,
+        "frame_count": output_spec.total_frames,
         "duration_seconds": output_spec.duration_seconds,
         "created_at": utc_now(),
     }
@@ -3460,7 +3480,7 @@ def _run_strict_source_validator(strict_root: Path, output_spec: OutputSpec) -> 
         "--product", str(strict_root / "product"),
         "--mask", str(strict_root / "mask"),
         "--background", str(strict_root / "background"),
-        "--frames", str(output_spec.frame_count), "--start-frame", "1",
+        "--frames", str(output_spec.total_frames), "--start-frame", "1",
         "--background-frame-offset", "0", "--json", str(report_path),
     ]
     result = subprocess.run(cmd, capture_output=True)
@@ -3469,6 +3489,64 @@ def _run_strict_source_validator(strict_root: Path, output_spec: OutputSpec) -> 
         detail = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()[-2000:]
         return None, f"Strict 来源一致性校验执行失败: {detail}"
     return report, None
+
+def reference_recreation_citation(db, plan_payload: dict, plan_id: str) -> dict | None:
+    """V5-06 原视频引用追踪：冻结计划携带 from_reference 时，把来源引用与冻结映射
+    快照写入 Run manifest，供重演产物溯源。参考视频内容/字幕/OCR/链接文本是外部
+    数据；品牌/水印/音乐/人物不默认复制到成片。"""
+    from_reference = plan_payload.get("from_reference") or {}
+    analysis_id = from_reference.get("analysis_id")
+    reference_id = from_reference.get("reference_id")
+    if not analysis_id or not reference_id:
+        return None
+    analysis = db.execute("SELECT * FROM reference_analyses WHERE id = ?", (analysis_id,)).fetchone()
+    reference = db.execute("SELECT * FROM reference_assets WHERE id = ?", (reference_id,)).fetchone()
+    mapping = db.execute(
+        "SELECT * FROM reference_mappings WHERE plan_id = ? ORDER BY created_at DESC LIMIT 1",
+        (plan_id,),
+    ).fetchone()
+    if not analysis or not reference or not mapping:
+        return None
+    reference_payload = json.loads(reference["payload"]) if reference["payload"] else {}
+    mapping_payload = json.loads(mapping["payload"]) if mapping["payload"] else {}
+    return {
+        "reference_id": reference_id,
+        "reference_source_sha256": (reference_payload.get("source") or {}).get("sha256"),
+        "reference_proxy_sha256": (reference_payload.get("proxy") or {}).get("sha256"),
+        "analysis_id": analysis_id,
+        "analysis_revision": analysis["revision"],
+        "analysis_payload_sha256": analysis["payload_sha256"],
+        "mapping_id": mapping["id"],
+        "mapping_payload_sha256": mapping["payload_sha256"],
+        "mapping": mapping_payload,
+        "note": "参考内容为外部数据；品牌/水印/音乐/人物不默认复制到成片",
+    }
+
+
+def _validate_from_reference_plan_snapshot(db, plan_snapshot: dict, plan_id: str) -> None:
+    """V5-06 重演计划任务前置校验：镜头结构必须与冻结 ReferenceMapping 一致，
+    保留时长（量化整帧）逐镜头核对，总帧数与 output.frame_count 一致。"""
+    mapping_row = db.execute(
+        "SELECT * FROM reference_mappings WHERE plan_id = ? ORDER BY created_at DESC LIMIT 1",
+        (plan_id,),
+    ).fetchone()
+    if not mapping_row:
+        raise HTTPException(409, "参考重演计划缺少冻结映射，无法启动任务")
+    mapping = json.loads(mapping_row["payload"])
+    expected_shots = mapping.get("shots") or []
+    shots = plan_snapshot.get("shots") or []
+    output = plan_snapshot.get("output") or {}
+    if len(shots) != len(expected_shots):
+        raise HTTPException(409, "计划镜头数与参考映射不一致")
+    for index, (shot, mapped) in enumerate(zip(shots, expected_shots), start=1):
+        if str(shot.get("id")) != str(mapped.get("target_shot_id")):
+            raise HTTPException(409, f"第 {index} 个镜头与参考映射不匹配")
+        if int(shot.get("duration_frames") or 0) != int(mapped.get("duration_target_frames") or -1):
+            raise HTTPException(409, f"第 {index} 个镜头时长与映射保留时长不一致")
+    total_frames = sum(int(shot["duration_frames"]) for shot in shots)
+    if int(output.get("frame_count") or total_frames) != total_frames:
+        raise HTTPException(409, "计划 output.frame_count 与镜头总帧数不一致")
+
 
 def run_strict_runtime_closure(job_id: str, run_dir: Path, plan_path: Path, output_spec: OutputSpec) -> dict:
     """Strict Run 的 RENDER→COMPOSITE→QA 运行时闭环：真实读取并复核冻结引用，
@@ -3561,12 +3639,12 @@ def run_strict_runtime_closure(job_id: str, run_dir: Path, plan_path: Path, outp
     else:
         input_manifest, _ = build_strict_input_manifest(job_id, strict_root, snapshot)
         required_layer_frames, plan_contract_failures = _required_layer_frame_contracts(
-            plan_payload, output_spec.frame_count
+            plan_payload, output_spec.total_frames
         )
         layer_contract_failures = _strict_layer_contract_failures(
             _collect_strict_layer_files(strict_root), policy_payload,
             snapshot.get("required_strict_layers"), required_layer_frames,
-            set(range(1, output_spec.frame_count + 1)),
+            set(range(1, output_spec.total_frames + 1)),
         )
         if plan_contract_failures or layer_contract_failures:
             return {"passed": False, "failure": "Strict 图层合同与冻结策略不一致: " + "；".join((plan_contract_failures + layer_contract_failures)[:12])}
@@ -3579,7 +3657,7 @@ def run_strict_runtime_closure(job_id: str, run_dir: Path, plan_path: Path, outp
     passes_report_path = strict_root / "passes_report.json"
     pass_cmd = [
         sys.executable, str(FIDELITY_PASS_VALIDATOR), "--passes", str(pass_root),
-        "--frames", str(output_spec.frame_count), "--start-frame", "1", "--json", str(passes_report_path),
+        "--frames", str(output_spec.total_frames), "--start-frame", "1", "--json", str(passes_report_path),
     ]
     pass_result = subprocess.run(pass_cmd, capture_output=True)
     passes_report = _read_json_report(passes_report_path)
@@ -3600,11 +3678,11 @@ def run_strict_runtime_closure(job_id: str, run_dir: Path, plan_path: Path, outp
             return {"passed": False, "failure": f"Strict Run 缺少{label}目录 strict/{folder.name}"}
     strict_plan_path = strict_root / "strict_plan.json"
     required_layer_frames, plan_contract_failures = _required_layer_frame_contracts(
-        plan_payload, output_spec.frame_count
+        plan_payload, output_spec.total_frames
     )
     strict_plan_path.write_text(
         json.dumps({
-            "frame_count": output_spec.frame_count,
+            "frame_count": output_spec.total_frames,
             "start_frame": 1,
             "background_frame_offset": 0,
             "required_layers": {name: sorted(frames) for name, frames in required_layer_frames.items()},
@@ -3672,6 +3750,7 @@ def run_strict_runtime_closure(job_id: str, run_dir: Path, plan_path: Path, outp
             "SELECT * FROM assets WHERE id = (SELECT asset_id FROM jobs WHERE id = ?)", (job_id,),
         ).fetchone()
         controlled_evidence = load_controlled_render_evidence(db, job_id)
+        reference_recreation = reference_recreation_citation(db, plan_snapshot, snapshot["plan_id"])
     asset_path = None
     if asset_row:
         asset = row_to_dict(asset_row)
@@ -3704,6 +3783,7 @@ def run_strict_runtime_closure(job_id: str, run_dir: Path, plan_path: Path, outp
         "plan_id": snapshot["plan_id"],
         "strict_mode": True,
         "fidelity_snapshot": snapshot,
+        "reference_recreation": reference_recreation,
         "input_manifest": input_manifest,
         "input_manifest_sha256": input_manifest_sha256,
         "source_manifest": source_manifest,
@@ -3730,7 +3810,7 @@ def run_strict_runtime_closure(job_id: str, run_dir: Path, plan_path: Path, outp
         "width": output_spec.width,
         "height": output_spec.height,
         "fps": output_spec.fps,
-        "frame_count": output_spec.frame_count,
+        "frame_count": output_spec.total_frames,
         "duration_seconds": output_spec.duration_seconds,
         "director_plan": plan_snapshot,
         "created_at": utc_now(),
@@ -3767,7 +3847,7 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             plan_snapshot = json.loads(plan_snapshot_bytes)
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"任务缺少有效的 DirectorPlan 快照: {exc}") from exc
-        output_spec = OutputSpec.model_validate(plan_snapshot.get("output", {}))
+        output_spec = output_spec_for_plan(plan_snapshot)
         with connect() as db:
             strict_snapshot = load_strict_run_snapshot(db, job_id)
         if strict_snapshot is not None:
@@ -3861,10 +3941,10 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
         stream = probe.get("streams", [{}])[0]
         duration = float(probe.get("format", {}).get("duration", 0))
         framerate = parse_r_frame_rate(stream.get("r_frame_rate", f"{output_spec.fps}/1"))
-        frame_count = int(stream.get("nb_frames", output_spec.frame_count))
+        frame_count = int(stream.get("nb_frames", output_spec.total_frames))
         if stream.get("width") != output_spec.width or stream.get("height") != output_spec.height:
             raise RuntimeError(f"视频技术检查失败: {stream.get('width')}x{stream.get('height')}, {duration:.3f}s")
-        if abs(framerate - output_spec.fps) > 0.05 or frame_count != output_spec.frame_count:
+        if abs(framerate - output_spec.fps) > 0.05 or frame_count != output_spec.total_frames:
             raise RuntimeError(
                 f"视频技术检查失败: fps={framerate}, frames={frame_count}, "
                 f"duration={duration:.3f}s"
@@ -3894,7 +3974,7 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             "width": output_spec.width,
             "height": output_spec.height,
             "fps": output_spec.fps,
-            "frame_count": output_spec.frame_count,
+            "frame_count": output_spec.total_frames,
             "duration_seconds": output_spec.duration_seconds,
             "ffprobe": {"duration": duration, "video_stream": stream},
             "qa": qa_report,
@@ -5813,6 +5893,13 @@ def approve_reference_analysis(analysis_id: str) -> dict:
 
 V5_REUSE_DIMENSIONS = {"duration", "shot_size", "composition", "motion_direction", "action_rhythm", "transition"}
 V5_MOTION_TO_CAMERA = {"static": "static", "moving": "side_track"}
+# V5 适配规划的确定性构图：按镜头序号循环取景（V3-07 校准机位族），目标对准产品中心。
+# 构图属于 changed_dimensions；取景高度 0.21m 按 CC0 相机口径标定，属启发式适配而非测量。
+V5_COMPOSITION_VIEWPOINTS = [
+    {"position_m": [0.0, -1.85, 0.21]},
+    {"position_m": [-0.55, -1.7, 0.26]},
+    {"position_m": [0.55, -1.7, 0.26]},
+]
 
 
 class FromReferenceRequest(BaseModel):
@@ -5850,6 +5937,10 @@ def create_plan_from_reference(project_id: str, request: FromReferenceRequest) -
     if not segments:
         raise HTTPException(409, "分析没有可用分段")
     asset_id = version["product_asset_id"]
+    reference_payload = json.loads(reference["payload"]) if reference["payload"] else {}
+    reference_duration_s = float(
+        (reference_payload.get("timebase") or {}).get("duration_s") or 0.0
+    )
     # 适配规划：源分段 → 可执行 Shot（保留时长按目标 fps 量化为整帧，误差记录在映射中）
     shots = []
     mapping_shots = []
@@ -5858,8 +5949,15 @@ def create_plan_from_reference(project_id: str, request: FromReferenceRequest) -
     for index, segment in enumerate(segments):
         start_s = float(segment["start_s"])
         end_s = segment["end_s"]
-        source_duration_s = (float(end_s) - start_s) if end_s is not None else 1.0
-        duration_frames = max(24, int(round(source_duration_s * DEFAULT_FPS)))
+        if end_s is not None:
+            source_duration_s = float(end_s) - start_s
+        elif reference_duration_s > start_s:
+            # 末尾开放分段（end_s=null 表示"到片尾"）用参考片实际时长求解，不静默假设 1 秒
+            source_duration_s = reference_duration_s - start_s
+        else:
+            source_duration_s = 1.0
+        # 重演计划不套用 V1 导演的 24 帧最小镜头约束；量化整帧即可（误差门 ≤1 帧/镜头）。
+        duration_frames = max(1, int(round(source_duration_s * DEFAULT_FPS)))
         duration_error_frames = duration_frames - source_duration_s * DEFAULT_FPS
         total_duration_error_frames += duration_error_frames
         total_frames += duration_frames
@@ -5873,6 +5971,11 @@ def create_plan_from_reference(project_id: str, request: FromReferenceRequest) -
             "camera": camera,
             "focal_length_mm": 35,
             "duration_frames": duration_frames,
+            "camera_target_m": [0.0, 0.0, 0.21],
+            "camera_path": {
+                "type": "static",
+                **V5_COMPOSITION_VIEWPOINTS[index % len(V5_COMPOSITION_VIEWPOINTS)],
+            },
         })
         mapping_shots.append({
             "source_segment_index": segment["index"],
@@ -6597,14 +6700,18 @@ def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
             raise HTTPException(409, "请先确认分镜计划")
         plan_snapshot = json.loads(plan["payload"])
         try:
-            PlanUpdate.model_validate(
-                {
-                    "intent": plan_snapshot["intent"],
-                    "shots": plan_snapshot["shots"],
-                    "crop_anchor": plan_snapshot.get("crop_anchor", CropAnchor.center.value),
-                    "duration_seconds": (plan_snapshot.get("output") or {}).get("duration_seconds", 6),
-                }
-            )
+            if plan_snapshot.get("from_reference"):
+                # V5 重演计划：时长与镜头数来自参考映射（量化整帧），不套用 V1 三镜头 5–8 秒合同。
+                _validate_from_reference_plan_snapshot(db, plan_snapshot, plan["id"])
+            else:
+                PlanUpdate.model_validate(
+                    {
+                        "intent": plan_snapshot["intent"],
+                        "shots": plan_snapshot["shots"],
+                        "crop_anchor": plan_snapshot.get("crop_anchor", CropAnchor.center.value),
+                        "duration_seconds": (plan_snapshot.get("output") or {}).get("duration_seconds", 6),
+                    }
+                )
         except (KeyError, json.JSONDecodeError, ValueError) as exc:
             raise HTTPException(409, f"计划快照无效，无法启动任务: {exc}") from exc
         asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan["product_asset_id"],)).fetchone()
@@ -6709,7 +6816,7 @@ def register_strict_sources(
         if not plan_row:
             raise HTTPException(404, "计划不存在")
         plan_snapshot = json.loads(plan_row["payload"])
-        output_spec = OutputSpec.model_validate(plan_snapshot.get("output", {}))
+        output_spec = output_spec_for_plan(plan_snapshot)
         job_id = run["job_id"]
         strict_root = RUNS / job_id / "strict"
         for folder in ("passes", "product", "mask", "background"):
@@ -6717,11 +6824,11 @@ def register_strict_sources(
                 raise HTTPException(409, f"缺少 Strict 层目录 strict/{folder}")
         layers = _collect_strict_layer_files(strict_root)
         required_layer_frames, plan_contract_failures = _required_layer_frame_contracts(
-            plan_snapshot, output_spec.frame_count
+            plan_snapshot, output_spec.total_frames
         )
         layer_contract_failures = _strict_layer_contract_failures(
             layers, policy_payload, snapshot.get("required_strict_layers"), required_layer_frames,
-            set(range(1, output_spec.frame_count + 1)),
+            set(range(1, output_spec.total_frames + 1)),
         )
         if plan_contract_failures or layer_contract_failures:
             raise HTTPException(409, "Strict 图层合同与冻结策略不一致: " + "；".join((plan_contract_failures + layer_contract_failures)[:12]))
@@ -6745,7 +6852,7 @@ def register_strict_sources(
             "input_trust": "REGISTERED_LOCAL_SAMPLE",
             "render_evidence": request.render_evidence.model_dump(),
             "background_workflow": background,
-            "frames": {"start_frame": 1, "frame_count": output_spec.frame_count},
+            "frames": {"start_frame": 1, "frame_count": output_spec.total_frames},
             "background_frame_offset": 0,
             "layers": layers,
         }

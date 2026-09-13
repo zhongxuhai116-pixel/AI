@@ -669,8 +669,9 @@ def load_plan(path: str, total_frames: int) -> list[dict]:
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"无法读取 DirectorPlan 快照: {exc}") from exc
     shots = payload.get("shots")
-    if not isinstance(shots, list) or len(shots) != 3:
-        raise RuntimeError("DirectorPlan 必须恰好包含 3 个镜头")
+    # V1 导演合同（恰好 3 镜头）由 API 层强制；渲染器支持 1–8 镜头以承接 V5 参考重演计划。
+    if not isinstance(shots, list) or not 1 <= len(shots) <= 8:
+        raise RuntimeError("DirectorPlan 必须包含 1–8 个镜头")
     normalized = []
     for index, shot in enumerate(shots, start=1):
         if not isinstance(shot, dict):
@@ -680,8 +681,8 @@ def load_plan(path: str, total_frames: int) -> list[dict]:
         focal = shot.get("focal_length_mm")
         if camera not in ALLOWED_CAMERAS:
             raise RuntimeError(f"第 {index} 个镜头的相机模板无效: {camera!r}")
-        if not isinstance(duration, int) or duration < 24:
-            raise RuntimeError(f"第 {index} 个镜头时长必须至少为 24 帧")
+        if not isinstance(duration, int) or duration < 1:
+            raise RuntimeError(f"第 {index} 个镜头时长必须至少为 1 帧")
         if not isinstance(focal, int) or not 15 <= focal <= 120:
             raise RuntimeError(f"第 {index} 个镜头焦距必须在 15–120mm")
         path = shot.get("camera_path")

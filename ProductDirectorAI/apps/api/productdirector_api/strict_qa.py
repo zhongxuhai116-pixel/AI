@@ -224,6 +224,11 @@ def _shot_for_frame(plan_payload: dict, frame: int) -> tuple[str | None, str | N
     return None, None, None
 
 
+def _resolved_frame_count(output_spec) -> int:
+    """输出帧数解析：运行时 OutputSpec 提供 total_frames；测试桩/外部调用可能只给 frame_count。"""
+    return int(getattr(output_spec, "total_frames", None) or getattr(output_spec, "frame_count", 0))
+
+
 def run_strict_qa(
     strict_root: Path,
     plan_payload: dict,
@@ -242,7 +247,7 @@ def run_strict_qa(
     thresholds.update(threshold_payload or {})
     failures: list[str] = []
     not_verified: list[str] = []
-    expected = set(range(1, int(output_spec.frame_count) + 1))
+    expected = set(range(1, int(_resolved_frame_count(output_spec)) + 1))
     product_root = strict_root / "product"
     mask_root = strict_root / "mask"
     pass_root = strict_root / "passes"
@@ -524,5 +529,5 @@ def run_strict_qa(
         "threshold_set_version": thresholds.get("threshold_set_version"),
         "policy_mode": policy_payload.get("mode"),
         "review_source_kind": review_payload.get("source_kind"),
-        "frame_count": int(output_spec.frame_count),
+        "frame_count": int(_resolved_frame_count(output_spec)),
     }
