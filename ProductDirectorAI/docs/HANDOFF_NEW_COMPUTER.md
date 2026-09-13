@@ -1,3 +1,5 @@
+> 2026-09-13：换电脑安装请优先使用 [最新安装与迁移](INSTALL.md)，旧安装脚本路径问题已修复。
+
 # ProductDirectorAI 换电脑接手手册（Windows）
 
 > 本次换电脑先读 [最新继续入口](NEXT_COMPUTER_START.md) 与 [A05 交接验收](reports/A05_SECURITY_HANDOFF.md)。下文是历史手册，其中仅授权 V1、固定 localhost、npm 阻塞等内容已由最新入口覆盖。当前代码新增登录鉴权，需按新入口配置。
