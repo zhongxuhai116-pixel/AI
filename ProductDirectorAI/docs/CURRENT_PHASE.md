@@ -1,6 +1,6 @@
 # 当前阶段
 
-> **2026-09-12 GitHub 整理更新**：用户已确认 V1/V2 ACCEPTED；完整 V3 仍为 IN_PROGRESS，V4–V6 未开始。V3 的 Q01–Q06、Strict 运行/来源、受控 Blender 输出、背景 Worker、QA 与 display-linear 色彩合同已有局部代码和验证报告。远端新增的 V3-06/V3-07 云端渲染记录见 [历史任务书](reports/V3_TASK_BRIEF.md)，该编号与[主规划](../ProductDirectorAI_V1-V6_Codex_Development_Plan.md)的 V3-06/V3-07 不同，不能据此宣布主规划任务或完整 V3 PASS。真实 Blender 单帧、H3 场景校准也不能替代主规划 V3-07 的两类产品×至少三镜头×两背景及完整人工审批。本页下方大量分时记录为历史快照；最新验收以 [控制记录](BROKER_V6_CONTROL.md) 和独立报告为准。
+> **2026-09-12/13 最新**：用户已确认 V1/V2 ACCEPTED；完整 V3 仍为 IN_PROGRESS，V4–V6 未开始。V3 的 Q01–Q06、Strict 运行/来源、受控 Blender 输出、背景 Worker、QA 与 display-linear 色彩合同已有局部代码和验证报告。新增真实 Blender 24 帧、540×960 探针：核心区色差与 96 个 EXR 通道结构通过独立复验，完整 72 帧及通道语义仍未验收，见 [P0.1 控制端报告](reports/V3_P01_MULTIFRAME_CONTROLLER_ACCEPTANCE_2026-09-12.md)。远端历史 V3-06/V3-07 云端记录见 [任务书](reports/V3_TASK_BRIEF.md)，该编号与[主规划](../ProductDirectorAI_V1-V6_Codex_Development_Plan.md)不同，不能据此宣布主规划任务或完整 V3 PASS。H3 场景校准也不能替代两类产品×至少三镜头×两背景及完整人工审批。本页下方大量分时记录为历史快照；最新验收以 [控制记录](BROKER_V6_CONTROL.md) 和独立报告为准。
 
 > **2026-09-12 历史收尾记录**：当时 V3-01/02 通过，V3-03/04 完成，V3-05 核心通过但仍有未完成项；历史任务书的 V3-06/V3-07 记录了云端真实渲染。后端本地与云端 **152/152**，云端 api / web / postgresql / comfy-h3 四个服务 active。该快照不代表当前完整阶段验收。
 
