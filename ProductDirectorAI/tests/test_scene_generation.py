@@ -36,6 +36,17 @@ Do not deform the product.
 
 
 class BriefParserTests(unittest.TestCase):
+    def test_bare_timestamps_and_inline_scene_descriptions(self):
+        brief = 'Purple product.\nSECUENCIA DEL VIDEO:\n'
+        for start, end in [(0,2),(2,5),(5,8),(8,11),(11,13),(13,15)]:
+            brief += f'{start}–{end} segundos: Action at {start}.\nTexto: Caption {start}\n'
+        brief += 'ESTILO VISUAL:\nNatural light.\nAUDIO:\nNo music.'
+        shots = scenes.parse_brief(brief)
+        self.assertEqual([s['duration_frames'] for s in shots], [48,72,72,72,48,48])
+        self.assertEqual(shots[0]['scene_description'], 'Action at 0.')
+        self.assertEqual(shots[-1]['end_frame'], 360)
+        self.assertNotIn('No music.', shots[-1]['scene_prompt'])
+
     def test_preserves_five_scene_timeline_and_distinct_prompts(self):
         shots = scenes.parse_brief(BRIEF)
         self.assertEqual([s['duration_frames'] for s in shots], [72,96,72,72,48])

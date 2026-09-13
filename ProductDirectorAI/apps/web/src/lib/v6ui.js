@@ -140,3 +140,8 @@ export function navAccessibility(items, activeId) {
     ariaCurrent: id === activeId ? "page" : undefined,
   }));
 }
+
+// Route explicit time ranges to scene generation; never silently use studio shots.
+export function hasSceneTimeline(intent = "") {
+  return /^(?:[ \t]*)(?:(?:ESCENA|SCENE|场景|镜头)\s*\d+\s*[—–:：-]|\d+(?:\.\d+)?\s*(?:a|to|到|至|[-–—])\s*\d+(?:\.\d+)?)/mi.test(intent);
+}

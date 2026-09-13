@@ -10,12 +10,12 @@ from pathlib import Path
 from .providers import comfyui
 
 HEADER = re.compile(
-    r"^\s*(?:ESCENA|SCENE|场景|镜头)\s*(\d+)\s*[—–:：-]\s*"
+    r"^[ \t]*(?:(?:ESCENA|SCENE|场景|镜头)\s*(\d+)\s*[—–:：-]\s*)?"
     r"(\d+(?:\.\d+)?)\s*(?:a|to|到|至|[-–—])\s*(\d+(?:\.\d+)?)"
-    r"\s*(?:segundos?|seconds?|secs?|s|秒)?\s*[:：]?[^\n]*$", re.I | re.M)
+    r"[ \t]*(?:segundos?|seconds?|secs?|s|秒)?[ \t]*[:：]?[ \t]*", re.I | re.M)
 APPENDIX = re.compile(r"^\s*(?:ESTILO VISUAL|VISUAL STYLE|AUDIO|LOCUCI[ÓO]N[^:\n]*|"
                       r"RESTRICCIONES|RESTRICTIONS|视觉风格|音频|配音|限制)\s*[:：]", re.I | re.M)
-CAPTION = re.compile(r"^\s*(?:Texto en pantalla|Texto final|On.screen text|Text on screen|"
+CAPTION = re.compile(r"^\s*(?:Texto(?: grande)? en pantalla|Texto final(?: grande)?|Texto secundario|Texto|On.screen text|Text on screen|"
                      r"字幕|屏幕文字|最终字幕)\s*[:：]\s*", re.I | re.M)
 
 
@@ -35,7 +35,7 @@ def parse_brief(intent: str, fps: int = 24) -> list[dict]:
     shots, end_frame = [], 0
     for i, match in enumerate(matches):
         start, end = (round(float(match.group(k)) * fps) for k in (2, 3))
-        if int(match.group(1)) != i + 1 or start != end_frame or end-start < fps or end-start > 360:
+        if (match.group(1) and int(match.group(1)) != i + 1) or start != end_frame or end-start < fps or end-start > 360:
             raise ValueError("场景需从0秒开始、按编号连续且不重叠，每段1–15秒；请修正时间轴")
         body_end = matches[i+1].start() if i+1 < len(matches) else (tail_start.start() if tail_start else len(intent))
         body = intent[match.end():body_end].strip()

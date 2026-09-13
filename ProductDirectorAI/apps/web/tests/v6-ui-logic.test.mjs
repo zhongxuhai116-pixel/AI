@@ -8,7 +8,7 @@ import { test } from "node:test";
 import {
   PREVIEW_DURATION_OPTIONS, PREVIEW_SHOT_COUNT, batchFormFingerprint, buildPlanUpdateBody,
   buildProductionPlanBody, buildTemplatePlanBody, detectUnsupportedRequirements, durationLabel,
-  navAccessibility, planStaleness, platformLabel, previewState, profileOptionLabel,
+  navAccessibility, planStaleness, platformLabel, previewState, profileOptionLabel, hasSceneTimeline,
 } from "../src/lib/v6ui.js";
 
 test("BUG-01 时长选项来自后端支持范围（5–8 秒），不是写死的假下拉", () => {
@@ -125,4 +125,9 @@ test("BUG-08 导航项在窄窗口仍有可访问名称与悬浮提示", () => {
   }
   assert.equal(nav[1].ariaCurrent, "page");
   assert.equal(nav[0].ariaCurrent, undefined);
+});
+
+test("裸时间段也必须进入场景生成，不回退默认三镜头", () => {
+  for (const text of ["0–2 segundos: Primer plano", "2-5 seconds: Macro", "场景 1 — 0 到 3 秒：近景", "ESCENA 1 — 0 a 3 segundos:"]) assert.equal(hasSceneTimeline(text), true);
+  assert.equal(hasSceneTimeline("1080 × 1920，15秒广告"), false);
 });

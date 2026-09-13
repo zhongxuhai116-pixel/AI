@@ -11,7 +11,7 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import {
   PREVIEW_DURATION_OPTIONS, PREVIEW_SHOT_COUNT, batchFormFingerprint, buildPlanUpdateBody,
   buildProductionPlanBody, buildTemplatePlanBody, detectUnsupportedRequirements, durationLabel,
-  navAccessibility, planStaleness, previewState, profileOptionLabel,
+  navAccessibility, planStaleness, previewState, profileOptionLabel, hasSceneTimeline,
 } from "./lib/v6ui.js";
 
 const API_BASE = (import.meta.env.VITE_API_BASE || "").trim().replace(/\/$/, "");
@@ -2343,7 +2343,7 @@ export function App() {
     upload(new File([blob], "demo-product.png", { type: "image/png" }));
   }
   async function generatePlan() {
-    if (/^(?:\s*)(?:ESCENA|SCENE|场景|镜头)\s*\d+\s*[—–:：-]/mi.test(intent)) return createProductionPlan();
+    if (hasSceneTimeline(intent)) return createProductionPlan();
     if (!asset) return setToast(["danger", "请先上传产品图片或 GLB。"]);
     setBusy(true);
     try {
@@ -2476,7 +2476,7 @@ export function App() {
   async function cancel() { if (job) { await apiRequest(`/jobs/${job.id}/cancel`, { method: "POST" }); refresh(); } }
   async function retry() { if (job) { await apiRequest(`/jobs/${job.id}/retry`, { method: "POST" }); refresh(); } }
   async function aiGenerate() {
-    if (/^(?:\s*)(?:ESCENA|SCENE|场景|镜头)\s*\d+\s*[—–:：-]/mi.test(intent)) return createProductionPlan();
+    if (hasSceneTimeline(intent)) return createProductionPlan();
     if (!asset) return setToast(["danger", "请先上传产品图片或 GLB。"]);
     setBusy(true);
     try {
