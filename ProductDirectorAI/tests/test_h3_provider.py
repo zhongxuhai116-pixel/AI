@@ -39,7 +39,7 @@ class H3ProviderTests(unittest.TestCase):
     tearDown = fixtures.JobControlAcceptanceTests.tearDown
 
     def _reconstruct(self, **overrides):
-        body = {"product_asset_id": self.image_asset["id"], "crop": [0, 0, 256, 256], **overrides}
+        body = {"product_asset_id": self.image_asset["id"], "crop": [0, 0, 64, 64], **overrides}
         return self.client.post("/api/v1/providers/h3/reconstruct", json=body)
 
     def _provider_rows(self) -> list[dict]:

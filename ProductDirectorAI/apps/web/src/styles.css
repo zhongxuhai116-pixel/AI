@@ -266,3 +266,9 @@ td code { font-size: 9px; color: #4b5a6e; }
   .sidebar.expanded nav button { justify-content: flex-start; padding: 0 14px; }
   .sidebar.expanded + .main { margin-left: 224px; width: calc(100% - 224px); }
 }
+
+.reconstruction-panel { background:white; border:1px solid #dce3ef; padding:18px; border-radius:10px; grid-column:1/-1; }
+.reconstruction-panel p { line-height:1.6; }
+.reconstruction-crop { position:relative; width:min(100%,480px); touch-action:none; user-select:none; cursor:crosshair; }
+.reconstruction-crop img { width:100%; display:block; }
+.reconstruction-selection { position:absolute; border:2px solid #f97316; background:#f9731622; pointer-events:none; }

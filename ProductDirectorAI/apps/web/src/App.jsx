@@ -1,3 +1,4 @@
+import ImageReconstruction from "./components/ImageReconstruction";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive, ArrowClockwise, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
@@ -162,13 +163,13 @@ function AssetCard({ asset, assetUrl, onUpload, onDemo, busy }) {
 
 function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnchor, onCropAnchorChange, assetUrl, onGenerate, onAiGenerate, busy, durationSeconds, onDurationChange, planState, unsupported, production }) {
   return <section className="card director-card">
-    <div className="card-head"><div><h2>导演描述</h2><span>V1 模板导演 · 基础预演</span></div><button>高级设置 <CaretRight /></button></div>
+    <div className="card-head"><div><h2>导演描述</h2><span>{plan?.scene_generation ? "H3 场景生成" : "基础预演 / 场景生成"}</span></div><button>高级设置 <CaretRight /></button></div>
     <textarea value={intent} onChange={(e) => setIntent(e.target.value)} />
     <div className="counter"><span>{intent.length} / 4000</span><span>AI 导演：本地生成 + 服务端校验</span></div>
     {planState?.stale && <p className="capability-note danger"><WarningCircle weight="fill" />{planState.reason}</p>}
     {!!unsupported?.length && <div className="capability-note danger">
       <WarningCircle weight="fill" />
-      <div><b>当前管线不支持的要求（不会被静默降级）</b>
+      <div><b>基础预演的能力限制（场景生成结果需另行审核）</b>
         <ul className="notes">{unsupported.map((item) => <li key={item.capability}><b>{item.capability}</b>：{item.detail}</li>)}</ul>
       </div>
     </div>}
@@ -178,16 +179,17 @@ function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnc
     </div>
     <div className="outputs">
       {/* BUG-01：总时长是真实可操作的下拉；比例/帧率是固定规格，明确标为只读 */}
-      <label><span>总时长（基础预演）</span>
-        <select value={durationSeconds} onChange={(event) => onDurationChange(Number(event.target.value))}>
+      <label><span>{plan?.scene_generation ? "场景总时长（来自提示词）" : "总时长（基础预演）"}</span>
+        <select disabled={!!plan?.scene_generation} value={durationSeconds} onChange={(event) => onDurationChange(Number(event.target.value))}>
+          {plan?.scene_generation && <option value={durationSeconds}>{durationLabel(durationSeconds)}</option>}
           {PREVIEW_DURATION_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{durationLabel(seconds)}</option>)}
         </select>
       </label>
-      <label><span>镜头数（V1 合同固定）</span><button disabled title="V1 产品合同要求恰好 3 个镜头">{PREVIEW_SHOT_COUNT} SHOTS（只读）</button></label>
+      <label><span>镜头数</span><button disabled>{plan?.shots?.length || PREVIEW_SHOT_COUNT} SHOTS（只读）</button></label>
       <label><span>视频比例 / 帧率（只读）</span><button disabled title="V1 输出规格：9:16 竖屏 @ 24fps">9:16 竖屏 · 24 fps</button></label>
       <label>
         <span>输出分辨率</span>
-        <select value={`${output.width}x${output.height}`} onChange={(event) => onOutputChange(event.target.value)}>
+        <select disabled={!!plan?.scene_generation} value={`${output.width}x${output.height}`} onChange={(event) => onOutputChange(event.target.value)}>
           {outputPresets.map((item) => <option key={`${item.width}x${item.height}`} value={`${item.width}x${item.height}`}>{item.label}</option>)}
         </select>
       </label>
@@ -219,7 +221,7 @@ function RenderCard({ health, plan, job, onRender, onCancel, onRetry }) {
     <div className="env">{[["Blender", health?.blender, Cube], ["FFmpeg", health?.ffmpeg, FilmSlate]].map(([name, value, Icon]) => <div key={name}><em className={value?.available ? "ok" : "off"}><Icon /></em><p><strong>{name}</strong><small>{value?.available ? "本机已就绪" : "未连接"}</small></p></div>)}</div>
     {job ? <div className="job-box"><div><span>{job.stage}</span><strong>{job.progress}%</strong></div><div className="progress"><i style={{ width: `${job.progress}%` }} /></div><small>{job.status === "FAILED" ? job.error : verificationOnly ? (releaseReason || "验证小样已完成，但不可发布或继承 Strict PASS") : job.status === "SUCCEEDED" ? "视频与 metadata 已完成基础检查" : "任务在后台执行，刷新页面也不会丢失。"}</small></div> : <div className="empty-job"><Clock /><span>确认分镜后创建第一条预演任务</span></div>}
     <div className="render-actions">
-      {active ? <button className="danger" onClick={onCancel}><StopCircle />取消任务</button> : <button className="primary" disabled={!plan} onClick={onRender}><Play weight="fill" />确认计划并生成预演</button>}
+      {active ? <button className="danger" onClick={onCancel}><StopCircle />取消任务</button> : <button className="primary" disabled={!plan} onClick={onRender}><Play weight="fill" />{plan?.scene_generation ? "确认场景并生成视频" : "确认计划并生成预演"}</button>}
       {retryable && <button onClick={onRetry}><ArrowClockwise />重试任务</button>}
       {(job?.status === "SUCCEEDED" || verificationOnly) && <><a href={`${API}/jobs/${job.id}/video`} target="_blank"><DownloadSimple />{verificationOnly ? "下载验证 MP4" : "下载 MP4"}</a><a className="icon-link" title={verificationOnly ? "下载验证小样 metadata（不可发布）" : "下载 metadata"} href={`${API}/jobs/${job.id}/manifest`} target="_blank"><BoxArrowDown /></a></>}
     </div>
@@ -2337,6 +2339,7 @@ export function App() {
     upload(new File([blob], "demo-product.png", { type: "image/png" }));
   }
   async function generatePlan() {
+    if (/^(?:\s*)(?:ESCENA|SCENE|场景|镜头)\s*\d+\s*[—–:：-]/mi.test(intent)) return createProductionPlan();
     if (!asset) return setToast(["danger", "请先上传产品图片或 GLB。"]);
     setBusy(true);
     try {
@@ -2374,12 +2377,12 @@ export function App() {
         body: JSON.stringify(buildProductionPlanBody({
           assetId: asset.id, profileId: productionProfile, intent, shots, locale: "es-MX",
           voiceoverText: productionStatus?.voiceoverText || "",
-          acceptUnverifiedAppearance: acceptAppearance,
+          acceptUnverifiedAppearance: acceptAppearance, renderMode: "h3_scenes",
         })),
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail?.detail || body.detail || "生产计划创建失败");
-      setPlan(body);
+      setPlan(body); setOutput(body.output); setDurationSeconds(body.duration_seconds); setJob(null);
       setProductionStatus({ ...(productionStatus || {}), created: body });
       setToast(["success", `生产计划已创建：${body.shots.length} 镜头 · ${body.total_frames} 帧 · ${body.duration_seconds}s（Profile ${body.production_plan.profile_id}）`]);
     } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
@@ -2393,6 +2396,7 @@ export function App() {
     }
     setBusy(true);
     try {
+      if (!plan.scene_generation) {
       const saved = await apiRequest(`/plans/${plan.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -2406,6 +2410,7 @@ export function App() {
       setPlan(savedPlan);
       if (savedPlan.output_changed) {
         setToast(["success", "输出规格已写入冻结合同（原审批失效，正在重新确认）。"]);
+      }
       }
       const approval = await apiRequest(`/plans/${plan.id}/approve`, {
         method: "POST",
@@ -2440,38 +2445,26 @@ export function App() {
       if (!response.ok) return;
       const body = await response.json();
       setProfiles(body);
-      if (body.length && !productionProfile) setProductionProfile(body[0].profile_key);
+      if (body.length && !productionProfile) setProductionProfile((body.find(p=>p.profile_key === "tiktok-mx-9x16-esmx") || body[0]).profile_key);
     }).catch(() => {});
   }, []);
   const unsupported = detectUnsupportedRequirements(intent);
   const planState = planStaleness({ intent, plan });
   const productionPanel = <div className="production-plan">
-    <h3>V6 生产计划（多场景广告，走 /plans/production）</h3>
+    <h3>按提示词生成场景视频</h3><p>按每段场景的时间和画面描述生成真实视频，保留产品原始彩色参考图。当前输出无声；人物动作和产品细节需要审核。</p>
     <div className="inline-fields">
       <label>Platform Profile
         <select value={productionProfile} onChange={(event) => setProductionProfile(event.target.value)}>
           {profiles.map((item) => <option key={item.profile_key} value={item.profile_key}>{profileOptionLabel(item)}</option>)}
         </select></label>
-      <label>场景数（2–8）
-        <input type="number" min="2" max="8" value={productionStatus?.shotCount || 5}
-          onChange={(event) => setProductionStatus({ ...(productionStatus || {}), shotCount: Number(event.target.value) })} /></label>
       <label>西语文案
         <input value={productionStatus?.voiceoverText || ""} placeholder="可留空，稍后在音频页生成"
           onChange={(event) => setProductionStatus({ ...(productionStatus || {}), voiceoverText: event.target.value })} /></label>
     </div>
-    {appearance && appearance.appearance_level !== "VERIFIED_APPEARANCE" && <div className="capability-note danger">
-      <WarningCircle weight="fill" />
-      <div><b>模型外观未核验：{appearance.appearance_coverage}</b>
-        <p>{appearance.appearance_note}</p>
-        <ul className="notes">{(appearance.checks || []).map((item) => <li key={item.item}>{item.item}：{item.status}</li>)}</ul>
-        <label className="checkbox-line"><input type="checkbox" checked={acceptAppearance}
-          onChange={() => setAcceptAppearance(!acceptAppearance)} />
-          <span>我确认只做几何预演，接受外观未核验（正式广告需先完成材质/几何核验）</span></label>
-      </div>
-    </div>}
+    {appearance && <p className="capability-note">场景生成会查找此模型的原始彩色产品图，不使用无贴图灰模；没有来源图时请选择图片素材。</p>}
     <div className="action-row">
-      <button className="primary" disabled={busy || !productionProfile || (appearance && appearance.appearance_level !== "VERIFIED_APPEARANCE" && !acceptAppearance)}
-        onClick={createProductionPlan}><Sparkle weight="fill" />创建 {(durationSeconds)} 秒生产计划（{Math.min(8, Math.max(2, Number(productionStatus?.shotCount) || 5))} 场景 / {durationSeconds * 24} 帧）</button>
+      <button className="primary" disabled={busy || !asset || !productionProfile}
+        onClick={createProductionPlan}>解析提示词并创建场景计划</button>
       {appearance && <a className="icon-link" title="查看外观核验明细" href={`${API}/assets/${asset?.id}/appearance`} target="_blank" rel="noreferrer"><BoxArrowDown />外观明细</a>}
     </div>
     {productionStatus?.created && <p className="output-summary">已创建生产计划：<b>{productionStatus.created.id.slice(0, 8)}</b> · {productionStatus.created.shots.length} 场景 · {productionStatus.created.total_frames} 帧 · {productionStatus.created.duration_seconds}s · Profile {productionStatus.created.production_plan.profile_id}（v{productionStatus.created.production_plan.profile_version}）</p>}
@@ -2479,6 +2472,7 @@ export function App() {
   async function cancel() { if (job) { await apiRequest(`/jobs/${job.id}/cancel`, { method: "POST" }); refresh(); } }
   async function retry() { if (job) { await apiRequest(`/jobs/${job.id}/retry`, { method: "POST" }); refresh(); } }
   async function aiGenerate() {
+    if (/^(?:\s*)(?:ESCENA|SCENE|场景|镜头)\s*\d+\s*[—–:：-]/mi.test(intent)) return createProductionPlan();
     if (!asset) return setToast(["danger", "请先上传产品图片或 GLB。"]);
     setBusy(true);
     try {
@@ -2579,10 +2573,13 @@ export function App() {
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
       {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "console" ? <ConsolePage /> : active === "costs" ? <CostPage /> : active === "automation" ? <AutomationPage /> : active === "webhooks" ? <WebhookPage /> : active === "publish" ? <PublishPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
-        <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
+        <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>产品与场景工作台</span></div><p>上传产品图后可生成3D；带时间段的场景提示词可生成参考图引导的视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">
-          <AssetCard asset={asset} assetUrl={assetUrl} onUpload={upload} onDemo={useDemo} busy={busy} />
+          <div><AssetCard asset={asset} assetUrl={assetUrl} onUpload={upload} onDemo={useDemo} busy={busy} />
+          {asset?.kind === "image" && <ImageReconstruction key={asset.id} asset={asset} src={assetUrl} request={apiRequest}
+            onModel={model=>{selectAsset(model);setToast(["success","3D模型已生成并切换，可查看三维预览；外观材质尚未核验。"]);refresh();}} />}
+          </div>
           <DirectorCard
             intent={intent}
             setIntent={setIntent}
@@ -2603,7 +2600,10 @@ export function App() {
           />
           <RenderCard health={health} plan={plan} job={job} onRender={run} onCancel={cancel} onRetry={retry} />
           <ProviderJobs jobs={providerJobs} onCancel={cancelProviderJob} />
-          <Shots plan={plan} setPlan={setPlan} assetUrl={asset?.kind === "image" ? assetUrl : ""} />
+          {plan?.scene_generation ? <section className="card shots"><h2>待确认的场景 · {plan.shots.length}段 · {plan.duration_seconds || plan.output.duration_seconds}秒</h2>
+            {plan.shots.map(shot=><article key={shot.id}><h3>{shot.name} · {shot.start_frame/24}–{shot.end_frame/24}秒</h3><p>{shot.scene_description}</p>{shot.caption_text && <p>字幕文案：{shot.caption_text}（可在后期添加）</p>}</article>)}
+            <p>确认后逐段调用H3；失败会明确停止，不再回退成默认摄影棚镜头。修改场景请编辑提示词并重新解析。</p></section>
+            : <Shots plan={plan} setPlan={setPlan} assetUrl={asset?.kind === "image" ? assetUrl : ""} />}
           <Jobs jobs={filtered} selected={job?.id} onOpen={setJob} />
         </div>
       </>}

@@ -110,7 +110,7 @@ export function platformLabel(platform) {
 
 /** 发布计划（生产计划）请求体：镜头数与总帧数来自真实输入，不再固定 3 镜头/144 帧（BUG-01）。 */
 export function buildProductionPlanBody({ assetId, profileId, intent, shots, locale, voiceoverText,
-                                          acceptUnverifiedAppearance }) {
+                                          acceptUnverifiedAppearance, renderMode }) {
   return {
     product_asset_id: assetId,
     profile_id: profileId,
@@ -126,6 +126,7 @@ export function buildProductionPlanBody({ assetId, profileId, intent, shots, loc
       caption_text: shot.caption_text || "",
     })),
     accept_unverified_appearance: Boolean(acceptUnverifiedAppearance),
+    render_mode: renderMode || "controlled",
   };
 }
 

@@ -41,6 +41,7 @@ from PIL import Image, ImageStat
 from . import director, director_plan, security, storage
 from .director_plan import CameraPath, ProductPose, SceneSpec, Vector3
 from .providers import comfyui
+from . import scene_generation
 from .strict_background import (
     BackgroundProducerError,
     MODE_CONTROLLED_IMPORT,
@@ -2623,7 +2624,9 @@ def job_release_eligibility(job: dict) -> dict:
     }
     if status == VERIFICATION_PASSED:
         result["verification_only"] = True
-        result["reason"] = "Strict 验证小样仅用于非商业验证，不可发布或继承 Strict PASS"
+        result["reason"] = ("场景视频已生成，产品细节与动作尚待视觉审核；不是严格保真成片"
+                            if manifest and manifest.get("scene_generation") else
+                            "Strict 验证小样仅用于非商业验证，不可发布或继承 Strict PASS")
         return result
     if status != "SUCCEEDED":
         result["reason"] = f"任务状态为 {status}，尚未达到可发布完成状态"
@@ -4390,6 +4393,51 @@ def run_strict_runtime_closure(job_id: str, run_dir: Path, plan_path: Path, outp
         _persist_qa_report(db, run_id, job_id, qa_report, threshold_set, manifest_sha256)
     return {"passed": True, "output": output, "manifest_path": manifest_path, "manifest": manifest}
 
+def resolve_scene_reference(db, asset, owner_id: str) -> dict:
+    source, crop = asset, None
+    if asset["kind"] == "model":
+        record = db.execute("SELECT request_payload FROM provider_jobs WHERE artifact_asset_id = ? "
+                            "AND operation = 'RECONSTRUCT_3D' ORDER BY created_at DESC LIMIT 1", (asset["id"],)).fetchone()
+        provenance = json.loads(record["request_payload"]) if record else {}
+        source = db.execute("SELECT * FROM assets WHERE id = ?", (provenance.get("asset_id", ""),)).fetchone()
+        crop = provenance.get("crop")
+        if source and provenance.get("asset_sha256") != source["sha256"]:
+            raise HTTPException(409, "重建来源图片已变化，请重新选择原始彩色产品图")
+    if not source or source["kind"] != "image" or source["owner_id"] != owner_id:
+        raise HTTPException(422, "场景生成需要原始彩色产品图；此模型无可追踪来源，请在产品库选择产品图片")
+    return {"asset_id": source["id"], "sha256": source["sha256"], "crop": crop}
+
+
+def render_scene_job(job_id: str, snapshot: dict, run_dir: Path) -> dict:
+    reference = snapshot["scene_generation"]["reference"]
+    with connect() as db:
+        source = db.execute("SELECT * FROM assets WHERE id = ?", (reference["asset_id"],)).fetchone()
+        product = db.execute("SELECT * FROM assets WHERE id = ?", (snapshot["product_asset_id"],)).fetchone()
+    if not source or not product or source["owner_id"] != product["owner_id"]:
+        raise RuntimeError("场景参考图不存在或归属不一致")
+    def check_active():
+        lease = CURRENT_LEASE.get()
+        with connect() as db:
+            require_active_lease(db, job_id, lease.worker_id, lease.lease_epoch)
+        if get_job(job_id)["cancel_requested"]:
+            raise RuntimeError("场景生成已取消；不全局中断其他用户的H3任务")
+    def run_command(command):
+        check_active()
+        with process_lock:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            processes[job_id] = process
+        try:
+            _, err = process.communicate()
+        finally:
+            with process_lock: processes.pop(job_id, None)
+        check_active()
+        if process.returncode:
+            raise RuntimeError(err.decode("utf-8", errors="replace")[-1800:])
+    return scene_generation.generate_scenes(snapshot, resolve_asset_path(row_to_dict(source)).read_bytes(), run_dir,
+        ffmpeg=FFMPEG, run_command=run_command, check_active=check_active,
+        progress=lambda stage, value: update_job(job_id, stage=stage, progress=value))
+
+
 def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
     lease = LeaseContext(job_id=job_id, worker_id=worker_id, lease_epoch=lease_epoch)
     keeper = HeartbeatKeeper(job_id, worker_id, lease_epoch)
@@ -4483,7 +4531,10 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             release_worker_lease(job_id, worker_id, lease_epoch, "worker.completed")
             return
         output = run_dir / "preview.mp4"
-        if asset["kind"] == "model":
+        scene_result = None
+        if plan_snapshot.get("scene_generation"):
+            scene_result = render_scene_job(job_id, plan_snapshot, run_dir)
+        elif asset["kind"] == "model":
             render_glb_job(job_id, asset, run_dir, output, plan_path, output_spec)
         else:
             render_image_job(job_id, asset, output, plan_snapshot, output_spec)
@@ -4532,10 +4583,10 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             with connect() as db:
                 contract_row = get_default_contract(job["plan_id"], db)
             strict_bound = strict_snapshot is not None
-            executed_mode = "STRICT" if strict_bound else "CONTROLLED"
+            executed_mode = "GENERATIVE" if scene_result else ("STRICT" if strict_bound else "CONTROLLED")
             verification_status = ("VERIFIED" if strict_bound and qa_report.get("passed") else
                                    ("NOT_VERIFIED" if not strict_bound else "UNKNOWN"))
-            director_plan_3d = director_plan.to_target_document(
+            director_plan_3d = None if scene_result else director_plan.to_target_document(
                 plan_snapshot,
                 executed_mode=executed_mode,
                 verification_status=verification_status,
@@ -4552,7 +4603,8 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             "plan_id": job["plan_id"],
             "asset_id": asset["id"],
             "asset_sha256": asset["sha256"],
-            "preview_kind": "BLENDER_3D" if asset["kind"] == "model" else "IMAGE_2D",
+            "preview_kind": "H3_SCENES" if scene_result else ("BLENDER_3D" if asset["kind"] == "model" else "IMAGE_2D"),
+            "scene_generation": scene_result,
             "width": output_spec.width,
             "height": output_spec.height,
             "fps": output_spec.fps,
@@ -4567,8 +4619,8 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
             # V6-16：保真三元组放在 Manifest 顶层，避免只看 director_plan_3d 时被误读
             "fidelity": {
                 "requested_mode": plan_snapshot.get("fidelity_mode"),
-                "executed_mode": executed_mode if director_plan_3d else None,
-                "verification_status": verification_status if director_plan_3d else "UNKNOWN",
+                "executed_mode": executed_mode if director_plan_3d or scene_result else None,
+                "verification_status": verification_status if director_plan_3d or scene_result else "UNKNOWN",
                 "strict_snapshot_bound": strict_bound,
                 "product_version_id": contract_row["product_version_id"] if contract_row else None,
                 "product_version_binding": "VERSIONED" if contract_row else "UNKNOWN",
@@ -4584,8 +4636,8 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         update_job(
             job_id,
-            status="SUCCEEDED",
-            stage="ARTIFACT",
+            status=VERIFICATION_PASSED if scene_result else "SUCCEEDED",
+            stage="SCENES_REVIEW" if scene_result else "ARTIFACT",
             progress=100,
             output_path=_storage_reference(job_id, str(output)),
             manifest_path=_storage_reference(job_id, str(manifest_path)),
@@ -5156,6 +5208,10 @@ def h3_reconstruct(request: H3ReconstructRequest) -> dict:
         raise HTTPException(422, "裁切区域无效")
 
     path = resolve_asset_path(asset)
+    from PIL import Image as PILImage
+    with PILImage.open(path) as image:
+        if x+width > image.width or y+height > image.height:
+            raise HTTPException(422, "3D重建裁切超出原图范围，请重新框选完整产品")
     provider_job_id = str(uuid.uuid4())
     payload = {
         "asset_id": asset["id"],
@@ -7628,6 +7684,8 @@ def update_plan(plan_id: str, request: PlanUpdate) -> dict:
             raise HTTPException(404, "计划不存在")
         ensure_plan_contract(db, current, owner_id, project_id)
         payload = json.loads(current["payload"])
+        if payload.get("scene_generation"):
+            raise HTTPException(409, "场景计划按完整提示词冻结，请重新解析创建新计划，不能用基础分镜覆盖")
         payload["intent"] = request.intent
         payload["shots"] = [shot.model_dump() for shot in request.shots]
         payload["crop_anchor"] = request.crop_anchor.value
@@ -13325,17 +13383,28 @@ class ProductionPlanRequest(BaseModel):
     notes: str = Field(default="", max_length=2000)
     # V6-16（复核 BUG-04）：模型外观未核验时，正式生产计划必须显式接受风险，否则拒绝创建。
     accept_unverified_appearance: bool = False
+    render_mode: Literal["controlled", "h3_scenes"] = "controlled"
 
 
 @app.post("/api/v1/plans/production", status_code=201)
 def create_production_plan(request: ProductionPlanRequest) -> dict:
     """按 Profile 规格创建多场景生产计划（V6 loop：完整有声视频 → 批量 → 发布包）。"""
     owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    parsed_scenes = None
+    if request.render_mode == "h3_scenes":
+        try:
+            parsed_scenes = scene_generation.parse_brief(request.intent)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        request.shots = [ProductionShotInput.model_validate(shot) for shot in parsed_scenes]
     with connect() as db:
         begin_immediate(db)
         asset = db.execute("SELECT * FROM assets WHERE id = ?", (request.product_asset_id,)).fetchone()
         if not asset:
             raise HTTPException(404, "产品素材不存在")
+        if asset["owner_id"] != owner_id:
+            raise HTTPException(403, "越权使用产品素材")
+        scene_reference = resolve_scene_reference(db, asset, owner_id) if parsed_scenes else None
         profile = _profile_for_request(db, request.profile_id, owner_id, project_id)
         if profile is None:
             raise HTTPException(404, "Profile 不存在")
@@ -13350,7 +13419,7 @@ def create_production_plan(request: ProductionPlanRequest) -> dict:
             })
         # V6-16（复核 BUG-04）：结构校验之后再做外观门——外观未核验的模型不能悄悄进入正式广告流程
         appearance = None
-        if asset["kind"] == "model":
+        if asset["kind"] == "model" and not parsed_scenes:
             try:
                 appearance = inspect_glb(resolve_asset_path(row_to_dict(asset)).read_bytes())
             except HTTPException:
@@ -13383,6 +13452,9 @@ def create_production_plan(request: ProductionPlanRequest) -> dict:
                 payload["camera_path"] = shot.camera_path.model_dump()
             if shot.caption_text:
                 payload["caption_text"] = shot.caption_text
+            if parsed_scenes:
+                payload.update({key: parsed_scenes[index-1][key] for key in
+                                ("scene_prompt", "scene_description", "start_frame", "end_frame")})
             shots.append(payload)
         plan_id = str(uuid.uuid4())
         payload = {
@@ -13399,6 +13471,7 @@ def create_production_plan(request: ProductionPlanRequest) -> dict:
             "scene": {"template": "studio_product", "background_color": "#0A0A0C", "lighting_preset": "softbox"},
             "shots": shots,
             "production_plan": {
+                "render_mode": request.render_mode,
                 "profile_id": request.profile_id,
                 "profile_version": profile["version"]["version"],
                 "profile_payload_sha256": profile["version"]["payload_sha256"],
@@ -13420,6 +13493,14 @@ def create_production_plan(request: ProductionPlanRequest) -> dict:
                  "note": "图片素材：外观来自拍摄/渲染原图", "accepted_by_operator": False}
             ),
         }
+        if parsed_scenes:
+            if spec.video.fps != 24:
+                raise HTTPException(422, "H3场景生成当前要求24fps的Profile")
+            payload["scene_generation"] = {"version": 1, "reference": scene_reference,
+                "mode": "H3_REFERENCE_SCENES", "visual_verification": "NOT_VERIFIED"}
+            payload["fidelity_mode"] = "GENERATIVE"
+            payload["appearance"] = {"status": "REFERENCE_GUIDED", "source_asset_id": scene_reference["asset_id"],
+                "note": "使用原始彩色产品图生成，不使用灰模；生成结果仍需视觉审核，不保证严格保真"}
         validate_production_plan_snapshot(payload, spec)
         _, payload_sha256 = plan_contract_payload_hash(payload)
         product_version_id = create_product_version(asset["id"], owner_id, project_id, payload_sha256, db)
@@ -13432,6 +13513,7 @@ def create_production_plan(request: ProductionPlanRequest) -> dict:
         "contract_id": contract["contract_id"], "product_version_id": product_version_id,
         "intent": payload["intent"], "output": payload["output"], "shots": shots,
         "production_plan": payload["production_plan"],
+        "scene_generation": payload.get("scene_generation"),
         "duration_seconds": round(seconds, 3), "total_frames": total_frames,
         "note": "V6 生产计划：按 Profile 规格的多场景计划；批准后即可创建 Run 真实渲染",
     }
