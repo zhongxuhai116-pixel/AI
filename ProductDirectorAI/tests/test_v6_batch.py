@@ -309,8 +309,40 @@ class BatchApiTests(unittest.TestCase):
         self.assertEqual(created.status_code, 202, created.text)
         self.assertEqual(created.json()["batch"]["summary"]["total"], 2)
 
-    def test_over_limit_returns_422_with_count(self) -> None:
-        # 展开上限 100：20 个变体是允许的（在 100 以内）
+    def test_reconcile_requeues_item_with_missing_queue_row(self) -> None:
+        """真实缺陷回归：批次项的队列行缺失时，项会停在 QUEUED 永不执行（产线已出现 2 例）。"""
+        payload = {"items": [{"plan_id": self.plan["id"], "profile_id": "tiktok-mx-9x16-esmx"}]}
+        with patch("productdirector_api.main.execute_job"), patch("productdirector_api.main.advance_batch"):
+            created = self.client.post("/api/v1/batches", json=payload)
+        batch_id = created.json()["batch"]["id"]
+        main.advance_batch(batch_id)
+        items = self.client.get(f"/api/v1/batches/{batch_id}/items").json()["items"]
+        job_id = items[0]["job_id"]
+        self.assertIsNotNone(job_id)
+        with main.connect() as db:
+            queue_rows = db.execute("SELECT count(*) AS n FROM run_jobs WHERE job_id = ?", (job_id,)).fetchone()["n"]
+        self.assertEqual(queue_rows, 1)
+        # 模拟旧版本留下的残缺状态：队列行被漏写（jobs/runs 仍在、状态停在 QUEUED）
+        with main.connect() as db:
+            db.execute("DELETE FROM run_jobs WHERE job_id = ?", (job_id,))
+            db.execute("UPDATE jobs SET status = 'QUEUED', stage = 'QUEUED', progress = 0 WHERE id = ?", (job_id,))
+            db.execute("UPDATE batch_items SET status = 'QUEUED' WHERE id = ?", (items[0]["id"],))
+        # 读取批次触发对账 → 必须补建队列行，否则该批次永远卡住
+        self.client.get(f"/api/v1/batches/{batch_id}")
+        with main.connect() as db:
+            restored = db.execute("SELECT * FROM run_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            attempts = db.execute("SELECT count(*) AS n FROM job_attempts WHERE run_job_id = ?",
+                                 (restored["id"],)).fetchone()["n"] if restored else 0
+        self.assertIsNotNone(restored, "对账必须补建缺失的 run_jobs 队列行")
+        self.assertEqual(restored["status"], "QUEUED")
+        self.assertEqual(attempts, 1)
+        # 幂等：重复对账不会再插入第二行
+        self.client.get(f"/api/v1/batches/{batch_id}")
+        with main.connect() as db:
+            again = db.execute("SELECT count(*) AS n FROM run_jobs WHERE job_id = ?", (job_id,)).fetchone()["n"]
+        self.assertEqual(again, 1)
+
+    def test_over_limit_returns_422_with_count(self) -> None:        # 展开上限 100：20 个变体是允许的（在 100 以内）
         allowed = self.client.post("/api/v1/batches/preview", json={
             "matrix": {"product_version_ids": [self.version_id], "plan_ids": [self.plan["id"]],
                        "profile_ids": ["tiktok-mx-9x16-esmx"], "variations_per_combination": 20},

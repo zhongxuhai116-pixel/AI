@@ -57,6 +57,7 @@ from . import audio_post
 from . import batch as batch_rules
 from . import interaction_geometry
 from . import interaction_validation
+from . import automation
 from . import ledger
 from . import localization
 from . import platform_profiles
@@ -729,6 +730,51 @@ def initialize_db() -> None:
               UNIQUE (batch_id, item_index),
               FOREIGN KEY(batch_id) REFERENCES batches(id)
             );
+            CREATE TABLE IF NOT EXISTS automation_keys (
+              id TEXT PRIMARY KEY,
+              key_id TEXT NOT NULL,
+              prefix TEXT NOT NULL,
+              name TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              workspace_id TEXT,
+              project_id TEXT,
+              scopes TEXT NOT NULL,
+              secret_hash TEXT NOT NULL,
+              fingerprint TEXT NOT NULL,
+              ip_allowlist TEXT NOT NULL DEFAULT '',
+              rate_limit_per_minute INTEGER NOT NULL DEFAULT 60,
+              budget_limit_amount REAL,
+              budget_period TEXT NOT NULL DEFAULT 'month',
+              expires_at REAL,
+              revoked_at TEXT,
+              revoked_reason TEXT NOT NULL DEFAULT '',
+              last_used_at TEXT,
+              call_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              UNIQUE (key_id)
+            );
+            CREATE TABLE IF NOT EXISTS automation_rate_windows (
+              id TEXT PRIMARY KEY,
+              scope_kind TEXT NOT NULL,
+              scope_ref TEXT NOT NULL,
+              window_start INTEGER NOT NULL,
+              window_seconds INTEGER NOT NULL DEFAULT 60,
+              count INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL,
+              UNIQUE (scope_kind, scope_ref, window_start)
+            );
+            CREATE TABLE IF NOT EXISTS idempotency_records (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              actor TEXT NOT NULL,
+              scope TEXT NOT NULL,
+              idem_key TEXT NOT NULL,
+              request_hash TEXT NOT NULL,
+              status_code INTEGER NOT NULL,
+              response TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE (owner_id, actor, scope, idem_key)
+            );
             CREATE TABLE IF NOT EXISTS budgets (
               id TEXT PRIMARY KEY,
               owner_id TEXT NOT NULL,
@@ -778,6 +824,7 @@ def initialize_db() -> None:
               note TEXT NOT NULL DEFAULT '',
               settled_at TEXT,
               settled_entry_id TEXT,
+              actor_key_id TEXT,
               payload TEXT NOT NULL,
               payload_sha256 TEXT NOT NULL,
               created_at TEXT NOT NULL
@@ -818,6 +865,8 @@ def initialize_db() -> None:
         # V6-06：预留对账标记，防止同一条预留被重复结算（重复结算会双计成本）。
         ensure_column(db, "cost_ledger", "settled_at", "TEXT")
         ensure_column(db, "cost_ledger", "settled_entry_id", "TEXT")
+        # V6-07：账本行记录产生它的 Automation Key（Key 周期预算按此汇总，不额外记账）
+        ensure_column(db, "cost_ledger", "actor_key_id", "TEXT")
         for column in ("verified_dimensions", "view_coverage", "unverified_regions", "logo_regions", "camera_visibility_constraints"):
             ensure_column(db, "product_versions", column, "TEXT")
         # v1 的后续阶段要求幂等以（plan_id, idempotency_key）为最小键，避免不同计划共享同一个 idempotency 误判。
@@ -4400,6 +4449,179 @@ def run_worker_once(worker_id: str) -> dict:
     return {"claimed": True, "job_id": claim["job_id"], "lease_epoch": claim["lease_epoch"], "status": get_job(claim["job_id"])["status"]}
 
 
+def current_actor_label() -> str:
+    """当前调用方标签：会话为 `session`，Automation 为 `key:<key_id>`（不写密钥）。"""
+    identity = security.current_automation_key.get()
+    if identity:
+        return f"key:{identity['key_id']}"
+    return "session"
+
+
+def _rate_window_bump(db: sqlite3.Connection, scope_kind: str, scope_ref: str, window: int) -> int:
+    """窗口计数 +1（唯一键冲突时重试重算），返回当前窗口计数。"""
+    for _ in range(6):
+        row = db.execute(
+            "SELECT count FROM automation_rate_windows WHERE scope_kind = ? AND scope_ref = ? AND window_start = ?",
+            (scope_kind, scope_ref, window),
+        ).fetchone()
+        now = utc_now()
+        if row is None:
+            try:
+                db.execute(
+                    "INSERT INTO automation_rate_windows(id, scope_kind, scope_ref, window_start, window_seconds, "
+                    "count, updated_at) VALUES (?, ?, ?, ?, 60, 1, ?)",
+                    (str(uuid.uuid4()), scope_kind, scope_ref, window, now),
+                )
+                return 1
+            except sqlite3.IntegrityError:
+                continue
+        count = int(row["count"]) + 1
+        db.execute(
+            "UPDATE automation_rate_windows SET count = ?, updated_at = ? WHERE scope_kind = ? AND scope_ref = ? "
+            "AND window_start = ?",
+            (count, now, scope_kind, scope_ref, window),
+        )
+        return count
+    raise HTTPException(503, "限流计数器写入失败，请重试")
+
+
+def _key_period_spend(db: sqlite3.Connection, key_id: str, period: str, now_epoch: float) -> float:
+    """该 Key 在当前周期的已发生金额（settled + accrued，预留不计入）。"""
+    seconds = {"minute": 60, "hour": 3600, "day": 86400, "month": 30 * 86400}.get(period or "month", 30 * 86400)
+    cutoff = _iso_from_epoch(now_epoch - seconds)
+    rows = db.execute(
+        "SELECT amount FROM cost_ledger WHERE actor_key_id = ? AND kind IN ('settled', 'accrued') AND created_at >= ?",
+        (key_id, cutoff),
+    ).fetchall()
+    return round(sum(float(row["amount"]) for row in rows), 6)
+
+
+def _iso_from_epoch(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def enforce_automation_access(request: Request, identity: dict) -> None:
+    """V6-07：scope、Key 管理边界、双层限流、Key 周期预算。"""
+    path = request.url.path.rstrip("/") or "/api/v1"
+    method = "GET" if request.method == "HEAD" else request.method
+    if automation.owner_only(path):
+        raise HTTPException(403, {
+            "code": "owner_session_required",
+            "detail": "Automation Key 不能管理 Key：创建/撤销只允许 Owner 会话（浏览器登录）",
+        })
+    required = automation.required_scope(method, path)
+    missing = automation.missing_scopes(identity["scopes"], required)
+    if missing:
+        raise HTTPException(403, {
+            "code": "insufficient_scope",
+            "detail": f"该 Key 缺少 scope：{', '.join(missing)}",
+            "required_scopes": missing,
+            "granted_scopes": identity["scopes"],
+            "route": f"{method} {path}",
+        })
+    now = time.time()
+    window = automation.window_start(now)
+    key_limit = max(1, int(identity["rate_limit_per_minute"]))
+    workspace_limit = automation.WORKSPACE_RATE_LIMIT_PER_MINUTE
+    with connect() as db:
+        begin_immediate(db)
+        key_count = _rate_window_bump(db, "key", identity["key_id"], window)
+        workspace_ref = identity["workspace_id"] or identity["owner_id"] or "workspace-default"
+        workspace_count = _rate_window_bump(db, "workspace", workspace_ref, window)
+    verdict = automation.rate_limit_verdict(key_count, key_limit, window, now)
+    workspace_verdict = automation.rate_limit_verdict(workspace_count, workspace_limit, window, now)
+    effective = key_limit if verdict["remaining"] <= workspace_verdict["remaining"] else workspace_limit
+    remaining = min(verdict["remaining"], workspace_verdict["remaining"])
+    request.state.rate_limit_headers = {
+        "X-RateLimit-Limit": str(effective),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(verdict["reset_in"]),
+        "X-RateLimit-Scope": "key+workspace",
+    }
+    blocked = (not verdict["allowed"] and "key") or (not workspace_verdict["allowed"] and "workspace") or None
+    if blocked:
+        request.state.rate_limit_headers["Retry-After"] = str(max(verdict["reset_in"], workspace_verdict["reset_in"]))
+        raise HTTPException(429, {
+            "code": "rate_limited",
+            "detail": (f"超过每分钟限额（{'Key' if blocked == 'key' else '工作区'} {effective} 次/分钟）："
+                       "这是本产品初始设置，可在部署压测后调整"),
+            "limit_scope": blocked,
+            "limits": {"per_key": key_limit, "per_workspace": workspace_limit},
+            "counts": {"key": key_count, "workspace": workspace_count},
+            "retry_after_seconds": max(verdict["reset_in"], workspace_verdict["reset_in"]),
+        })
+    if identity.get("budget_limit_amount") is not None and method in {"POST", "PATCH", "PUT", "DELETE"}:
+        with connect() as db:
+            spend = _key_period_spend(db, identity["key_id"], identity["budget_period"], now)
+        if spend >= float(identity["budget_limit_amount"]):
+            raise HTTPException(409, {
+                "code": "key_budget_exhausted",
+                "detail": (f"该 Key 在 {identity['budget_period']} 周期内已发生 {spend}，"
+                           f"达到上限 {identity['budget_limit_amount']}：后续写调用被阻断"),
+                "spend": spend, "limit": identity["budget_limit_amount"], "period": identity["budget_period"],
+            })
+    with connect() as db:
+        db.execute("UPDATE automation_keys SET last_used_at = ?, call_count = call_count + 1 WHERE key_id = ?",
+                   (utc_now(), identity["key_id"]))
+
+
+def _idempotency_gate(request: Request, scope: str, payload: dict) -> "IdempotencyGate":
+    return IdempotencyGate(request, scope, payload)
+
+
+class IdempotencyGate:
+    """按 (owner, 调用方, 接口, 键) 隔离的幂等记录；同键不同体 → 409。"""
+
+    def __init__(self, request: Request, scope: str, payload: dict):
+        self.request = request
+        self.scope = scope
+        self.actor = current_actor_label()
+        self.owner_id = security.current_owner.get() or DEFAULT_OWNER_ID
+        self.key = (request.headers.get("idempotency-key") or "").strip() or None
+        self.request_hash = automation.request_fingerprint(payload)
+        self.required = security.current_automation_key.get() is not None and automation.idempotency_required(
+            request.method, request.url.path.rstrip("/") or request.url.path
+        )
+
+    def replay(self) -> dict | None:
+        if not self.key:
+            if self.required:
+                raise HTTPException(428, {
+                    "code": "idempotency_key_required",
+                    "detail": "Automation 调用创建任务/发布类接口必须带 Idempotency-Key 头（同键重放返回首次结果）",
+                    "header": "Idempotency-Key",
+                })
+            return None
+        with connect() as db:
+            row = db.execute(
+                "SELECT * FROM idempotency_records WHERE owner_id = ? AND actor = ? AND scope = ? AND idem_key = ?",
+                (self.owner_id, self.actor, self.scope, self.key),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["request_hash"] != self.request_hash:
+            raise HTTPException(409, {
+                "code": "idempotency_conflict",
+                "detail": "同一个 Idempotency-Key 被用于不同的请求内容：请换新键，避免误复用旧结果",
+                "scope": self.scope,
+            })
+        return json.loads(row["response"])
+
+    def store(self, response_body: dict, status_code: int) -> None:
+        if not self.key:
+            return
+        with connect() as db:
+            try:
+                db.execute(
+                    "INSERT INTO idempotency_records(id, owner_id, actor, scope, idem_key, request_hash, "
+                    "status_code, response, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), self.owner_id, self.actor, self.scope, self.key, self.request_hash,
+                     status_code, _canonical_json_text(response_body), utc_now()),
+                )
+            except sqlite3.IntegrityError:
+                pass  # 并发同键：先写入者为准，重放方会读到它
+
+
 app = FastAPI(title="ProductDirectorAI V1", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -4413,19 +4635,30 @@ app.add_middleware(
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     context = None
+    key_context = None
     try:
         if request.method != "OPTIONS" and not request.url.path.startswith("/internal/"):
             if not (request.url.path == "/api/v1/session" and request.method == "POST"):
                 owner = security.authenticate(request, connect, ALLOWED_ORIGINS)
                 context = security.current_owner.set(owner)
+                key_identity = getattr(request.state, "automation_key", None)
+                if key_identity is not None:
+                    key_context = security.current_automation_key.set(key_identity)
+                    enforce_automation_access(request, key_identity)
         response = await call_next(request)
+        headers = getattr(request.state, "rate_limit_headers", None)
+        if headers:
+            for name, value in headers.items():
+                response.headers[name] = value
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
     except HTTPException as exc:
         return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
-                            headers={"Cache-Control": "no-store"})
+                            headers=getattr(request.state, "rate_limit_headers", None) or {"Cache-Control": "no-store"})
     finally:
+        if key_context is not None:
+            security.current_automation_key.reset(key_context)
         if context is not None:
             security.current_owner.reset(context)
 
@@ -9478,7 +9711,25 @@ def preview_batch(request: BatchPreviewRequest) -> dict:
 
 
 @app.post("/api/v1/batches", status_code=202)
-def create_batch(request: BatchCreateRequest, background: BackgroundTasks) -> dict:
+def create_batch(request: BatchCreateRequest, background: BackgroundTasks, response: Response,
+                 http_request: Request) -> dict:
+    return _create_batch_endpoint(request, background, response, http_request, scope="batches.create")
+
+
+def _create_batch_endpoint(request: BatchCreateRequest, background: BackgroundTasks, response: Response,
+                           http_request: Request, scope: str) -> dict:
+    """批次创建入口（UI 与 Automation 共用同一实现，不另写绕过校验的快速路线）。"""
+    gate = _idempotency_gate(http_request, scope, request.model_dump())
+    replay = gate.replay()
+    if replay is not None:
+        response.headers["Idempotency-Replayed"] = "true"
+        return replay
+    result = _create_batch_record(request, background)
+    gate.store(result, 202)
+    return result
+
+
+def _create_batch_record(request: BatchCreateRequest, background: BackgroundTasks) -> dict:
     owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
     with connect() as db:
         begin_immediate(db)
@@ -9570,6 +9821,25 @@ def start_batch_item_run(db, batch_row, item_row) -> dict:
          f"batch:{item_row['batch_id']}:{item_row['item_index']}", job_id, now, now),
     )
     # 队列行（run_jobs）必须一起写：Worker 只从 run_jobs 领取任务，缺了它任务永远不会被执行
+    _requeue_missing_run_job(db, run_id, job_id)
+    # 执行器从 run 目录读取冻结计划快照：不写它，任务会在领取后立刻失败
+    ensure_run_plan_snapshot(job_id, plan_snapshot)
+    return {"run_id": run_id, "job_id": job_id, "plan_contract_id": contract["id"]}
+
+
+def _requeue_missing_run_job(db, run_id: str, job_id: str) -> bool:
+    """补建缺失的 run_jobs 队列行：Worker 只从 run_jobs 领取任务。
+
+    真实缺陷证据：产线上有批次项的 jobs/runs 已建但队列行为 0，项停在 QUEUED 永不执行。
+    对账时补建（幂等）让这些项重新可被领取，不需要人工改库。
+    """
+    existing = db.execute("SELECT 1 FROM run_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if existing:
+        return False
+    run = db.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if not run:
+        return False
+    now = utc_now()
     run_job_id = str(uuid.uuid4())
     db.execute(
         "INSERT INTO run_jobs (id, run_id, job_id, attempt, status, stage, created_at, updated_at, error) "
@@ -9581,9 +9851,7 @@ def start_batch_item_run(db, batch_row, item_row) -> dict:
         "VALUES (?, ?, 1, 'CREATED', ?, NULL, NULL, NULL)",
         (str(uuid.uuid4()), run_job_id, now),
     )
-    # 执行器从 run 目录读取冻结计划快照：不写它，任务会在领取后立刻失败
-    ensure_run_plan_snapshot(job_id, plan_snapshot)
-    return {"run_id": run_id, "job_id": job_id, "plan_contract_id": contract["id"]}
+    return True
 
 
 def ensure_run_plan_snapshot(job_id: str, plan_payload: dict) -> Path:
@@ -9597,7 +9865,7 @@ def ensure_run_plan_snapshot(job_id: str, plan_payload: dict) -> Path:
 
 
 def reconcile_batch_items(db, batch_id: str) -> None:
-    """把关联 Run/Job 的终态回写到批次项：项状态不能只等下一次调度才更新。"""
+    """把关联 Run/Job 的终态回写到批次项；并补建缺失的队列行（否则项永远不执行）。"""
     items = db.execute(
         "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
     ).fetchall()
@@ -9617,6 +9885,8 @@ def reconcile_batch_items(db, batch_id: str) -> None:
         elif job["status"] == "RUNNING" and item["status"] != "RUNNING":
             db.execute("UPDATE batch_items SET status = 'RUNNING', updated_at = ? WHERE id = ?",
                        (utc_now(), item["id"]))
+        elif job["status"] == "QUEUED" and item["run_id"]:
+            _requeue_missing_run_job(db, item["run_id"], item["job_id"])
 
 
 def refresh_batch_status(db, batch_id: str) -> sqlite3.Row:
@@ -10474,16 +10744,19 @@ def _insert_ledger_entry(db: sqlite3.Connection, *, owner_id: str, project_id: s
                          note: str = "", refs: dict | None = None) -> str:
     entry = ledger.ledger_entry(kind=kind, amount=amount, currency=currency, refs=refs or {}, note=note)
     entry_id = str(uuid.uuid4())
+    key_identity = security.current_automation_key.get()
+    actor_key_id = key_identity["key_id"] if key_identity else None
     payload_text = _canonical_json_text({
         "kind": entry["kind"], "amount": entry["amount"], "currency": entry["currency"],
         "refs": entry["refs"], "note": note,
     })
     db.execute(
         "INSERT INTO cost_ledger(id, owner_id, project_id, budget_id, kind, amount, currency, run_id, batch_id, "
-        "usage_event_id, note, payload, payload_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "usage_event_id, note, payload, payload_sha256, created_at, actor_key_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (entry_id, owner_id, project_id, budget_id, entry["kind"], entry["amount"], entry["currency"],
          run_id, batch_id, usage_event_id, note, payload_text,
-         hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), utc_now()),
+         hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), utc_now(), actor_key_id),
     )
     return entry_id
 
@@ -10907,6 +11180,288 @@ def settle_budget(budget_id: str, request: BudgetSettleRequest) -> dict:
         "budget_id": budget_id, "reservation_id": request.reservation_id, "settled_entry_id": settled_id,
         "currency": row["currency"], **settle, "snapshot": snapshot,
         "note": "取消不等于无费用：已提交的调用仍需按实际金额对账",
+    }
+
+
+# ---------------------------------------------------------------------------
+# V6-07 Automation API：Key（scope/限额/IP/周期预算）、幂等、限流、外部调用面
+# ---------------------------------------------------------------------------
+
+class AutomationKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    scopes: list[str] = Field(default_factory=list, max_length=len(automation.SCOPES))
+    workspace_id: str | None = None
+    project_id: str | None = None
+    ip_allowlist: str = Field(default="", max_length=200)
+    rate_limit_per_minute: int = Field(default=automation.DEFAULT_RATE_LIMIT_PER_MINUTE, ge=1,
+                                       le=automation.MAX_RATE_LIMIT_PER_MINUTE)
+    budget_limit_amount: float | None = Field(default=None, ge=0)
+    budget_period: Literal["minute", "hour", "day", "month"] = "month"
+    expires_in_days: int | None = Field(default=None, ge=1, le=automation.KEY_TTL_MAX_DAYS)
+    note: str = Field(default="", max_length=500)
+
+
+class AutomationKeyRevokeRequest(BaseModel):
+    reason: str = Field(default="", max_length=300)
+
+
+class AutomationGenerateRequest(BatchCreateRequest):
+    """复用批次创建（同一校验/预算/生产服务），只追加自动化意图字段。"""
+    auto_publish: bool = False
+    budget_id: str | None = None
+    publish_intent: dict = Field(default_factory=dict)
+
+
+def _automation_key_public(row: sqlite3.Row, *, reveal: str | None = None) -> dict:
+    return {
+        "id": row["id"],
+        "key_id": row["key_id"],
+        "prefix": row["prefix"],
+        "name": row["name"],
+        "scopes": [item for item in (row["scopes"] or "").split(",") if item],
+        "workspace_id": row["workspace_id"],
+        "project_id": row["project_id"],
+        "ip_allowlist": row["ip_allowlist"],
+        "rate_limit_per_minute": row["rate_limit_per_minute"],
+        "budget_limit_amount": row["budget_limit_amount"],
+        "budget_period": row["budget_period"],
+        "expires_at": row["expires_at"],
+        "revoked_at": row["revoked_at"],
+        "revoked_reason": row["revoked_reason"],
+        "last_used_at": row["last_used_at"],
+        "call_count": row["call_count"],
+        "fingerprint": row["fingerprint"],
+        "created_at": row["created_at"],
+        "key": reveal,
+        "note": ("密钥只在创建时显示一次；服务端只保存哈希，日志只记录 Key ID"
+                 if reveal else "密钥不可再次读取；如遗失请撤销后重建"),
+    }
+
+
+@app.get("/api/v1/automation-keys")
+def list_automation_keys() -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM automation_keys WHERE owner_id = ? ORDER BY created_at DESC LIMIT 200",
+            (owner_id,),
+        ).fetchall()
+    return [_automation_key_public(row) for row in rows]
+
+
+@app.post("/api/v1/automation-keys", status_code=201)
+def create_automation_key(request: AutomationKeyCreateRequest) -> dict:
+    """创建 Automation Key（Owner 会话专用）。密钥只显示一次，撤销立即生效。"""
+    owner_id, default_workspace, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    scopes = [item.strip() for item in request.scopes if item.strip()]
+    if not scopes:
+        raise HTTPException(422, {"code": "SCOPES_REQUIRED", "detail": f"至少需要一个 scope（可用：{list(automation.SCOPES)}）"})
+    unknown = [item for item in scopes if item not in automation.SCOPES]
+    if unknown:
+        raise HTTPException(422, {"code": "UNKNOWN_SCOPE", "detail": f"未知 scope：{unknown}",
+                                  "scopes": list(automation.SCOPES)})
+    target_workspace = request.workspace_id or default_workspace
+    target_project = request.project_id
+    with connect() as db:
+        if request.workspace_id:
+            workspace = db.execute("SELECT id FROM workspaces WHERE id = ? AND owner_id = ?",
+                                   (request.workspace_id, owner_id)).fetchone()
+            if not workspace:
+                raise HTTPException(404, "workspace 不存在")
+        if target_project:
+            project = db.execute("SELECT id FROM projects WHERE id = ? AND owner_id = ?",
+                                 (target_project, owner_id)).fetchone()
+            if not project:
+                raise HTTPException(404, "project 不存在")
+    try:
+        ttl = automation.ttl_seconds(request.expires_in_days)
+    except automation.AutomationError as exc:
+        raise HTTPException(exc.status_code, exc.as_detail()) from exc
+    generated = automation.generate_key()
+    key_row_id = str(uuid.uuid4())
+    now = utc_now()
+    expires_at = (time.time() + ttl) if ttl else None
+    with connect() as db:
+        db.execute(
+            "INSERT INTO automation_keys(id, key_id, prefix, name, owner_id, workspace_id, project_id, scopes, "
+            "secret_hash, fingerprint, ip_allowlist, rate_limit_per_minute, budget_limit_amount, budget_period, "
+            "expires_at, revoked_at, revoked_reason, last_used_at, call_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', NULL, 0, ?)",
+            (key_row_id, generated["key_id"], generated["prefix"], request.name, owner_id, target_workspace,
+             target_project, ",".join(scopes), generated["secret_hash"], generated["fingerprint"],
+             request.ip_allowlist, request.rate_limit_per_minute, request.budget_limit_amount,
+             request.budget_period, expires_at, now),
+        )
+        row = db.execute("SELECT * FROM automation_keys WHERE id = ?", (key_row_id,)).fetchone()
+    payload = _automation_key_public(row, reveal=generated["plaintext"])
+    payload["limits"] = automation.limits_document(key_limit=request.rate_limit_per_minute)
+    payload["next_steps"] = [
+        "用 Authorization: Bearer <key> 调用；创建任务/发布类接口必须带 Idempotency-Key 头",
+        "GET /api/v1/automation/openapi 查看该调用面的路由、scope 与限额",
+    ]
+    return payload
+
+
+@app.delete("/api/v1/automation-keys/{key_row_id}")
+def revoke_automation_key(key_row_id: str, request: AutomationKeyRevokeRequest) -> dict:
+    owner_id, _, _ = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute("SELECT * FROM automation_keys WHERE id = ? AND owner_id = ?",
+                         (key_row_id, owner_id)).fetchone()
+        if not row:
+            raise HTTPException(404, "Automation Key 不存在")
+        if row["revoked_at"]:
+            return {**_automation_key_public(row), "revoked": True,
+                    "note": "该 Key 早已撤销：撤销是幂等的，新调用一律 401"}
+        now = utc_now()
+        db.execute("UPDATE automation_keys SET revoked_at = ?, revoked_reason = ? WHERE id = ?",
+                   (now, request.reason, key_row_id))
+        updated = db.execute("SELECT * FROM automation_keys WHERE id = ?", (key_row_id,)).fetchone()
+    return {**_automation_key_public(updated), "revoked": True, "revoked_by": "owner-session",
+            "note": "撤销立即生效：该 Key 的新调用返回 401 key_revoked"}
+
+
+@app.get("/api/v1/automation/openapi")
+def automation_openapi() -> dict:
+    """Automation 调用面说明：路由 → scope、强制幂等键、限额（本产品设置，附错误码）。"""
+    identity = security.current_automation_key.get()
+    return {
+        "surface": "/api/v1",
+        "auth": "Authorization: Bearer <automation key>；不使用 Cookie，不需要 CSRF 头",
+        "scopes": automation.scopes_document(),
+        "limits": automation.limits_document(key_limit=(identity or {}).get("rate_limit_per_minute")),
+        "idempotency": {
+            "header": "Idempotency-Key",
+            "scope_isolation": "按 (owner, 调用方, 接口, 键) 隔离；绑定请求规范化哈希",
+            "replay": "同键同体重放返回首次结果并带 Idempotency-Replayed: true",
+            "conflict": "同键不同体 → 409 idempotency_conflict",
+        },
+        "automation_only_routes": [
+            {"method": "POST", "path": "/api/v1/automation/generate", "scope": "generate:write",
+             "note": "复用批次创建（同一校验/预算/生产服务）"},
+            {"method": "GET", "path": "/api/v1/automation/batches/{id}", "scope": "jobs:read"},
+            {"method": "GET", "path": "/api/v1/automation/jobs/{job_id}", "scope": "jobs:read",
+             "note": "生产状态与发布状态分开返回"},
+        ],
+        "error_codes": {
+            "401": ["key_revoked", "key_expired", "Key 无效"],
+            "403": ["insufficient_scope", "ip_not_allowed", "owner_session_required"],
+            "409": ["idempotency_conflict", "key_budget_exhausted"],
+            "428": ["idempotency_key_required"],
+            "429": ["rate_limited"],
+        },
+        "note": "未登记的路由不会对 Automation Key 放行；Key 管理接口只允许 Owner 会话",
+    }
+
+
+@app.post("/api/v1/automation/generate", status_code=202)
+def automation_generate(request: AutomationGenerateRequest, background: BackgroundTasks, response: Response,
+                        http_request: Request) -> dict:
+    """外部系统创建生产批次：与 UI 同一实现；auto_publish 只是意图，不跳过授权与审批。"""
+    identity = security.current_automation_key.get() or {}
+    if identity.get("project_id") and identity["project_id"] != DEFAULT_PROJECT_ID:
+        raise HTTPException(403, {"code": "project_out_of_scope",
+                                  "detail": f"该 Key 只允许项目 {identity['project_id']}"})
+    intent = batch_rules.normalize_publish_intent({**request.publish_intent, "auto_publish": request.auto_publish})
+    if request.auto_publish and not request.budget_id:
+        raise HTTPException(422, {
+            "code": "BUDGET_REQUIRED_FOR_AUTO_PUBLISH",
+            "detail": "auto_publish=true 必须先指定 budget_id（付费/发布路线不接受无预算提交）",
+        })
+    if request.budget_id:
+        owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+        with connect() as db:
+            budget = db.execute(
+                "SELECT * FROM budgets WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.budget_id, owner_id, project_id),
+            ).fetchone()
+        if not budget:
+            raise HTTPException(404, "预算账户不存在")
+        if budget["limit_amount"] is None:
+            raise HTTPException(409, {"code": "no_limit",
+                                      "detail": "该预算未设置上限：无已知报价时不得按 0 估算"})
+    payload = request.model_copy(update={"publish_intent": intent})
+    result = _create_batch_endpoint(payload, background, response, http_request, scope="automation.generate")
+    result["automation"] = {
+        "actor": current_actor_label(),
+        "budget_id": request.budget_id,
+        "auto_publish_requested": intent["auto_publish"],
+        "publish_status": (result.get("batch") or {}).get("publish_status", "NOT_REQUESTED"),
+        "note": ("auto_publish=true 只是意图：平台授权、有效审批与可见性未满足时发布保持 "
+                 "WAITING_APPROVAL/BLOCKED，不会自动公开"),
+    }
+    return result
+
+
+@app.get("/api/v1/automation/batches/{batch_id}")
+def automation_get_batch(batch_id: str) -> dict:
+    """与 GET /batches/{id} 同一实现（同一资源不重复实现）；额外给出发布意图/状态分栏。"""
+    batch = get_batch(batch_id)
+    identity = security.current_automation_key.get() or {}
+    if identity.get("project_id") and batch.get("project_id") and batch["project_id"] != identity["project_id"]:
+        raise HTTPException(403, {"code": "project_out_of_scope",
+                                  "detail": f"该 Key 只允许项目 {identity['project_id']}"})
+    with connect() as db:
+        row = db.execute("SELECT payload FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    payload = json.loads(row["payload"]) if row else {}
+    intent = batch_rules.normalize_publish_intent(payload.get("publish_intent"))
+    batch["publish_intent"] = intent
+    batch["publish"] = {
+        "intent": intent["auto_publish"],
+        "status": payload.get("publish_status", "NOT_REQUESTED"),
+        "note": "发布状态独立于生产状态：auto_publish 只是意图，不跳过平台授权与审批",
+    }
+    return batch
+
+
+@app.get("/api/v1/automation/jobs/{reference_id}")
+def automation_get_job(reference_id: str) -> dict:
+    """按 BatchItem ID / Run ID / Job ID 返回：生产状态与发布状态分开（不混成一个状态）。"""
+    item = None
+    with connect() as db:
+        item = db.execute("SELECT * FROM batch_items WHERE id = ? OR run_id = ? OR job_id = ?",
+                          (reference_id, reference_id, reference_id)).fetchone()
+    if item is None:
+        job = get_job(reference_id)
+        run = None
+        with connect() as db:
+            run = db.execute("SELECT * FROM runs WHERE job_id = ?", (job_id,)).fetchone()
+        return {
+            "job_id": job_id,
+            "kind": "run",
+            "production": {
+                "status": job["status"], "stage": job.get("stage"), "progress": job.get("progress"),
+                "error": job.get("error"), "run_id": run["id"] if run else None,
+            },
+            "publish": {"intent": "none", "status": "NOT_REQUESTED",
+                        "note": "该 Job 不属于批次项，没有发布意图"},
+        }
+    with connect() as db:
+        batch = db.execute("SELECT * FROM batches WHERE id = ?", (item["batch_id"],)).fetchone()
+        payload = json.loads(batch["payload"]) if batch else {}
+        job_row = db.execute("SELECT * FROM jobs WHERE id = ?", (item["job_id"],)).fetchone() if item["job_id"] else None
+        run_row = db.execute("SELECT * FROM runs WHERE id = ?", (item["run_id"],)).fetchone() if item["run_id"] else None
+    return {
+        "batch_id": item["batch_id"],
+        "item_id": item["id"],
+        "item_index": item["item_index"],
+        "kind": "batch_item",
+        "production": {
+            "status": item["status"],
+            "job_id": item["job_id"],
+            "run_id": item["run_id"],
+            "job_status": job_row["status"] if job_row else None,
+            "run_status": run_row["status"] if run_row else None,
+            "error": item["error"],
+        },
+        "publish": {
+            "intent": (payload.get("publish_intent") or {}).get("auto_publish", False),
+            "status": payload.get("publish_status", "NOT_REQUESTED"),
+            "note": "发布状态独立于生产状态：生产成功不等于已发布，发布需要平台授权与有效审批",
+        },
+        "cache_key": item["cache_key"],
+        "updated_at": item["updated_at"],
     }
 
 

@@ -15,6 +15,8 @@ WORKER_ID = os.getenv("PRODUCTDIRECTOR_WORKER_ID", "cloud-worker")
 COOKIE = "pd_session"
 SESSION_SECONDS = 8 * 60 * 60
 current_owner: ContextVar[str | None] = ContextVar("current_owner", default=None)
+# V6-07：Automation Key 身份（只放非敏感字段；密钥明文永不进入上下文或日志）
+current_automation_key: ContextVar[dict | None] = ContextVar("current_automation_key", default=None)
 
 
 def digest(value: str) -> str:
@@ -43,6 +45,8 @@ def authenticate(request: Request, connect, allowed_origins: list[str]) -> str:
     check_origin(request, allowed_origins)
     authorization = request.headers.get("authorization", "")
     if authorization:
+        if authorization.startswith(f"Bearer pda_"):
+            return authenticate_automation(request, authorization[len("Bearer "):], connect)
         if not matches(authorization, f"Bearer {OWNER_TOKEN}"):
             raise HTTPException(401, "未授权")
         request.state.csrf_token = None
@@ -79,6 +83,42 @@ def create_session(request: Request, response, token: str, connect, allowed_orig
     response.set_cookie(COOKIE, session_token, max_age=SESSION_SECONDS, httponly=True,
                         secure=secure, samesite="strict", path="/")
     return {"owner_id": OWNER_ID, "csrf_token": csrf_token}
+
+
+def authenticate_automation(request: Request, raw_key: str, connect) -> str:
+    """V6-07：Automation Key 认证（无 Cookie/CSRF；IP 允许列表与本 Key 绑定）。"""
+    from . import automation
+    parsed = automation.parse_key(raw_key)
+    if parsed is None:
+        raise HTTPException(401, "Automation Key 格式无效")
+    key_id, secret = parsed
+    with connect() as db:
+        row = db.execute("SELECT * FROM automation_keys WHERE key_id = ?", (key_id,)).fetchone()
+    if not row or not automation.secret_matches(secret, row["secret_hash"]):
+        raise HTTPException(401, "Automation Key 无效")
+    if row["revoked_at"]:
+        raise HTTPException(401, {"code": "key_revoked", "detail": f"Key 已于 {row['revoked_at']} 撤销"})
+    if row["expires_at"] is not None and float(row["expires_at"]) <= time.time():
+        raise HTTPException(401, {"code": "key_expired", "detail": "Key 已过期"})
+    client_ip = request.client.host if request.client else None
+    if not automation.ip_allowed(client_ip, row["ip_allowlist"] or ""):
+        raise HTTPException(403, {"code": "ip_not_allowed", "detail": "调用来源 IP 不在该 Key 的允许列表"})
+    scopes = [item for item in (row["scopes"] or "").split(",") if item]
+    identity = {
+        "key_id": key_id,
+        "name": row["name"],
+        "scopes": scopes,
+        "workspace_id": row["workspace_id"],
+        "project_id": row["project_id"],
+        "rate_limit_per_minute": int(row["rate_limit_per_minute"]),
+        "budget_limit_amount": row["budget_limit_amount"],
+        "budget_period": row["budget_period"],
+        "prefix": row["prefix"],
+        "client_ip": client_ip,
+    }
+    request.state.automation_key = identity
+    request.state.csrf_token = None
+    return row["owner_id"]
 
 
 def ensure_worker(request: Request) -> None:

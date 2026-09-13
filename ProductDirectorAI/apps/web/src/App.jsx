@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive, ArrowClockwise, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
   Clock, Coins, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
-  MagnifyingGlass, MonitorPlay, Package, PencilSimple, Play, Plus, Queue,
+  MagnifyingGlass, MonitorPlay, Package, PencilSimple, Play, Plug, Plus, Queue,
   ShieldCheck, SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, User, VideoCamera, WarningCircle, X,
 } from "@phosphor-icons/react";
 import * as THREE from "three";
@@ -19,7 +19,7 @@ const navItems = [
   ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck],
   ["interaction", "人物互动", User], ["reference", "参考重演", VideoCamera],
   ["profiles", "平台配置", SquaresFour], ["batch", "批次生产", Queue],
-  ["audio", "音频与音乐", MonitorPlay], ["packages", "发布包", Package], ["costs", "成本与用量", Coins], ["settings", "设置", Gear],
+  ["audio", "音频与音乐", MonitorPlay], ["packages", "发布包", Package], ["costs", "成本与用量", Coins], ["automation", "自动化接入", Plug], ["settings", "设置", Gear],
 ];
 const defaultShots = [
   { id: "shot_01", name: "正面推近", camera: "dolly_in", focal_length_mm: 35, duration_frames: 48 },
@@ -1414,6 +1414,139 @@ function CostPage() {
   </section>;
 }
 
+function AutomationPage() {
+  const [keys, setKeys] = useState([]);
+  const [surface, setSurface] = useState(null);
+  const [created, setCreated] = useState(null);
+  const [form, setForm] = useState({
+    name: "外部系统", scopes: ["projects:read", "jobs:read", "generate:write"],
+    ip_allowlist: "", rate_limit_per_minute: 60, budget_limit_amount: "", expires_in_days: "",
+  });
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const allScopes = surface?.scopes?.scopes || [
+    "projects:read", "assets:write", "generate:write", "jobs:read", "packages:read", "publish:write", "webhooks:manage",
+  ];
+
+  useEffect(() => { load(); }, []);
+  useEffect(() => { if (notice) { const timer = setTimeout(() => setNotice(null), 9000); return () => clearTimeout(timer); } }, [notice]);
+
+  async function load() {
+    const [k, s] = await Promise.all([apiRequest("/automation-keys"), apiRequest("/automation/openapi")]);
+    if (k.ok) setKeys(await k.json());
+    if (s.ok) setSurface(await s.json());
+  }
+  function toggleScope(scope) {
+    setForm((value) => ({
+      ...value,
+      scopes: value.scopes.includes(scope) ? value.scopes.filter((item) => item !== scope) : [...value.scopes, scope],
+    }));
+  }
+  async function createKey() {
+    setBusy(true);
+    try {
+      const response = await apiRequest("/automation-keys", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: form.name, scopes: form.scopes, ip_allowlist: form.ip_allowlist,
+          rate_limit_per_minute: Number(form.rate_limit_per_minute),
+          budget_limit_amount: form.budget_limit_amount === "" ? null : Number(form.budget_limit_amount),
+          expires_in_days: form.expires_in_days === "" ? null : Number(form.expires_in_days),
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "创建失败");
+      setCreated(body);
+      setNotice(["success", "Key 已创建：密钥只显示这一次，请立即保存到调用方的密钥管理里"]);
+      await load();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function revoke(key) {
+    if (!window.confirm(`撤销 Key ${key.prefix}？撤销后该 Key 的新调用会立即返回 401。`)) return;
+    setBusy(true);
+    try {
+      const response = await apiRequest(`/automation-keys/${key.id}`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "控制台撤销" }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail?.detail || body.detail || "撤销失败");
+      setNotice(["warning", `已撤销 ${key.prefix}：新调用立即 401（撤销幂等）`]);
+      await load();
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  function copyKey() {
+    if (!created?.key) return;
+    navigator.clipboard?.writeText(created.key);
+    setNotice(["success", "密钥已复制到剪贴板（离开本页后无法再次读取）"]);
+  }
+
+  return <section className="page">
+    <div className="page-head"><div><b>V6 AUTOMATION</b><h1>自动化接入</h1>
+      <p>外部系统用受限 Key 调用；未登记的接口不放行，缺 scope 一律 403，创建任务/发布类调用必须带 Idempotency-Key。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    {created?.key && <section className="card">
+      <div className="card-head"><div><h2>新 Key（只显示一次）</h2><small>{created.name} · {created.prefix}</small></div>
+        <button onClick={copyKey}><DownloadSimple />复制</button></div>
+      <pre className="key-once">{created.key}</pre>
+      <p className="capability-note"><WarningCircle weight="fill" />服务端只保存哈希；页面刷新后无法再次读取。
+        请放到调用方的密钥管理（环境变量/密钥库），不要提交到 Git、日志或前端代码。</p>
+    </section>}
+    <div className="two-col">
+      <section className="card">
+        <div className="card-head"><div><h2>Key 列表</h2><small>{keys.length} 个</small></div></div>
+        <table className="table"><thead><tr><th>Key</th><th>Scope</th><th>限额</th><th>状态</th><th>调用</th><th /></tr></thead>
+          <tbody>{keys.map((item) => <tr key={item.id}>
+            <td>{item.name}<small>{item.prefix}</small></td>
+            <td><small>{item.scopes.join(", ")}</small></td>
+            <td><small>{item.rate_limit_per_minute}/分钟{item.budget_limit_amount !== null ? ` · ≤${item.budget_limit_amount}/${item.budget_period}` : ""}</small></td>
+            <td>{item.revoked_at ? <Pill status="FAILED" /> : <Pill status="SUCCEEDED" />}<small>{item.revoked_at ? formatTime(item.revoked_at) : item.expires_at ? `至 ${Math.round((item.expires_at * 1000 - Date.now()) / 86400000)} 天` : "长期"}</small></td>
+            <td><small>{item.call_count} 次<small>{item.last_used_at ? formatTime(item.last_used_at) : "未使用"}</small></small></td>
+            <td>{item.revoked_at ? null : <button onClick={() => revoke(item)} disabled={busy}>撤销</button>}</td></tr>)}</tbody></table>
+        {!keys.length && <p className="capability-note">还没有 Automation Key：外部系统目前无法调用任何接口。</p>}
+      </section>
+
+      <section className="card">
+        <div className="card-head"><div><h2>创建 Key</h2><small>最小权限原则：只勾选需要的 scope</small></div></div>
+        <div className="inline-fields">
+          <label>名称<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
+          <label>每分钟限额<input value={form.rate_limit_per_minute} onChange={(event) => setForm({ ...form, rate_limit_per_minute: event.target.value })} /></label>
+          <label>IP 允许列表<input value={form.ip_allowlist} onChange={(event) => setForm({ ...form, ip_allowlist: event.target.value })} placeholder="留空=不限；10.0.0.*" /></label>
+          <label>周期预算上限<input value={form.budget_limit_amount} onChange={(event) => setForm({ ...form, budget_limit_amount: event.target.value })} placeholder="留空=不限" /></label>
+          <label>有效期（天）<input value={form.expires_in_days} onChange={(event) => setForm({ ...form, expires_in_days: event.target.value })} placeholder="留空=长期" /></label>
+        </div>
+        <div className="scope-grid">{allScopes.map((scope) => <label className="checkbox-line" key={scope}>
+          <input type="checkbox" checked={form.scopes.includes(scope)} onChange={() => toggleScope(scope)} /><span>{scope}</span></label>)}</div>
+        <div className="action-row"><button className="primary" onClick={createKey} disabled={busy}><Plus />创建 Key</button></div>
+        <p className="capability-note"><WarningCircle weight="fill" />Key 不能管理 Key：创建/撤销只允许 Owner 会话（本控制台）。</p>
+      </section>
+    </div>
+
+    {surface && <section className="card">
+      <div className="card-head"><div><h2>调用面与限额</h2><small>{surface.limits.note}</small></div></div>
+      <div className="profile-detail"><dl>
+        <dt>认证</dt><dd>{surface.auth}</dd>
+        <dt>幂等</dt><dd>{surface.idempotency.header} · {surface.idempotency.scope_isolation}；{surface.idempotency.replay}</dd>
+        <dt>每 Key</dt><dd>{surface.limits.requests_per_minute.per_key} 请求/分钟</dd>
+        <dt>每工作区</dt><dd>{surface.limits.requests_per_minute.per_workspace} 请求/分钟</dd>
+        <dt>并发</dt><dd>{surface.limits.default_concurrency.gpu_jobs} GPU Job / {surface.limits.default_concurrency.remote_generation_operations} 远程生成 operation</dd>
+        <dt>错误码</dt><dd>{Object.entries(surface.error_codes).map(([code, items]) => `${code}: ${[].concat(items).join(" / ")}`).join("；")}</dd>
+      </dl></div>
+      <div className="two-col">
+        <div><h3>路由 → scope</h3>
+          <table className="table"><thead><tr><th>方法</th><th>路径</th><th>Scope</th></tr></thead>
+            <tbody>{surface.scopes.route_scopes.map((item) => <tr key={`${item.method}${item.path_regex}`}>
+              <td>{item.method}</td><td><code>{item.path_regex}</code></td><td>{item.scope}</td></tr>)}</tbody></table></div>
+        <div><h3>强制幂等键</h3>
+          <table className="table"><thead><tr><th>方法</th><th>路径</th></tr></thead>
+            <tbody>{surface.scopes.requires_idempotency_key.map((item) => <tr key={`${item.method}${item.path_regex}`}>
+              <td>{item.method}</td><td><code>{item.path_regex}</code></td></tr>)}</tbody></table>
+          <p className="capability-note"><WarningCircle weight="fill" />{surface.scopes.note}</p></div>
+      </div>
+    </section>}
+  </section>;
+}
+
 function ReferencePage() {
   const [references, setReferences] = useState([]);
   const [versions, setVersions] = useState([]);
@@ -1755,7 +1888,7 @@ export function App() {
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "costs" ? <CostPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "profiles" ? <ProfilePage /> : active === "batch" ? <BatchPage /> : active === "audio" ? <AudioPage /> : active === "packages" ? <PackagePage /> : active === "costs" ? <CostPage /> : active === "automation" ? <AutomationPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">

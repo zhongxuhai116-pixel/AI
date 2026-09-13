@@ -611,6 +611,7 @@ CREATE TABLE IF NOT EXISTS cost_ledger (
   note TEXT NOT NULL DEFAULT '',
   settled_at TEXT,
   settled_entry_id TEXT,
+  actor_key_id TEXT,
   payload TEXT NOT NULL,
   payload_sha256 TEXT NOT NULL,
   created_at TEXT NOT NULL
@@ -619,3 +620,53 @@ CREATE TABLE IF NOT EXISTS cost_ledger (
 -- 已有安装补齐 V6-06 预留对账列（幂等：防止同一条预留被重复结算）
 ALTER TABLE cost_ledger ADD COLUMN IF NOT EXISTS settled_at TEXT;
 ALTER TABLE cost_ledger ADD COLUMN IF NOT EXISTS settled_entry_id TEXT;
+-- V6-07：记录产生该账本行的 Automation Key（用于 Key 周期预算，不额外记账）
+ALTER TABLE cost_ledger ADD COLUMN IF NOT EXISTS actor_key_id TEXT;
+
+-- V6-07：Automation Key、限流窗口、幂等记录
+CREATE TABLE IF NOT EXISTS automation_keys (
+  id TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL UNIQUE,
+  prefix TEXT NOT NULL,
+  name TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  workspace_id TEXT,
+  project_id TEXT,
+  scopes TEXT NOT NULL,
+  secret_hash TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  ip_allowlist TEXT NOT NULL DEFAULT '',
+  rate_limit_per_minute INTEGER NOT NULL DEFAULT 60,
+  budget_limit_amount DOUBLE PRECISION,
+  budget_period TEXT NOT NULL DEFAULT 'month',
+  expires_at DOUBLE PRECISION,
+  revoked_at TEXT,
+  revoked_reason TEXT NOT NULL DEFAULT '',
+  last_used_at TEXT,
+  call_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS automation_rate_windows (
+  id TEXT PRIMARY KEY,
+  scope_kind TEXT NOT NULL,
+  scope_ref TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  window_seconds INTEGER NOT NULL DEFAULT 60,
+  count INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  UNIQUE (scope_kind, scope_ref, window_start)
+);
+
+CREATE TABLE IF NOT EXISTS idempotency_records (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  idem_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status_code INTEGER NOT NULL,
+  response TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (owner_id, actor, scope, idem_key)
+);
