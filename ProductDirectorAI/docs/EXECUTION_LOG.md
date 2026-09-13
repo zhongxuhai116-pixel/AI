@@ -135,5 +135,6 @@
 - 真实缺陷与修复：`build_layers.py` 输出帧号从 0 起编号，被冻结帧集合合同正确拒绝（fail-closed 生效），修复为沿用输入帧号（提交 `edc2df7`）后重跑通过。
 - 1080×1920 口径复验：同一 72 帧计划重渲 + 重建层 + 校验（passed）+ H3 背景（同 seed 同源视频，解码缩放——H3 原生 576×1024）+ 合成（passed / pixel_lock_ok）+ 双产品检测（72/72 零误报）。
 - 主规划 V3-04 补强（QA 闭环）：修复真实缺陷——`run_qa_for_run` 在任务已处于终态（VERIFICATION_PASSED/SUCCEEDED）时调用 `update_job(status=QA_REJECTED)` 会被 `_apply_job_update` 的终态保护静默丢弃，QA 失败后任务仍显示成功；现允许唯一的终态→终态降级 QA_REJECTED（取消胜出仍优先）。新增 4 个 API 级真实 QA 故障注入测试（不 mock 引擎）：Logo 区抹除、部分帧掩码放大、掩码整体错位、产品变色——均触发对应致命失败（Logo/轮廓/核心区 MAE）、任务 QA_REJECTED、发布门拒绝；正例对照无致命失败。全量后端 **345/345 OK**（云端 228.3s）。
+- 主规划 V3-06 审核界面上线（提交 `5c8eb6b`）：前端新增「保真审核」页（版本审核/质检报告/通道查看三页 + 问题帧定位 + 审批按钮注明 Manifest hash）；后端新增 `GET /qa-reports`、`GET /runs/{id}/strict-artifacts/{channel}/{frame}`（白名单帧预览）、`GET /plans/{id}/contracts`；QA 报告新增结构化 problems（check/frame/shot 定位）。真实运行修复两个缺陷：受控渲染验证小样此前**静默跳过 QA**（无背景工作流分支直接 VERIFICATION_PASSED，现落库真实 QA 报告）；QA 颜色对照**跨色彩空间误判**（AgX display PNG 直接对比 scene EXR，真实数据 432 个误报问题，现同空间对照/不可比则 NOT_VERIFIED）。**线上真实 E2E**：真实 CC0 GLB 上传 → 严格 Run → 真实 Blender 144 帧受控渲染 → QA 报告（NOT_VERIFIED、0 问题、color/edge/contour/logo/asset_hash PASS）→ 审批门 409 → 帧预览 200。全量后端 **349/349 OK**、前端 build + Sites 4/4、线上 api/web 均部署新代码。
 - 推送：`b260f1f`、`edc2df7`、`c8f0396` 已推送到 GitHub `main`；云端 `wip-v305-layers` 分支保留本地。
-- 未完成（如实记录）：遮挡物自身投影的逐帧人工比对、真实人物遮挡素材；scene-linear 全链路映射；主规划 V3-05 真实候选审核样例、V3-06 审核界面、V3-07 完整验收；V4–V6。
+- 未完成（如实记录）：遮挡物自身投影的逐帧人工比对、真实人物遮挡素材；scene-linear 全链路映射；V3-06 浏览器人工走查；V3-07 真机校准/取景、两类产品×3 镜头×2 背景、完整 V3_ACCEPTANCE；V4–V6。
