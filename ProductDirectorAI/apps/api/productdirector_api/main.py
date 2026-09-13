@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 from fastapi import BackgroundTasks, FastAPI, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image, ImageStat
 from . import director, director_plan, security, storage
@@ -55,6 +55,7 @@ from .strict_background import (
 from . import strict_qa
 from . import interaction_geometry
 from . import interaction_validation
+from . import platform_profiles
 from . import reference_analysis
 
 
@@ -535,6 +536,48 @@ def initialize_db() -> None:
               payload_sha256 TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS platform_profiles (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              profile_key TEXT NOT NULL,
+              name TEXT NOT NULL,
+              platform TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (owner_id, project_id, profile_key)
+            );
+            CREATE TABLE IF NOT EXISTS platform_profile_versions (
+              id TEXT PRIMARY KEY,
+              profile_id TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE (profile_id, version),
+              FOREIGN KEY(profile_id) REFERENCES platform_profiles(id)
+            );
+            CREATE TABLE IF NOT EXISTS postproduction_presets (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              preset_key TEXT NOT NULL,
+              name TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (owner_id, project_id, preset_key)
+            );
+            CREATE TABLE IF NOT EXISTS postproduction_preset_versions (
+              id TEXT PRIMARY KEY,
+              preset_id TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE (preset_id, version),
+              FOREIGN KEY(preset_id) REFERENCES postproduction_presets(id)
+            );
             """
     with connect() as db:
         db.executescript(schema_sql)
@@ -590,6 +633,38 @@ def initialize_db() -> None:
                 now,
             ),
         )
+        # V6-01：六个首批导出 Profile 与两个后期模板作为产品预设种子（幂等）。
+        for seed in platform_profiles.SEED_PROFILES:
+            spec = platform_profiles.spec_from_payload(seed)
+            profile_key = spec.identity.profile_id
+            db.execute(
+                "INSERT OR IGNORE INTO platform_profiles(id, owner_id, project_id, profile_key, name, platform, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (profile_key, DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID, profile_key,
+                 spec.identity.name, spec.identity.platform, now, now),
+            )
+            payload_text = platform_profiles.profile_payload_json(spec)
+            db.execute(
+                "INSERT OR IGNORE INTO platform_profile_versions(id, profile_id, version, payload, payload_sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (f"{profile_key}-v1", profile_key, 1, payload_text,
+                 hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+            )
+        for seed in platform_profiles.SEED_PRESETS:
+            spec = platform_profiles.PostproductionPresetSpec.model_validate(seed["spec"])
+            preset_key = seed["preset_key"]
+            db.execute(
+                "INSERT OR IGNORE INTO postproduction_presets(id, owner_id, project_id, preset_key, name, kind, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (preset_key, DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID, preset_key, spec.name, "postproduction", now, now),
+            )
+            payload_text = platform_profiles.preset_payload_json(spec)
+            db.execute(
+                "INSERT OR IGNORE INTO postproduction_preset_versions(id, preset_id, version, payload, payload_sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (f"{preset_key}-v1", preset_key, 1, payload_text,
+                 hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+            )
 
 
 initialize_db()
@@ -7216,6 +7291,448 @@ def job_manifest(
         media_type="application/json",
         filename=f"metadata-{job_id}.json",
     )
+
+
+# ---------------------------------------------------------------------------
+# V6-01：Platform Profile 与后期模板（版本化导出配置、安全区、规格校验）
+# ---------------------------------------------------------------------------
+
+
+class PlatformProfileCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    platform: Literal[
+        "tiktok", "youtube", "instagram", "facebook_page", "facebook_ads", "marketplace", "pinterest",
+    ]
+    purpose: Literal["organic_post", "ads_material", "marketplace_listing"] = "organic_post"
+    # 完整规格快照；缺省时按平台默认模板生成草稿（仍会返回真实校验结果）。
+    spec: dict | None = None
+    profile_key: str = Field(default="", max_length=80)
+    notes: str = Field(default="", max_length=2000)
+
+
+class PlatformProfileVersionRequest(BaseModel):
+    spec: dict
+    notes: str = Field(default="", max_length=2000)
+
+
+class PlatformProfileValidateRequest(BaseModel):
+    account_id: str = Field(default="", max_length=120)
+    output: dict | None = None
+
+
+class PostproductionPresetCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    preset_key: str = Field(default="", max_length=80)
+    spec: dict
+    notes: str = Field(default="", max_length=2000)
+
+
+def _platform_profile_public(db, row) -> dict:
+    latest = db.execute(
+        "SELECT * FROM platform_profile_versions WHERE profile_id = ? ORDER BY version DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    spec = platform_profiles.spec_from_payload(json.loads(latest["payload"]))
+    problems = platform_profiles.validate_spec(spec)
+    summary = platform_profiles.summarize(problems)
+    return {
+        "id": row["id"],
+        "profile_key": row["profile_key"],
+        "name": row["name"],
+        "platform": row["platform"],
+        "version": latest["version"],
+        "version_id": latest["id"],
+        "payload_sha256": latest["payload_sha256"],
+        "aspect_ratio": spec.composition.aspect_ratio,
+        "locale": spec.market.locale,
+        "resolution": f"{spec.video.width}x{spec.video.height}",
+        "fps": spec.video.fps,
+        "duration_range_seconds": [spec.video.duration_min_seconds, spec.video.duration_max_seconds],
+        "rules_status": platform_profiles.rules_status(spec),
+        "valid": summary["valid"],
+        "blocking_count": summary["blocking_count"],
+        "warning_count": summary["warning_count"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _create_platform_profile_version(db, profile_id: str, spec_payload: dict, notes: str = "") -> dict:
+    """写入一个不可变 Profile 版本；版本号由服务端强制递增，不接受客户端指定。"""
+    latest = db.execute(
+        "SELECT COALESCE(MAX(version), 0) AS version FROM platform_profile_versions WHERE profile_id = ?",
+        (profile_id,),
+    ).fetchone()
+    version = int(latest["version"]) + 1
+    payload = dict(spec_payload)
+    identity = dict(payload.get("identity") or {})
+    identity["profile_id"] = profile_id
+    identity["version"] = version
+    payload["identity"] = identity
+    if notes:
+        payload["notes"] = notes
+    spec = platform_profiles.PlatformProfileSpec.model_validate(payload)
+    payload_text = platform_profiles.profile_payload_json(spec)
+    version_id = str(uuid.uuid4())
+    now = utc_now()
+    db.execute(
+        "INSERT INTO platform_profile_versions(id, profile_id, version, payload, payload_sha256, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (version_id, profile_id, version, payload_text,
+         hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+    )
+    db.execute(
+        "UPDATE platform_profiles SET name = ?, platform = ?, updated_at = ? WHERE id = ?",
+        (spec.identity.name, spec.identity.platform, now, profile_id),
+    )
+    return {
+        "id": version_id,
+        "profile_id": profile_id,
+        "version": version,
+        "payload_sha256": hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
+        "spec": spec.model_dump(),
+        "validation": platform_profiles.summarize(platform_profiles.validate_spec(spec)),
+        "rules_status": platform_profiles.rules_status(spec),
+        "created_at": now,
+    }
+
+
+def _default_profile_spec_payload(
+    name: str, platform: str, purpose: str, notes: str
+) -> dict:
+    """按平台选一个种子模板作为草稿骨架（显式照抄，不做隐式猜测）。"""
+    for seed in platform_profiles.SEED_PROFILES:
+        if seed["identity"]["platform"] == platform:
+            payload = json.loads(json.dumps(seed))
+            payload["identity"]["name"] = name
+            payload["identity"]["purpose"] = purpose
+            payload["identity"]["profile_id"] = "draft"
+            if notes:
+                payload["notes"] = notes
+            return payload
+    raise HTTPException(422, f"平台 {platform} 没有可用的草稿模板，请直接提交完整 spec")
+
+
+@app.get("/api/v1/platform-profiles")
+def list_platform_profiles(
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> list[dict]:
+    """导出 Profile 列表（含最新版本的真实校验摘要）。选择 Profile 不代表账号存在。"""
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM platform_profiles WHERE owner_id = ? AND project_id = ? ORDER BY created_at ASC",
+            (owner_id, project_id),
+        ).fetchall()
+        return [_platform_profile_public(db, row) for row in rows]
+
+
+@app.post("/api/v1/platform-profiles", status_code=201)
+def create_platform_profile(request: PlatformProfileCreateRequest) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    profile_key = request.profile_key or f"draft-{uuid.uuid4().hex[:8]}"
+    payload = request.spec or _default_profile_spec_payload(
+        request.name, request.platform, request.purpose, request.notes
+    )
+    payload = dict(payload)
+    payload["identity"] = {
+        **(payload.get("identity") or {}),
+        "name": request.name,
+        "platform": request.platform,
+        "purpose": request.purpose,
+        "version": 1,
+    }
+    try:
+        platform_profiles.PlatformProfileSpec.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(422, f"Profile 规格无效: {exc.errors()[:4]}") from exc
+    with connect() as db:
+        begin_immediate(db)
+        exists = db.execute(
+            "SELECT 1 FROM platform_profiles WHERE owner_id = ? AND project_id = ? AND profile_key = ?",
+            (owner_id, project_id, profile_key),
+        ).fetchone()
+        if exists:
+            raise HTTPException(409, "同名 profile_key 已存在")
+        now = utc_now()
+        profile_id = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO platform_profiles(id, owner_id, project_id, profile_key, name, platform, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (profile_id, owner_id, project_id, profile_key, request.name, request.platform, now, now),
+        )
+        created = _create_platform_profile_version(db, profile_id, payload, request.notes)
+        row = db.execute("SELECT * FROM platform_profiles WHERE id = ?", (profile_id,)).fetchone()
+        public = _platform_profile_public(db, row)
+    return {"profile": public, "version": created}
+
+
+@app.get("/api/v1/platform-profiles/{profile_id}")
+def get_platform_profile(profile_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM platform_profiles WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (profile_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Profile 不存在")
+        latest = db.execute(
+            "SELECT * FROM platform_profile_versions WHERE profile_id = ? ORDER BY version DESC LIMIT 1",
+            (profile_id,),
+        ).fetchone()
+    spec = platform_profiles.spec_from_payload(json.loads(latest["payload"]))
+    problems = platform_profiles.validate_spec(spec)
+    return {
+        "profile": {
+            "id": row["id"], "profile_key": row["profile_key"], "name": row["name"],
+            "platform": row["platform"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+        },
+        "latest_version": {
+            "id": latest["id"], "version": latest["version"], "payload_sha256": latest["payload_sha256"],
+            "created_at": latest["created_at"],
+        },
+        "spec": spec.model_dump(),
+        "validation": platform_profiles.summarize(problems),
+        "rules_status": platform_profiles.rules_status(spec),
+    }
+
+
+@app.get("/api/v1/platform-profiles/{profile_id}/versions")
+def list_platform_profile_versions(profile_id: str) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM platform_profiles WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (profile_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Profile 不存在")
+        versions = db.execute(
+            "SELECT * FROM platform_profile_versions WHERE profile_id = ? ORDER BY version ASC",
+            (profile_id,),
+        ).fetchall()
+    return [
+        {
+            "id": item["id"], "version": item["version"], "payload_sha256": item["payload_sha256"],
+            "created_at": item["created_at"],
+            "spec": json.loads(item["payload"]),
+        }
+        for item in versions
+    ]
+
+
+@app.post("/api/v1/platform-profiles/{profile_id}/versions", status_code=201)
+def create_platform_profile_version(profile_id: str, request: PlatformProfileVersionRequest) -> dict:
+    """新版本是不可变快照；旧版本保留（修改永远生成新版本）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM platform_profiles WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (profile_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Profile 不存在")
+        try:
+            created = _create_platform_profile_version(db, profile_id, request.spec, request.notes)
+        except ValidationError as exc:
+            raise HTTPException(422, f"Profile 规格无效: {exc.errors()[:4]}") from exc
+    return created
+
+
+@app.post("/api/v1/platform-profiles/{profile_id}/validate")
+def validate_platform_profile(profile_id: str, request: PlatformProfileValidateRequest) -> dict:
+    """规格校验 + （可选）实际成片兼容性 + （可选）账号能力。
+
+    账号能力需要真实平台授权；未配置时如实返回 NOT_CONFIGURED，不伪造能力结论。
+    """
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM platform_profiles WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (profile_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Profile 不存在")
+        latest = db.execute(
+            "SELECT * FROM platform_profile_versions WHERE profile_id = ? ORDER BY version DESC LIMIT 1",
+            (profile_id,),
+        ).fetchone()
+    spec = platform_profiles.spec_from_payload(json.loads(latest["payload"]))
+    problems = list(platform_profiles.validate_spec(spec))
+    output_report = None
+    if request.output:
+        output_problems = platform_profiles.output_compatibility(spec, request.output)
+        problems.extend(output_problems)
+        output_report = platform_profiles.summarize(output_problems)
+    account_report = {
+        "account_id": request.account_id,
+        "status": "NOT_CONFIGURED" if request.account_id else "NOT_REQUESTED",
+        "reason": "未配置该平台账号授权：账号能力需 V6-C 连接器现场验证，不能用规格校验代替",
+        "capabilities": None,
+    }
+    summary = platform_profiles.summarize(problems)
+    return {
+        "profile_id": profile_id,
+        "version": latest["version"],
+        "payload_sha256": latest["payload_sha256"],
+        "valid": summary["valid"],
+        "blocking": summary["blocking"],
+        "warnings": summary["warnings"],
+        "output_compatibility": output_report,
+        "rules_status": platform_profiles.rules_status(spec),
+        "account": account_report,
+        "checked_at": utc_now(),
+    }
+
+
+# --- 后期模板（字幕/配音/BGM/混音） ---------------------------------------
+
+
+def _preset_public(db, row) -> dict:
+    latest = db.execute(
+        "SELECT * FROM postproduction_preset_versions WHERE preset_id = ? ORDER BY version DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    spec = platform_profiles.PostproductionPresetSpec.model_validate(json.loads(latest["payload"]))
+    problems = platform_profiles.validate_preset_spec(spec)
+    summary = platform_profiles.summarize(problems)
+    return {
+        "id": row["id"],
+        "preset_key": row["preset_key"],
+        "name": row["name"],
+        "version": latest["version"],
+        "version_id": latest["id"],
+        "payload_sha256": latest["payload_sha256"],
+        "locale": spec.locale,
+        "subtitles_enabled": spec.subtitles.enabled,
+        "voice_enabled": spec.voice.enabled,
+        "music_enabled": spec.music.enabled,
+        "adaptation_policy": spec.adaptation_policy,
+        "valid": summary["valid"],
+        "blocking_count": summary["blocking_count"],
+        "warning_count": summary["warning_count"],
+        "created_at": row["created_at"],
+    }
+
+
+@app.get("/api/v1/postproduction-presets")
+def list_postproduction_presets(
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM postproduction_presets WHERE owner_id = ? AND project_id = ? ORDER BY created_at ASC",
+            (owner_id, project_id),
+        ).fetchall()
+        return [_preset_public(db, row) for row in rows]
+
+
+@app.get("/api/v1/postproduction-presets/{preset_id}")
+def get_postproduction_preset(preset_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM postproduction_presets WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (preset_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "后期模板不存在")
+        latest = db.execute(
+            "SELECT * FROM postproduction_preset_versions WHERE preset_id = ? ORDER BY version DESC LIMIT 1",
+            (preset_id,),
+        ).fetchone()
+    spec = platform_profiles.PostproductionPresetSpec.model_validate(json.loads(latest["payload"]))
+    return {
+        "preset": {
+            "id": row["id"], "preset_key": row["preset_key"], "name": row["name"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        },
+        "latest_version": {"id": latest["id"], "version": latest["version"],
+                           "payload_sha256": latest["payload_sha256"], "created_at": latest["created_at"]},
+        "spec": spec.model_dump(),
+        "validation": platform_profiles.summarize(platform_profiles.validate_preset_spec(spec)),
+    }
+
+
+@app.post("/api/v1/postproduction-presets", status_code=201)
+def create_postproduction_preset(request: PostproductionPresetCreateRequest) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    preset_key = request.preset_key or f"preset-{uuid.uuid4().hex[:8]}"
+    try:
+        spec = platform_profiles.PostproductionPresetSpec.model_validate(request.spec)
+    except ValidationError as exc:
+        raise HTTPException(422, f"后期模板规格无效: {exc.errors()[:4]}") from exc
+    with connect() as db:
+        begin_immediate(db)
+        exists = db.execute(
+            "SELECT 1 FROM postproduction_presets WHERE owner_id = ? AND project_id = ? AND preset_key = ?",
+            (owner_id, project_id, preset_key),
+        ).fetchone()
+        if exists:
+            raise HTTPException(409, "同名 preset_key 已存在")
+        now = utc_now()
+        preset_id = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO postproduction_presets(id, owner_id, project_id, preset_key, name, kind, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'postproduction', ?, ?)",
+            (preset_id, owner_id, project_id, preset_key, request.name, now, now),
+        )
+        payload_text = platform_profiles.preset_payload_json(spec)
+        version_id = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO postproduction_preset_versions(id, preset_id, version, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, 1, ?, ?, ?)",
+            (version_id, preset_id, payload_text, hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+        )
+        row = db.execute("SELECT * FROM postproduction_presets WHERE id = ?", (preset_id,)).fetchone()
+        public = _preset_public(db, row)
+    return {"preset": public, "version": 1, "version_id": version_id,
+            "spec": spec.model_dump(),
+            "validation": platform_profiles.summarize(platform_profiles.validate_preset_spec(spec))}
+
+
+@app.post("/api/v1/postproduction-presets/{preset_id}/versions", status_code=201)
+def create_postproduction_preset_version(preset_id: str, request: PlatformProfileVersionRequest) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM postproduction_presets WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (preset_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "后期模板不存在")
+        try:
+            spec = platform_profiles.PostproductionPresetSpec.model_validate(request.spec)
+        except ValidationError as exc:
+            raise HTTPException(422, f"后期模板规格无效: {exc.errors()[:4]}") from exc
+        latest = db.execute(
+            "SELECT COALESCE(MAX(version), 0) AS version FROM postproduction_preset_versions WHERE preset_id = ?",
+            (preset_id,),
+        ).fetchone()
+        version = int(latest["version"]) + 1
+        payload_text = platform_profiles.preset_payload_json(spec)
+        version_id = str(uuid.uuid4())
+        now = utc_now()
+        db.execute(
+            "INSERT INTO postproduction_preset_versions(id, preset_id, version, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (version_id, preset_id, version, payload_text,
+             hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+        )
+        db.execute("UPDATE postproduction_presets SET updated_at = ? WHERE id = ?", (now, preset_id))
+    return {
+        "id": version_id, "preset_id": preset_id, "version": version,
+        "payload_sha256": hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
+        "spec": spec.model_dump(),
+        "validation": platform_profiles.summarize(platform_profiles.validate_preset_spec(spec)),
+        "created_at": now,
+    }
 
 
 def main_cli(argv: list[str] | None = None) -> int:

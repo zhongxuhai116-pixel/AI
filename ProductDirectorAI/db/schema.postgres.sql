@@ -332,3 +332,48 @@ CREATE TABLE IF NOT EXISTS reference_mappings (
   payload_sha256 TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- V6-01：Platform Profile 与后期模板（不可变版本快照）
+CREATE TABLE IF NOT EXISTS platform_profiles (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  profile_key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (owner_id, project_id, profile_key)
+);
+
+CREATE TABLE IF NOT EXISTS platform_profile_versions (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL REFERENCES platform_profiles(id),
+  version INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (profile_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS postproduction_presets (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  preset_key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (owner_id, project_id, preset_key)
+);
+
+CREATE TABLE IF NOT EXISTS postproduction_preset_versions (
+  id TEXT PRIMARY KEY,
+  preset_id TEXT NOT NULL REFERENCES postproduction_presets(id),
+  version INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (preset_id, version)
+);
