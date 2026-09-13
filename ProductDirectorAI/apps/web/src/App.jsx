@@ -70,7 +70,7 @@ function ModelPreview({ url }) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color("#f3f5f7");
     const camera = new THREE.PerspectiveCamera(36, mount.clientWidth / mount.clientHeight, .01, 100);
-    camera.position.set(2.5, -3.2, 2);
+    camera.position.set(2.5, 1.8, 3.2);
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.setSize(mount.clientWidth, mount.clientHeight);
@@ -78,23 +78,27 @@ function ModelPreview({ url }) {
     mount.replaceChildren(renderer.domElement);
     scene.add(new THREE.HemisphereLight(0xffffff, 0x475569, 2.5));
     const key = new THREE.DirectionalLight(0xffffff, 4); key.position.set(-2, -3, 5); scene.add(key);
-    scene.add(new THREE.GridHelper(8, 16, 0xd7dce3, 0xe4e7eb));
+    const grid = new THREE.GridHelper(8, 16, 0xd7dce3, 0xe4e7eb);
+    grid.position.y = -1;
+    scene.add(grid);
     let object; let frame; let down = false; let previous = 0;
     new GLTFLoader().setWithCredentials(true).load(url, (gltf) => {
-      object = gltf.scene;
-      const box = new THREE.Box3().setFromObject(object);
+      const model = gltf.scene;
+      const box = new THREE.Box3().setFromObject(model);
       const size = box.getSize(new THREE.Vector3());
       const center = box.getCenter(new THREE.Vector3());
-      object.position.sub(center);
+      model.position.sub(center);
+      object = new THREE.Group();
+      object.add(model);
       object.scale.setScalar(1.8 / (Math.max(size.x, size.y, size.z) || 1));
       scene.add(object);
     });
     const canvas = renderer.domElement;
     const start = (e) => { down = true; previous = e.clientX; };
-    const move = (e) => { if (down && object) { object.rotation.z += (e.clientX - previous) * .01; previous = e.clientX; } };
+    const move = (e) => { if (down && object) { object.rotation.y += (e.clientX - previous) * .01; previous = e.clientX; } };
     const stop = () => { down = false; };
     canvas.addEventListener("pointerdown", start); window.addEventListener("pointermove", move); window.addEventListener("pointerup", stop);
-    const animate = () => { frame = requestAnimationFrame(animate); camera.lookAt(0, 0, .4); renderer.render(scene, camera); };
+    const animate = () => { frame = requestAnimationFrame(animate); camera.lookAt(0, 0, 0); renderer.render(scene, camera); };
     animate();
     return () => { cancelAnimationFrame(frame); renderer.dispose(); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); };
   }, [url]);
@@ -136,7 +140,7 @@ function Steps({ asset, plan, job }) {
   const verifiedOnly = job?.status === "VERIFICATION_PASSED";
   const list = [
     ["1", "产品素材", asset ? "已选择" : "图片 / GLB", Image, !!asset],
-    ["2", "生成分镜", plan ? "3 个 Shot" : "模板导演", FilmSlate, !!plan],
+    ["2", "生成分镜", plan ? `${plan.shots.length} 个 Shot` : "模板导演", FilmSlate, !!plan],
     ["3", "生成预演", job?.stage || "等待执行", Camera, job?.status === "SUCCEEDED" || verifiedOnly],
     ["4", "技术检查", job?.status === "SUCCEEDED" ? "已通过" : verifiedOnly ? "验证通过·不可发布" : "自动校验", ListChecks, job?.status === "SUCCEEDED" || verifiedOnly],
   ];
@@ -207,7 +211,7 @@ function DirectorCard({ intent, setIntent, plan, output, onOutputChange, cropAnc
         <small>9:16 裁切区域预览 —— 成片会在这个区域内做推近/侧移，不会用到框外内容。</small>
       </div>
     </div>
-    <button className="primary wide" disabled={busy} onClick={onGenerate}><Sparkle weight="fill" />{busy ? "正在生成..." : plan ? "重新生成三镜头" : "生成三镜头计划"}</button>
+    <button className="primary wide" disabled={busy} onClick={onGenerate}><Sparkle weight="fill" />{busy ? "正在生成..." : plan?.scene_generation ? "重新解析场景计划" : plan ? "重新生成三镜头" : "生成三镜头计划"}</button>
   </section>;
 }
 
