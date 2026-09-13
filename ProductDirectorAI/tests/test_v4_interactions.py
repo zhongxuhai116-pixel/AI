@@ -136,13 +136,22 @@ class V4InteractionTests(unittest.TestCase):
 
     def test_validate_unreachable_anchor_fails(self) -> None:
         plan, version_id = self._approved_version()
-        character = self._character(height=(0.9, 1.0))  # 可达带 [0.475, 1.0925]
+        character = self._character(height=(0.9, 1.0))  # 可达带 [0.1425, 1.0925]
         anchor_set = self._anchor_set(version_id, z=0.9)  # 世界高 1.305m > 1.0925
         created = self._interaction(plan["id"], version_id, anchor_set["id"], character["id"])
         report = self.client.post(f"/api/v1/interaction-plans/{created.json()['id']}/validate").json()
         self.assertFalse(report["passed"])
         self.assertTrue(any("接触距离" in failure for failure in report["failures"]), report["failures"])
         self.assertTrue(report["metrics"]["contact"]["contact_distance_m"] > report["metrics"]["contact"]["threshold_m"])
+
+    def test_low_anchor_feasible_with_bend(self) -> None:
+        # 低位锚点（弯腰可及，reach_low = 0.15 × 身高中值）应通过
+        plan, version_id = self._approved_version()
+        character = self._character()
+        anchor_set = self._anchor_set(version_id, z=0.25)  # 世界高 0.3625m
+        created = self._interaction(plan["id"], version_id, anchor_set["id"], character["id"])
+        report = self.client.post(f"/api/v1/interaction-plans/{created.json()['id']}/validate").json()
+        self.assertTrue(report["passed"], report["failures"])
 
     def test_validate_penetration_fails(self) -> None:
         plan, version_id = self._approved_version()

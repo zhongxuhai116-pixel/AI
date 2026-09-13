@@ -1,6 +1,6 @@
 # 当前阶段
 
-> **2026-09-13 云端会话更新**：V1/V2 仍为 ACCEPTED。本轮完成两条开发线合并（`b260f1f`/`edc2df7`/`c8f0396`）、**V3-05 独立层真实闭环**、**主规划 V3-04 QA 闭环补强**、**主规划 V3-06 审核界面上线**、**主规划 V3-07 真机校准与验收组装**（[V3_ACCEPTANCE 草稿](reports/V3_ACCEPTANCE.md)）。**V4 已开工**：V4-01 锚点/人物/动作合同 + 版本化；V4-02/03 交互计划合同 + 纯数学校验引擎（接触/穿透/时序）+ 数据版预演（365/365，线上已部署并冒烟通过）。V3 保持 IN_PROGRESS 待负责人人工复核（按项目先例 V4 工程先行，不宣布 V3 PASS）。剩余：V3 收尾复核、V4-02/03 渲染侧（Blender 人体 Proxy、IK/碰撞几何）、V4-04…07、V5、V6。
+> **2026-09-13 云端会话更新**：V1/V2 仍为 ACCEPTED。本轮完成两条开发线合并（`b260f1f`/`edc2df7`/`c8f0396`）、**V3-05 独立层真实闭环**、**主规划 V3-04 QA 闭环补强**、**主规划 V3-06 审核界面上线**、**主规划 V3-07 真机校准与验收组装**（[V3_ACCEPTANCE 草稿](reports/V3_ACCEPTANCE.md)）。**V4 已开工**：V4-01 锚点/人物/动作合同；V4-02/03 交互计划 + 校验引擎 + **Blender 人体 Proxy 预演与真实几何接触 QA 闭环**（正例通过、负例 fail-closed，[V4-02/03 报告](reports/V402_V403_PROXY_PREVIZ_2026-09-13.md)，369/369）。V3 保持 IN_PROGRESS 待负责人人工复核。剩余：V3 收尾复核、预演帧人工目检、击打/IK 真实几何、V4-04…07、V5、V6。
 
 > **2026-09-13 最新**：用户已确认 V1/V2 ACCEPTED；完整 V3 仍为 IN_PROGRESS，V4–V6 未开始。V3 的 Q01–Q06、Strict 运行/来源、受控 Blender 输出、背景 Worker、QA 与 display-linear 色彩合同已有局部代码和验证报告。真实 Blender 探针已从 24 帧扩到 **72 帧、540×960**；核心区色差、288 个 EXR 通道结构与 576 项文件哈希通过独立复验，Depth/Normal/稳定 ID/跨空间颜色语义仍未验收，见 [P0.1b 控制端报告](reports/V3_P01B_72FRAME_CONTROLLER_ACCEPTANCE_2026-09-13.md)。远端历史 V3-06/V3-07 云端记录见 [任务书](reports/V3_TASK_BRIEF.md)，该编号与[主规划](../ProductDirectorAI_V1-V6_Codex_Development_Plan.md)不同，不能据此宣布主规划任务或完整 V3 PASS。H3 场景校准也不能替代两类产品×至少三镜头×两背景及完整人工审批。本页下方大量分时记录为历史快照；最新验收以 [控制记录](BROKER_V6_CONTROL.md) 和独立报告为准。
 

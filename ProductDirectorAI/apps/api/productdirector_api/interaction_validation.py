@@ -3,7 +3,8 @@
 Proxy 模型（确定性、可单测；真实 IK 在 Blender Proxy 渲染侧另做）：
 - 产品归一化约定沿用 V4-01：锚点 position_m 为 bbox 归一化比例，归一化包围盒
   最长边 = 1.45m；本引擎按"每轴尺寸 ≤ 最长边"做保守世界换算（如实记录）。
-- 人物可达带：reach_low = 0.5 × 身高中值，reach_high = 1.15 × 身高中值（米）。
+- 人物可达带：reach_low = 0.15 × 身高中值（弯腰可及低位锚点），
+  reach_high = 1.15 × 身高中值（米）。
 - 接触距离：|锚点高度 − clamp(锚点高度, reach_low, reach_high)|，阈值 = min(2cm, 锚点半径)。
 - 穿透：距离误差超过锚点半径的部分视为手穿过产品表面；穿透帧数按
   [contact_frame, contact_frame+2] 窗口计，>2 帧或 >1cm 即失败。
@@ -21,9 +22,9 @@ TIMING_TOLERANCE_FRAMES = 2
 
 
 def character_reach_band(height_range_m: list[float]) -> tuple[float, float]:
-    """人物可达带（米）：(reach_low, reach_high)。"""
+    """人物可达带（米）：(reach_low, reach_high)。低位锚点按弯腰可及建模（0.15×身高）。"""
     mid = (float(height_range_m[0]) + float(height_range_m[1])) / 2.0
-    return mid * 0.5, mid * 1.15
+    return mid * 0.15, mid * 1.15
 
 
 def anchor_world_z(position_m: list[float]) -> float:
@@ -121,7 +122,7 @@ def _report(failures: list[str], metrics: dict, interaction: dict, template: dic
         "interaction": interaction,
         "motion_template": template["id"],
         "character": character.get("name"),
-        "proxy_model": "确定性代理：可达带 0.5–1.15×身高；锚点高度按归一化最长边 1.45m 保守换算（每轴 ≤ 最长边）",
+        "proxy_model": "确定性代理：可达带 0.15–1.15×身高；锚点高度按归一化最长边 1.45m 保守换算（每轴 ≤ 最长边）",
     }
 
 
