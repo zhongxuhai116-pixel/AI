@@ -180,6 +180,23 @@ def read_reference(pass_root: Path, frame: int) -> tuple[np.ndarray | None, np.n
     return _pick_beauty(planes), _pick_alpha(planes)
 
 
+def read_display_reference(strict_root: Path, frame: int) -> np.ndarray | None:
+    """同空间显示参考：渲染主帧（AgX display PNG，与 product/ 层同一色彩合同）。
+
+    颜色对照必须在同一色彩空间进行；scene-linear EXR 与 display PNG 不直接互比
+    （主规划 §9.11：同一线性空间中相对**经过允许变换**的 Blender 参考比较）。
+    """
+    main_frame = strict_root / f"frame_{frame:04d}.png"
+    if not main_frame.exists():
+        return None
+    try:
+        with Image.open(main_frame) as image:
+            array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+        return srgb_to_linear(array)
+    except Exception:
+        return None
+
+
 def _region_slice(region: dict, height: int, width: int) -> tuple[slice, slice]:
     x0 = max(0, min(width - 1, int(round(float(region.get("x", 0)) * width))))
     y0 = max(0, min(height - 1, int(round(float(region.get("y", 0)) * height))))
@@ -191,6 +208,20 @@ def _region_slice(region: dict, height: int, width: int) -> tuple[slice, slice]:
 def _frame_failures(check: dict, frame: int, failures: list[str]) -> None:
     for failure in failures:
         check["failures"].append(f"帧 {frame}: {failure}")
+
+
+def _shot_for_frame(plan_payload: dict, frame: int) -> tuple[str | None, str | None, int | None]:
+    """把逻辑帧号映射到 DirectorPlan 的 Shot 与镜内帧号（1 起）。"""
+    shots = plan_payload.get("shots") or []
+    start = 1
+    for shot in shots:
+        if not isinstance(shot, dict):
+            continue
+        duration = int(shot.get("duration_frames") or 0)
+        if start <= frame <= start + duration - 1:
+            return str(shot.get("id") or ""), str(shot.get("name") or ""), frame - start + 1
+        start += duration
+    return None, None, None
 
 
 def run_strict_qa(
@@ -227,11 +258,21 @@ def run_strict_qa(
             failures.append(f"{label} 多出帧：{extra[:12]}")
 
     frame_report: list[dict] = []
+    problems: list[dict] = []
+
+    def fail(check: str, reason: str) -> None:
+        """帧级失败：同时写入汇总字符串与结构化问题（供 UI 按 Shot/frame 定位）。"""
+        failures.append(f"帧 {frame}: {reason}")
+        problems.append({"check": check, "frame": frame, "reason": reason})
+
     color_mae_max = 0.0
     edge_mae_max = 0.0
     contour_iou_min = 1.0
     logo_mae_max = 0.0
     logo_min_coverage = 1.0
+    color_compared = False
+    logo_compared = False
+    declared_logo_regions = bool(review_payload.get("logo_regions"))
     for frame in sorted(expected):
         entry = {"frame": frame}
         if frame not in product_files:
@@ -243,42 +284,42 @@ def run_strict_qa(
         try:
             product, product_alpha = read_product(product_files[frame])
         except Exception as exc:
-            failures.append(f"帧 {frame} 产品层读取失败：{exc}")
+            fail("frame_completeness", f"产品层读取失败：{exc}")
             frame_report.append(entry)
             continue
         try:
             mask = read_mask(mask_files[frame])
         except Exception as exc:
-            failures.append(f"帧 {frame} 遮罩读取失败：{exc}")
+            fail("frame_completeness", f"遮罩读取失败：{exc}")
             frame_report.append(entry)
             continue
         reference, reference_alpha = read_reference(pass_root, frame)
         if reference is None:
-            failures.append(f"帧 {frame} 缺少 Beauty 参考")
+            fail("frame_completeness", "缺少 Beauty 参考")
             frame_report.append(entry)
             continue
         if reference.shape != product.shape:
-            failures.append(f"帧 {frame} Beauty 参考与产品层尺寸不一致：{reference.shape} / {product.shape}")
+            fail("frame_completeness", f"Beauty 参考与产品层尺寸不一致：{reference.shape} / {product.shape}")
             frame_report.append(entry)
             continue
         if reference_alpha is not None and reference_alpha.shape != mask.shape:
-            failures.append(f"帧 {frame} 参考 Alpha 与遮罩尺寸不一致：{reference_alpha.shape} / {mask.shape}")
+            fail("frame_completeness", f"参考 Alpha 与遮罩尺寸不一致：{reference_alpha.shape} / {mask.shape}")
             frame_report.append(entry)
             continue
         if product_alpha is None:
-            failures.append(f"帧 {frame} 产品层缺少可信 Alpha")
+            fail("frame_completeness", "产品层缺少可信 Alpha")
             frame_report.append(entry)
             continue
         if product_alpha.shape != mask.shape:
-            failures.append(f"帧 {frame} 产品 Alpha 与遮罩尺寸不一致：{product_alpha.shape} / {mask.shape}")
+            fail("frame_completeness", f"产品 Alpha 与遮罩尺寸不一致：{product_alpha.shape} / {mask.shape}")
             frame_report.append(entry)
             continue
         if not np.isfinite(product).all() or not np.isfinite(product_alpha).all() or not np.isfinite(mask).all():
-            failures.append(f"帧 {frame} 产品/遮罩包含非有限值")
+            fail("frame_completeness", "产品/遮罩包含非有限值")
             frame_report.append(entry)
             continue
         if reference_alpha is not None and not np.isfinite(reference_alpha).all():
-            failures.append(f"帧 {frame} 参考 Alpha 包含非有限值")
+            fail("frame_completeness", "参考 Alpha 包含非有限值")
             frame_report.append(entry)
             continue
 
@@ -287,6 +328,16 @@ def run_strict_qa(
         entry["mask_coverage"] = round(coverage, 4)
         binary_ratio = float(((mask > 0.95) | (mask < 0.05)).mean())
         entry["mask_binary_ratio"] = round(binary_ratio, 4)
+        # 颜色对照的参考选择：产品层是 display PNG 时用同空间显示主帧（AgX）；
+        # 产品层是 scene-linear EXR 时直接用 Beauty EXR。两者都无法取得时如实 NOT_VERIFIED。
+        if product_files[frame].suffix.lower() == ".png":
+            display_ref = read_display_reference(strict_root, frame)
+            if display_ref is not None and display_ref.shape[:2] != mask.shape:
+                fail("frame_completeness", f"显示参考与遮罩尺寸不一致：{display_ref.shape[:2]} / {mask.shape}")
+                frame_report.append(entry)
+                continue
+        else:
+            display_ref = reference
         core = erode(mask_binary, 2)
         zero_visibility_frames = set(
             int(item) for item in (snapshot.get("zero_visibility_frames") or [])
@@ -303,15 +354,15 @@ def run_strict_qa(
                 frame_report.append(entry)
                 continue
             if not alpha_empty:
-                failures.append(f"帧 {frame} 声明空可见帧但 Alpha 实证不为空")
+                fail("frame_completeness", "声明空可见帧但 Alpha 实证不为空")
             else:
-                failures.append(f"帧 {frame} 产品可见性合同缺失或 Alpha 实证不足")
+                fail("frame_completeness", "产品可见性合同缺失或 Alpha 实证不足")
             frame_report.append(entry)
             continue
         if coverage < float(thresholds["min_mask_coverage"]):
-            failures.append(f"帧 {frame} Mask 覆盖率过低 {coverage:.4f}")
+            fail("mask", f"Mask 覆盖率过低 {coverage:.4f}")
         if binary_ratio < float(thresholds["min_mask_binary_ratio"]):
-            failures.append(f"帧 {frame} Mask 不够二值 {binary_ratio:.4f}")
+            fail("mask", f"Mask 不够二值 {binary_ratio:.4f}")
 
         if reference_alpha is None:
             not_verified.append("参考 Alpha 不可用，无法验证轮廓/产品身份")
@@ -324,22 +375,27 @@ def run_strict_qa(
             entry["reference_contour_iou"] = round(iou, 4)
             contour_iou_min = min(contour_iou_min, iou)
             if iou < float(thresholds["contour_iou_min"]):
-                failures.append(f"帧 {frame} 产品轮廓 IoU 过低 {iou:.4f}")
+                fail("contour", f"产品轮廓 IoU 过低 {iou:.4f}")
 
         if core.any():
-            color_diff = np.mean(np.abs(product[core] - reference[core]))
-            color_mae_max = max(color_mae_max, float(color_diff))
-            entry["core_color_mae"] = round(float(color_diff), 6)
-            if color_diff > float(thresholds["color_core_mae_max"]):
-                failures.append(f"帧 {frame} 线性核心区 MAE 过高 {color_diff:.6f}")
+            if display_ref is None:
+                color_compared = False
+                not_verified.append("产品层与参考不在同一色彩空间且缺少同空间显示参考，颜色对照未验证")
+            else:
+                color_compared = True
+                color_diff = np.mean(np.abs(product[core] - display_ref[core]))
+                color_mae_max = max(color_mae_max, float(color_diff))
+                entry["core_color_mae"] = round(float(color_diff), 6)
+                if color_diff > float(thresholds["color_core_mae_max"]):
+                    fail("color_core", f"线性核心区 MAE 过高 {color_diff:.6f}")
 
             edge = dilate(mask_binary, 2) & ~core
-            if edge.any():
-                edge_diff = float(np.mean(np.abs(product[edge] - reference[edge])))
+            if edge.any() and display_ref is not None:
+                edge_diff = float(np.mean(np.abs(product[edge] - display_ref[edge])))
                 entry["edge_mae"] = round(edge_diff, 6)
                 edge_mae_max = max(edge_mae_max, edge_diff)
                 if edge_diff > float(thresholds["edge_mae_max"]):
-                    failures.append(f"帧 {frame} 边缘带 MAE 过高 {edge_diff:.6f}")
+                    fail("edge", f"边缘带 MAE 过高 {edge_diff:.6f}")
 
         for region in review_payload.get("logo_regions", []):
             y_slice, x_slice = _region_slice(region, mask.shape[0], mask.shape[1])
@@ -347,21 +403,31 @@ def run_strict_qa(
             region_coverage = float(region_mask.mean()) if region_mask.size else 0.0
             logo_min_coverage = min(logo_min_coverage, region_coverage)
             if region_coverage < float(thresholds["logo_mask_min_coverage"]):
-                failures.append(
-                    f"帧 {frame} Logo 区域 {region.get('label') or region} 覆盖不足 {region_coverage:.4f}"
-                )
+                fail("logo", f"Logo 区域 {region.get('label') or region} 覆盖不足 {region_coverage:.4f}")
                 continue
             region_core = region_mask & core[y_slice, x_slice]
             if not region_core.any():
-                failures.append(f"帧 {frame} Logo 区域 {region.get('label') or region} 缺少可比较核心像素")
+                fail("logo", f"Logo 区域 {region.get('label') or region} 缺少可比较核心像素")
                 continue
+            if display_ref is None:
+                logo_compared = False
+                not_verified.append("产品层与参考不在同一色彩空间且缺少同空间显示参考，Logo 颜色对照未验证")
+                continue
+            logo_compared = True
             region_diff = float(np.mean(np.abs(
-                product[y_slice, x_slice][region_core] - reference[y_slice, x_slice][region_core]
+                product[y_slice, x_slice][region_core] - display_ref[y_slice, x_slice][region_core]
             )))
             logo_mae_max = max(logo_mae_max, region_diff)
             if region_diff > float(thresholds["logo_core_mae_max"]):
-                failures.append(f"帧 {frame} Logo 核心区 MAE 过高 {region_diff:.6f}")
+                fail("logo", f"Logo 核心区 MAE 过高 {region_diff:.6f}")
         frame_report.append(entry)
+
+    for problem in problems:
+        shot_id, shot_name, shot_frame = _shot_for_frame(plan_payload, problem["frame"])
+        problem["shot"] = shot_id
+        problem["shot_name"] = shot_name
+        problem["shot_frame"] = shot_frame
+    problems.sort(key=lambda item: (item["frame"], item["check"]))
 
     checks = {
         "frame_completeness": {"status": "PASS"},
@@ -374,6 +440,17 @@ def run_strict_qa(
         "encoded_media": {"status": "NOT_VERIFIED", "reason": "压缩损伤/闪烁/可读性未接入"},
         "asset_hash": {"status": "NOT_VERIFIED", "reason": "缺少受控渲染资产 hash 证据"},
     }
+    if not color_compared:
+        checks["color_core"] = {
+            "status": "NOT_VERIFIED",
+            "reason": "缺少与产品层同一色彩空间的显示参考（display PNG 需要渲染主帧，scene EXR 才可直接对照 Beauty）",
+        }
+        checks["edge"] = checks["color_core"].copy()
+    if declared_logo_regions and not logo_compared:
+        checks["logo"] = {
+            "status": "NOT_VERIFIED",
+            "reason": "缺少与产品层同一色彩空间的显示参考，Logo 颜色对照未验证",
+        }
     if controlled_evidence:
         if controlled_evidence.get("producer_control") != "CONTROLLED_WORKER":
             checks["asset_hash"] = {
@@ -414,6 +491,7 @@ def run_strict_qa(
     for failure in failures:
         if "Logo" in failure:
             checks["logo"]["status"] = "FAIL"
+            checks["logo"]["reason"] = "存在 Logo 帧级失败（覆盖不足或核心区超差），见 problems"
         elif "轮廓" in failure:
             checks["contour"]["status"] = "FAIL"
         elif "核心区 MAE" in failure:
@@ -439,6 +517,7 @@ def run_strict_qa(
         "fatal_failures": fatal,
         "not_verified": sorted(set(not_verified)),
         "checks": checks,
+        "problems": problems,
         "frames": frame_report,
         "thresholds": thresholds,
         "threshold_set_id": thresholds.get("threshold_set_id"),

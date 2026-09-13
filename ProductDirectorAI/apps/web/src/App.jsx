@@ -3,7 +3,7 @@ import {
   Archive, ArrowClockwise, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
   Clock, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
   MagnifyingGlass, MonitorPlay, Package, PencilSimple, Play, Plus, Queue,
-  SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, WarningCircle, X,
+  ShieldCheck, SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, WarningCircle, X,
 } from "@phosphor-icons/react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -16,7 +16,7 @@ const navItems = [
   ["project", "项目", SquaresFour], ["products", "产品库", Cube],
   ["director", "导演台", SlidersHorizontal], ["storyboard", "分镜", FilmSlate],
   ["preview", "3D 预演", MonitorPlay], ["jobs", "渲染任务", Queue],
-  ["assets", "素材库", Archive], ["settings", "设置", Gear],
+  ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck], ["settings", "设置", Gear],
 ];
 const defaultShots = [
   { id: "shot_01", name: "正面推近", camera: "dolly_in", focal_length_mm: 35, duration_frames: 48 },
@@ -47,6 +47,7 @@ function Pill({ status = "DRAFT" }) {
     CANCEL_REQUESTED: ["取消中", "warning"], CANCELLED: ["已取消", "neutral"],
     FAILED: ["失败", "danger"], QA_REJECTED: ["质检驳回", "danger"],
     SUCCEEDED: ["已完成", "success"], VERIFICATION_PASSED: ["验证通过·不可发布", "warning"],
+    NOT_VERIFIED: ["未核实", "warning"],
   };
   const [text, tone] = map[status] || [status, "neutral"];
   return <span className={`pill ${tone}`}><i />{text}</span>;
@@ -256,6 +257,164 @@ function Settings({ health, provider, onSaveProvider, onTestProvider, busy }) {
       <div className="gpu-guidance"><WarningCircle weight="fill" /><p><strong>你截图里的 5090 配置可以开。</strong><span>单卡、14 核 64GB、按量计费；系统盘从 50GB 调到至少 100GB，ComfyUI/视频模型建议 200GB 或独立云盘。先跑 2–5 小时基准，不先买包月。</span></p></div>
       <div className="gpu-card-footer"><small>V1 仅展示已核对的选型，不保存云账号、不创建实例、不产生费用。</small><a href="https://compshare.cn/price-list" target="_blank" rel="noreferrer">查看官方价格 <CaretRight /></a></div>
     </section>
+  </section>;
+}
+
+const fidelityTabs = [["versions", "版本审核"], ["qa", "质检报告"], ["viewer", "通道查看"]];
+const viewerChannels = [
+  ["product", "产品层 product"], ["mask", "遮罩 mask"], ["background", "背景 background"],
+  ["composite", "合成 composite"], ["passes_mask", "通道遮罩 passes/mask"],
+];
+const checkLabels = {
+  frame_completeness: "帧完整性", color_core: "核心区颜色", edge: "边缘带", contour: "轮廓",
+  logo: "Logo 保护", product_id: "产品身份", dimension: "尺寸", encoded_media: "编码成片",
+  asset_hash: "资产哈希",
+};
+
+function FidelityPage({ jobs }) {
+  const [tab, setTab] = useState("versions");
+  const [versions, setVersions] = useState([]);
+  const [selectedVersionId, setSelectedVersionId] = useState("");
+  const [reviews, setReviews] = useState([]);
+  const [policies, setPolicies] = useState([]);
+  const [selectedJobId, setSelectedJobId] = useState("");
+  const [qaRows, setQaRows] = useState([]);
+  const [report, setReport] = useState(null);
+  const [channel, setChannel] = useState("product");
+  const [frame, setFrame] = useState(1);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState(null);
+
+  useEffect(() => {
+    apiRequest("/product-versions").then(async (response) => {
+      if (response.ok) {
+        const rows = await response.json();
+        setVersions(rows);
+        if (rows[0]) loadVersion(rows[0].id);
+      }
+    }).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (notice) { const timer = setTimeout(() => setNotice(null), 5000); return () => clearTimeout(timer); }
+  }, [notice]);
+
+  async function loadVersion(id) {
+    setSelectedVersionId(id); setReviews([]); setPolicies([]);
+    const [rv, pl] = await Promise.all([
+      apiRequest(`/product-versions/${id}/reviews`),
+      apiRequest(`/product-versions/${id}/fidelity-policies`),
+    ]);
+    if (rv.ok) setReviews(await rv.json());
+    if (pl.ok) setPolicies(await pl.json());
+  }
+  async function loadQa(jobId) {
+    setSelectedJobId(jobId); setReport(null); setQaRows([]);
+    const response = await apiRequest(`/qa-reports?job_id=${encodeURIComponent(jobId)}`);
+    if (response.ok) setQaRows(await response.json());
+  }
+  async function openReport(id) {
+    const response = await apiRequest(`/qa-reports/${id}`);
+    if (response.ok) setReport(await response.json());
+  }
+  async function decide(decision) {
+    if (!report) return; setBusy(true);
+    try {
+      const response = await apiRequest(`/qa-reports/${report.id}/decisions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision, manifest_hash: report.manifest_sha256, notes: note }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || "审批提交失败");
+      setNotice(["success", `已提交：${decision === "APPROVED" ? "批准" : "拒绝"}（Manifest ${String(report.manifest_sha256).slice(0, 12)}…）`]);
+      openReport(report.id);
+      if (selectedJobId) loadQa(selectedJobId);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  function jumpToProblem(problem) {
+    setChannel("composite"); setFrame(problem.frame); setTab("viewer");
+  }
+
+  const selectedVersion = versions.find((item) => item.id === selectedVersionId);
+  const review = reviews[0];
+  const problems = report?.report?.problems || [];
+  const reportChecks = report?.report?.checks || {};
+  const canApprove = report?.status === "PASS";
+  const frameMax = report?.report?.frame_count || 144;
+
+  return <section className="page">
+    <div className="page-head"><div><b>V3 PRODUCT FIDELITY</b><h1>产品保真审核</h1><p>版本审核与保真策略、质检报告、问题帧定位和通道查看。批准按钮始终注明所批 Manifest hash。</p></div></div>
+    <div className="tabs">{fidelityTabs.map(([id, label]) => <button className={tab === id ? "active" : ""} onClick={() => setTab(id)} key={id}>{label}</button>)}</div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+
+    {tab === "versions" && <div className="fidelity-grid">
+      <section className="card">
+        <div className="card-head"><div><h2>产品版本</h2><span className="count">{versions.length}</span></div><small>批准后的版本不可改写；改动会生成新版本</small></div>
+        {versions.length ? <div className="table-wrap"><table><thead><tr><th>版本</th><th>状态</th><th>创建时间</th><th /></tr></thead><tbody>{versions.map((item) => <tr className={selectedVersionId === item.id ? "selected" : ""} key={item.id}><td><strong>v{item.version}</strong> <small>{item.id.slice(0, 8)}</small></td><td><Pill status={item.status === "APPROVED" ? "SUCCEEDED" : "DRAFT"} /></td><td>{formatTime(item.created_at)}</td><td><button onClick={() => loadVersion(item.id)}>查看</button></td></tr>)}</tbody></table></div> : <div className="table-empty"><Cube /><strong>还没有产品版本</strong><span>批准计划后会生成产品版本。</span></div>}
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>版本审核</h2>{review && <Pill status={review.decision === "APPROVED" ? "SUCCEEDED" : "DRAFT"} />}</div><small>冻结记录 · 哈希 {review?.payload_sha256?.slice(0, 12) || "—"}…</small></div>
+        {review ? <div className="kv-list">
+          <p><b>审核结论</b><span>{review.decision === "APPROVED" ? "已批准" : review.decision}</span></p>
+          <p><b>来源类型</b><span>{review.review.source_kind === "cad" ? "官方 CAD / 3D" : review.review.source_kind === "image" ? "单图重建（未观测面保持 unverified）" : review.review.source_kind || "—"}</span></p>
+          <p><b>已核实尺寸</b><span>{Object.entries(review.review.verified_dimensions || {}).map(([k, v]) => `${k}: ${v}mm`).join(" · ") || "未提供"}</span></p>
+          <p><b>视角覆盖</b><span>{(review.review.view_coverage || []).join("、") || "未声明"}</span></p>
+          <p><b>未核实区域</b><span>{(review.review.unverified_regions || []).map((r) => `${r.region || r.label || JSON.stringify(r)}`).join("；") || "无"}</span></p>
+          <p><b>Logo 区域</b><span>{(review.review.logo_regions || []).map((r) => `${r.label || "logo"} (${r.x}, ${r.y}, ${r.width} × ${r.height})`).join("；") || "未标记"}</span></p>
+          <p><b>相机可见性限制</b><span>{(review.review.camera_visibility_constraints || []).join("；") || "无"}</span></p>
+          {review.review.notes && <p><b>备注</b><span>{review.review.notes}</span></p>}
+        </div> : <div className="table-empty"><ListChecks /><strong>该版本还没有冻结审核</strong><span>提交审核后核实结果会绑定到版本。</span></div>}
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>保真策略</h2><span className="count">{policies.length}</span></div><small>策略版本化、不可改写</small></div>
+        {policies.length ? <div className="table-wrap"><table><thead><tr><th>版本</th><th>模式</th><th>保护区域</th><th>允许操作</th></tr></thead><tbody>{policies.map((item) => <tr key={item.id}><td><strong>v{item.version}</strong></td><td><Pill status={item.mode === "STRICT" ? "SUCCEEDED" : "DRAFT"} /></td><td>{(item.policy.protected_regions || []).map((r) => r.label || r.region || JSON.stringify(r)).join("、") || "—"}</td><td>{(item.policy.allowed_operations || []).join("、") || "—"}</td></tr>)}</tbody></table></div> : <div className="table-empty"><ShieldCheck /><strong>还没有保真策略</strong><span>STRICT 模式会保护已批准资产。</span></div>}
+      </section>
+    </div>}
+
+    {tab === "qa" && <div className="fidelity-grid">
+      <section className="card">
+        <div className="card-head"><div><h2>任务与质检报告</h2><span className="count">{qaRows.length}</span></div><small>选择任务查看其 QA 报告</small></div>
+        <div className="qa-pick">
+          <select value={selectedJobId} onChange={(event) => loadQa(event.target.value)}>
+            <option value="">选择渲染任务…</option>
+            {jobs.map((item) => <option key={item.id} value={item.id}>任务 {item.id.slice(0, 8)} · {item.status}</option>)}
+          </select>
+        </div>
+        {qaRows.length ? <div className="table-wrap"><table><thead><tr><th>报告</th><th>状态</th><th>阈值集</th><th>审批</th><th /></tr></thead><tbody>{qaRows.map((item) => <tr className={report?.id === item.id ? "selected" : ""} key={item.id}><td><strong>{item.id.slice(0, 8)}</strong><small> {formatTime(item.created_at)}</small></td><td><Pill status={item.status === "PASS" ? "SUCCEEDED" : item.status === "FAIL" ? "QA_REJECTED" : "NOT_VERIFIED"} /></td><td><small>{item.threshold_set_version}</small></td><td>{item.decision ? `${item.decision}${item.decision_valid === false ? " · 已失效" : ""}` : "待审批"}</td><td><button onClick={() => openReport(item.id)}>查看</button></td></tr>)}</tbody></table></div> : <div className="table-empty"><ListChecks /><strong>该任务还没有 QA 报告</strong><span>Strict 运行闭环会生成质检报告。</span></div>}
+      </section>
+      {report && <section className="card qa-detail">
+        <div className="card-head"><div><h2>QA 报告 {report.id.slice(0, 8)}</h2><Pill status={report.status === "PASS" ? "SUCCEEDED" : report.status === "FAIL" ? "QA_REJECTED" : "NOT_VERIFIED"} /></div><small>阈值集 {report.threshold_set_id} · {report.threshold_set_version}</small></div>
+        <div className="kv-list">
+          <p><b>Manifest 哈希</b><span className="mono">{report.manifest_sha256}</span></p>
+          <p><b>绑定哈希</b><span className="mono">{report.binding_sha256}</span></p>
+          <p><b>当前审批</b><span>{report.effective_decision || "未审批"}{report.decision_valid === false ? ` · 已失效：${report.decision_invalid_reason || "输入已变化"}` : ""}</span></p>
+          <p><b>未核实项</b><span>{(report.report.not_verified || []).join("；") || "无"}</span></p>
+        </div>
+        <h3>检查项</h3>
+        <div className="table-wrap"><table><thead><tr><th>检查</th><th>状态</th><th>摘要</th></tr></thead><tbody>{Object.entries(reportChecks).map(([key, check]) => <tr key={key}><td>{checkLabels[key] || key}</td><td><Pill status={check.status === "PASS" ? "SUCCEEDED" : check.status === "FAIL" ? "QA_REJECTED" : "DRAFT"} /></td><td><small>{check.reason || Object.entries(check).filter(([k]) => k !== "status").map(([k, v]) => `${k}=${v}`).join(" · ")}</small></td></tr>)}</tbody></table></div>
+        <h3>问题帧 {problems.length ? `（${problems.length}）` : ""}</h3>
+        {problems.length ? <div className="table-wrap"><table><thead><tr><th>帧</th><th>镜头</th><th>镜内帧</th><th>检查</th><th>原因</th><th /></tr></thead><tbody>{problems.map((problem, index) => <tr key={index}><td><strong>#{problem.frame}</strong></td><td>{problem.shot_name || problem.shot || "—"}</td><td>{problem.shot_frame || "—"}</td><td>{checkLabels[problem.check] || problem.check}</td><td><small>{problem.reason}</small></td><td><button onClick={() => jumpToProblem(problem)}>定位</button></td></tr>)}</tbody></table></div> : <p className="qa-empty-note">没有帧级问题。</p>}
+        <div className="qa-decision">
+          <label><span>审批备注</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="审批说明（可选）" /></label>
+          <button className="primary" disabled={busy || !canApprove} title={canApprove ? `批准 Manifest ${report.manifest_sha256}` : "QA 状态不是 PASS，不能批准为 Strict 成果"} onClick={() => decide("APPROVED")}><Check weight="fill" />批准（Manifest {String(report.manifest_sha256).slice(0, 10)}…）</button>
+          <button className="danger" disabled={busy} onClick={() => decide("REJECTED")}><X />拒绝</button>
+        </div>
+      </section>}
+    </div>}
+
+    {tab === "viewer" && <div className="fidelity-grid">
+      <section className="card channel-viewer">
+        <div className="card-head"><div><h2>通道查看器</h2></div><small>beauty/alpha/depth/normal 为 EXR 原始通道，当前只提供可在线预览的 PNG 通道</small></div>
+        {report ? <div className="viewer-controls">
+          <label><span>通道</span><select value={channel} onChange={(event) => setChannel(event.target.value)}>{viewerChannels.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label><span>帧（1–{frameMax}）</span><input type="number" min="1" max={frameMax} value={frame} onChange={(event) => setFrame(Math.max(1, Math.min(frameMax, Number(event.target.value) || 1)))} /></label>
+          <span className="viewer-src">Run {report.run_id.slice(0, 8)}</span>
+        </div> : <div className="table-empty"><MonitorPlay /><strong>先选择一份 QA 报告</strong><span>查看器按报告的 Run 定位 strict 产物目录。</span></div>}
+        {report && <div className="viewer-stage"><img key={`${report.run_id}-${channel}-${frame}`} src={`${API}/runs/${report.run_id}/strict-artifacts/${channel}/${frame}`} alt={`${channel} 帧 ${frame}`} onError={(event) => { event.currentTarget.style.opacity = 0.25; }} /></div>}
+        {report && problems.length > 0 && <div className="viewer-problems"><b>问题帧快捷跳转</b>{problems.slice(0, 12).map((problem, index) => <button key={index} onClick={() => { setChannel("composite"); setFrame(problem.frame); }}>#{problem.frame}</button>)}</div>}
+      </section>
+    </div>}
   </section>;
 }
 
@@ -482,7 +641,7 @@ export function App() {
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">

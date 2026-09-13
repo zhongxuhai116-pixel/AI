@@ -3306,6 +3306,66 @@ def run_controlled_blender_passes(
     return {"passed": True, "output": manifest_path, "manifest_path": manifest_path, "manifest": manifest}
 
 
+def _persist_controlled_verification_qa(
+    job_id: str,
+    run_dir: Path,
+    plan_snapshot: dict,
+    output_spec: OutputSpec,
+    strict_snapshot: dict,
+    policy_payload: dict,
+    controlled_evidence: dict | None,
+    asset_path: str | None,
+    manifest_path: Path,
+) -> str:
+    """受控渲染验证小样的 QA 报告：真实 QA 引擎只测渲染保真（产品 vs Beauty 参考、
+    轮廓 IoU、Logo 区域）；未合成/无成片编码的检查如实 NOT_VERIFIED，发布门继续拒绝。
+    保证每条 Strict Run 都有 QA 记录，不为"验证小样"静默跳过 QA。"""
+    strict_root = run_dir / "strict"
+    with connect() as db:
+        review_row = db.execute(
+            "SELECT payload FROM product_reviews WHERE id = ?", (strict_snapshot["product_review_id"],),
+        ).fetchone()
+        pv_row = db.execute(
+            "SELECT project_id FROM product_versions WHERE id = ?", (strict_snapshot["product_version_id"],),
+        ).fetchone()
+        threshold_set = load_qa_threshold_set(
+            db, strict_snapshot["owner_id"], (pv_row["project_id"] if pv_row else DEFAULT_PROJECT_ID), None, None
+        )
+        run_id = _latest_run_id_for_job(db, job_id)
+        evidence_row = db.execute(
+            "SELECT controlled_render_evidence_json FROM runs WHERE id = ?", (run_id,),
+        ).fetchone()
+    if not review_row:
+        return ""
+    # 受控渲染刚写完的证据必须重新读取：execute_job 局部变量是渲染前的旧值。
+    if controlled_evidence is None and evidence_row and evidence_row["controlled_render_evidence_json"]:
+        try:
+            controlled_evidence = json.loads(evidence_row["controlled_render_evidence_json"])
+        except json.JSONDecodeError:
+            controlled_evidence = None
+    try:
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    manifest_sha256 = hashlib.sha256(_canonical_json_text(manifest_payload).encode("utf-8")).hexdigest()
+    qa_report = strict_qa.run_strict_qa(
+        strict_root,
+        plan_snapshot,
+        output_spec,
+        strict_snapshot,
+        policy_payload,
+        json.loads(review_row["payload"]),
+        threshold_set["payload"],
+        controlled_evidence=controlled_evidence,
+        media_report=None,
+        media_file=None,
+        asset_path=Path(asset_path) if asset_path else None,
+    )
+    (strict_root / "qa_report.json").write_text(json.dumps(qa_report, ensure_ascii=False, indent=2), encoding="utf-8")
+    with connect() as db:
+        return _persist_qa_report(db, run_id, job_id, qa_report, threshold_set, manifest_sha256)
+
+
 def _run_strict_source_validator(strict_root: Path, output_spec: OutputSpec) -> tuple[dict | None, str | None]:
     report_path = strict_root / "source_report.json"
     cmd = [
@@ -3662,6 +3722,13 @@ def execute_claimed_job(job_id: str, worker_id: str, lease_epoch: int) -> None:
                                error=None)
                     release_worker_lease(job_id, worker_id, lease_epoch, "worker.completed")
                     return
+                # 未绑定背景工作流：受控渲染验证小样。仍运行真实 QA 引擎并落库，
+                # 合成/编码检查如实 NOT_VERIFIED；发布门继续拒绝。
+                _persist_controlled_verification_qa(
+                    job_id, run_dir, plan_snapshot, output_spec, strict_snapshot, policy_payload,
+                    controlled_evidence, asset["path"],
+                    Path(controlled_result["manifest_path"]),
+                )
                 update_job(
                     job_id, status=VERIFICATION_PASSED, stage="VERIFIED_SAMPLE", progress=100,
                     output_path=_storage_reference(job_id, str(controlled_result["manifest_path"])),
@@ -4643,6 +4710,40 @@ def create_plan(request: PlanRequest) -> dict:
     }
 
 
+@app.get("/api/v1/plans/{plan_id}/contracts")
+def list_plan_contracts(
+    plan_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> list[dict]:
+    """计划合同版本列表（V3 审核界面创建 Strict Run 时需要冻结合同 id）。"""
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        plan = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if not plan:
+            raise HTTPException(404, "计划不存在")
+        rows = db.execute(
+            "SELECT pc.* FROM plan_contracts pc "
+            "JOIN product_versions pv ON pv.id = pc.product_version_id "
+            "WHERE pc.plan_id = ? AND pv.owner_id = ? AND pv.project_id = ? "
+            "ORDER BY pc.version DESC",
+            (plan_id, owner_id, project_id),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "plan_id": row["plan_id"],
+            "product_version_id": row["product_version_id"],
+            "version": row["version"],
+            "contract_status": row["contract_status"],
+            "payload_sha256": row["payload_sha256"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
 @app.post("/api/v1/plans/{plan_id}/approve")
 def approve_plan(plan_id: str, request: PlanApproval) -> dict:
     owner_id, _, project_id = normalize_contract_context(request.owner_id, request.project_id)
@@ -5027,6 +5128,67 @@ def get_qa_report(report_id: str) -> dict:
             raise HTTPException(404, "QA 报告不存在")
         resolve_run_owner_scope(row["run_id"])
         return qa_report_public(row, db)
+
+
+@app.get("/api/v1/qa-reports")
+def list_qa_reports(
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+    job_id: str | None = None,
+    run_id: str | None = None,
+) -> list[dict]:
+    """QA 报告列表（可按 job/run 过滤）；供审核界面按任务定位质检记录。"""
+    conditions: list[str] = []
+    values: list[str] = []
+    if job_id:
+        conditions.append("job_id = ?")
+        values.append(job_id)
+    if run_id:
+        conditions.append("run_id = ?")
+        values.append(run_id)
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    with connect() as db:
+        rows = db.execute(
+            f"SELECT * FROM qa_reports{where} ORDER BY created_at DESC LIMIT 200",
+            values,
+        ).fetchall()
+    return [qa_report_public(row) for row in rows]
+
+
+STRICT_PREVIEW_CHANNELS: dict[str, tuple[str, str, str]] = {
+    # channel -> (strict 子目录, 文件名模板, media type)；只放浏览器可预览的 PNG 通道。
+    # EXR 通道（beauty/alpha/depth/normal）需要专门查看器，当前接口如实在 404 中说明。
+    "product": ("product", "frame_{frame:04d}.png", "image/png"),
+    "mask": ("mask", "frame_{frame:04d}.png", "image/png"),
+    "background": ("background", "frame_{frame:04d}.png", "image/png"),
+    "composite": ("composite_out", "composite_{frame:04d}.png", "image/png"),
+    "passes_mask": ("passes/mask", "frame_{frame:04d}.png", "image/png"),
+}
+
+
+@app.get("/api/v1/runs/{run_id}/strict-artifacts/{channel}/{frame}")
+def get_strict_artifact_frame(run_id: str, channel: str, frame: int) -> FileResponse:
+    """V3-06 通道查看器的受鉴权帧预览：只放行白名单 PNG 通道与合法帧号。"""
+    if channel not in STRICT_PREVIEW_CHANNELS:
+        raise HTTPException(
+            404,
+            "通道不可预览或不存在；beauty/alpha/depth/normal 为 EXR 原始通道，需专用查看器",
+        )
+    if frame < 1 or frame > 100000:
+        raise HTTPException(404, "帧号无效")
+    resolve_run_owner_scope(run_id)
+    with connect() as db:
+        row = db.execute("SELECT job_id FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Run 不存在")
+    folder, pattern, media_type = STRICT_PREVIEW_CHANNELS[channel]
+    strict_root = (RUNS / row["job_id"] / "strict").resolve()
+    target = (strict_root / folder / pattern.format(frame=frame)).resolve()
+    if strict_root not in target.parents:
+        raise HTTPException(403, "非法路径")
+    if not target.is_file():
+        raise HTTPException(404, f"该通道帧不存在：{channel} 帧 {frame}")
+    return FileResponse(target, media_type=media_type)
 
 
 @app.post("/api/v1/qa-reports/{report_id}/decisions")

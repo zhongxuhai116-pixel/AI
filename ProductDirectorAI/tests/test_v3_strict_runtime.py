@@ -653,6 +653,26 @@ class V3StrictRuntimeTests(unittest.TestCase):
         self.assertFalse(release["eligible"], release)
         self.assertTrue(release["verification_only"], release)
 
+    def test_controlled_verification_sample_persists_qa_report(self) -> None:
+        """未绑定背景工作流的受控渲染小样也必须落库 QA 报告（不为验证小样静默跳过 QA）。"""
+        _, job_id, _, _ = self._create_strict_run()
+
+        main.execute_job(job_id)
+
+        job = self.client.get(f"/api/v1/jobs/{job_id}").json()
+        self.assertEqual(job["status"], "VERIFICATION_PASSED", job)
+        with main.connect() as db:
+            row = db.execute(
+                "SELECT * FROM qa_reports WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        payload = json.loads(row["payload"])
+        self.assertEqual(payload["schema_version"], "1.0")
+        self.assertIn("problems", payload)
+        self.assertIn("checks", payload)
+        self.assertTrue(row["manifest_sha256"])
+
     def test_controlled_render_rejects_asset_hash_mismatch(self) -> None:
         _, job_id, _, _ = self._create_strict_run()
         with main.connect() as db:

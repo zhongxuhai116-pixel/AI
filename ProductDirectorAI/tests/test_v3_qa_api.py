@@ -125,6 +125,8 @@ class V3QaApiTests(unittest.TestCase):
         for index in range(1, rt.FRAME_COUNT + 1):
             name = f"frame_{index:04d}.png"
             rt._write_rgba(strict_root / "product" / name, rt.PRODUCT_SRGB)
+            # 同空间显示参考（AgX 渲染主帧，颜色对照合同的比较基准）
+            rt._write_rgba(strict_root / name, rt.PRODUCT_SRGB)
             rt._write_rgba(strict_root / "mask" / name, (0, 0, 0))
             rt._write_rgba(strict_root / "passes" / "mask" / name, (0, 0, 0))
             rt._write_rgb(strict_root / "background" / name, (10, 10, 10))
@@ -272,6 +274,66 @@ class V3QaApiTests(unittest.TestCase):
         # 负例：产品变色 → 线性核心区 MAE 超阈值
         self._tamper_product_color(job_id, range(30, 36), (200, 30, 30))
         payload = self._run_qa_expect_fail(job_id, "核心区")
+
+    def test_list_qa_reports_and_structured_problems(self) -> None:
+        job_id, _, _ = self._create_strict_run()
+        self._write_strict_inputs(job_id)
+        main.execute_job(job_id)
+        listed = self.client.get("/api/v1/qa-reports", params={"job_id": job_id})
+        self.assertEqual(listed.status_code, 200, listed.text)
+        rows = listed.json()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["job_id"], job_id)
+        self.assertTrue(rows[0]["run_id"])
+        # 正例：结构化问题列表存在且为空
+        self.assertIsInstance(rows[0]["report"].get("problems"), list)
+        self.assertEqual(rows[0]["report"]["problems"], [])
+        # 负例：Logo 抹除后问题带 check/frame/shot 定位
+        self._tamper_product_pixels(job_id, [5], (3, 3, 5, 4), (255, 0, 0))
+        self._run_qa_expect_fail(job_id, "Logo")
+        listed = self.client.get("/api/v1/qa-reports", params={"job_id": job_id})
+        self.assertEqual(listed.status_code, 200, listed.text)
+        rows = listed.json()
+        self.assertEqual(len(rows), 2, rows)
+        problems = rows[0]["report"]["problems"]
+        self.assertTrue(problems, rows[0]["report"])
+        problem = problems[0]
+        self.assertEqual(problem["frame"], 5)
+        self.assertIn(problem["check"], {"logo", "color_core"})
+        self.assertIn("核心区", problem["reason"])
+        self.assertIsNotNone(problem["shot"])
+        self.assertIsNotNone(problem["shot_frame"])
+
+    def test_strict_artifact_frame_preview(self) -> None:
+        job_id, _, _ = self._create_strict_run()
+        self._write_strict_inputs(job_id)
+        main.execute_job(job_id)
+        run_id = self._run_id(job_id)
+        for channel in ("product", "mask", "background", "composite", "passes_mask"):
+            response = self.client.get(f"/api/v1/runs/{run_id}/strict-artifacts/{channel}/1")
+            self.assertEqual(response.status_code, 200, (channel, response.text))
+            self.assertEqual(response.headers["content-type"], "image/png", channel)
+            self.assertTrue(response.content, channel)
+        missing_frame = self.client.get(f"/api/v1/runs/{run_id}/strict-artifacts/product/9999")
+        self.assertEqual(missing_frame.status_code, 404, missing_frame.text)
+        exr_channel = self.client.get(f"/api/v1/runs/{run_id}/strict-artifacts/beauty/1")
+        self.assertEqual(exr_channel.status_code, 404, exr_channel.text)
+        bad_channel = self.client.get(f"/api/v1/runs/{run_id}/strict-artifacts/../../etc/passwd/1")
+        self.assertEqual(bad_channel.status_code, 404, bad_channel.text)
+
+    def test_list_plan_contracts(self) -> None:
+        plan = self._create_plan()
+        approved = self.client.post(f"/api/v1/plans/{plan['id']}/approve", json={"approved": True})
+        self.assertEqual(approved.status_code, 200, approved.text)
+        response = self.client.get(f"/api/v1/plans/{plan['id']}/contracts")
+        self.assertEqual(response.status_code, 200, response.text)
+        rows = response.json()
+        self.assertTrue(rows, rows)
+        self.assertEqual(rows[0]["plan_id"], plan["id"])
+        self.assertTrue(rows[0]["product_version_id"])
+        self.assertEqual(rows[0]["version"], 1)
+        missing = self.client.get("/api/v1/plans/00000000-0000-0000-0000-000000000000/contracts")
+        self.assertEqual(missing.status_code, 404, missing.text)
 
     def test_threshold_set_version_is_frozen(self) -> None:
         response = self.client.post(
