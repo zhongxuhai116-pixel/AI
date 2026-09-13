@@ -51,6 +51,7 @@ from .strict_background import (
     write_background_evidence,
 )
 from . import strict_qa
+from . import interaction_geometry
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -446,6 +447,39 @@ def initialize_db() -> None:
               decision_notes TEXT,
               decision_manifest_sha256 TEXT,
               decided_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS interaction_anchors (
+              id TEXT PRIMARY KEY,
+              product_version_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              name TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'DRAFT',
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              approved_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (product_version_id, revision)
+            );
+            CREATE TABLE IF NOT EXISTS anchor_sets (
+              id TEXT PRIMARY KEY,
+              product_version_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE (product_version_id, revision)
+            );
+            CREATE TABLE IF NOT EXISTS characters (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'DRAFT',
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
@@ -5246,6 +5280,332 @@ def decide_qa_report(report_id: str, request: QaDecisionRequest) -> dict:
         )
         updated = db.execute("SELECT * FROM qa_reports WHERE id = ?", (report_id,)).fetchone()
     return qa_report_public(updated, db)
+
+
+# ---------------------------------------------------------------------------
+# V4-01：交互锚点 / 人物 / 动作模板合同与版本化
+# ---------------------------------------------------------------------------
+
+V4_ANCHOR_ACTIONS = {"press_button", "single_punch_target", "approach", "celebrate", "two_person_turn"}
+V4_MOTION_TEMPLATES = [
+    {
+        "id": "approach",
+        "label": "走近产品",
+        "skeleton_version": "pd-proxy-v1",
+        "duration_frames": 48,
+        "contact_events": [],
+        "allowed_speed_range": [0.8, 1.2],
+        "requires_anchor": False,
+    },
+    {
+        "id": "press_button",
+        "label": "按按钮",
+        "skeleton_version": "pd-proxy-v1",
+        "duration_frames": 72,
+        "contact_events": [{"event": "contact", "frame_offset": 36}, {"event": "press", "frame_offset": 44}],
+        "allowed_speed_range": [0.9, 1.1],
+        "requires_anchor": True,
+    },
+    {
+        "id": "single_punch_target",
+        "label": "击打指定靶点",
+        "skeleton_version": "pd-proxy-v1",
+        "duration_frames": 96,
+        "contact_events": [{"event": "impact", "frame_offset": 60}],
+        "allowed_speed_range": [0.9, 1.15],
+        "requires_anchor": True,
+    },
+    {
+        "id": "celebrate",
+        "label": "庆祝",
+        "skeleton_version": "pd-proxy-v1",
+        "duration_frames": 72,
+        "contact_events": [],
+        "allowed_speed_range": [0.85, 1.25],
+        "requires_anchor": False,
+    },
+]
+V4_MOTION_TEMPLATES_BY_ID = {item["id"]: item for item in V4_MOTION_TEMPLATES}
+
+
+class AnchorRequest(BaseModel):
+    """交互锚点合同：产品本地规范坐标（bbox 归一化 0..1）+ 单位法线 + 半径 + 允许动作。"""
+    name: str = Field(min_length=1, max_length=80)
+    position_m: list[float] = Field(min_length=3, max_length=3)
+    normal: list[float] = Field(min_length=3, max_length=3)
+    radius_m: float
+    allowed_actions: list[str] = Field(min_length=1, max_length=8)
+    notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_contract(self):
+        failures = interaction_geometry.anchor_payload_ok(self.model_dump())
+        if failures:
+            raise ValueError("；".join(failures))
+        for action in self.allowed_actions:
+            if action not in V4_ANCHOR_ACTIONS:
+                raise ValueError(f"不允许的动作类型：{action}（可用: {sorted(V4_ANCHOR_ACTIONS)}）")
+        return self
+
+
+class AnchorSetApproveRequest(BaseModel):
+    revision: int = Field(ge=1)
+
+
+class CharacterRequest(BaseModel):
+    """人物规格：合成 Proxy 或授权素材，真实素材必须带许可/同意记录。"""
+    name: str = Field(min_length=1, max_length=80)
+    source: Literal["synthesized_proxy", "licensed_asset"]
+    height_range_m: list[float] = Field(min_length=2, max_length=2)
+    asset_refs: list[str] = Field(default_factory=list, max_length=16)
+    license_record: str = Field(default="", max_length=4000)
+    consent_record: str = Field(default="", max_length=4000)
+    notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_character(self):
+        low, high = self.height_range_m
+        if not (0.5 <= low <= high <= 2.5):
+            raise ValueError("height_range_m 必须在 [0.5, 2.5] 内且递增")
+        if self.source == "licensed_asset" and not (self.license_record and self.consent_record):
+            raise ValueError("授权素材必须提供 license_record 与 consent_record")
+        if self.source == "synthesized_proxy" and (self.license_record or self.consent_record):
+            # 合成人物也可以记录来源说明，不禁止；但真实素材记录不得缺失（上一条已覆盖）。
+            pass
+        return self
+
+
+def _anchor_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "product_version_id": row["product_version_id"],
+        "revision": row["revision"],
+        "name": row["name"],
+        "status": row["status"],
+        "payload_sha256": row["payload_sha256"],
+        "approved_at": row["approved_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "anchor": json.loads(row["payload"]),
+    }
+
+
+def _canonical_anchor_set_payload(version_id: str, revision: int, anchor_rows: list[dict]) -> tuple[str, str]:
+    payload = {
+        "schema_version": "1.0",
+        "product_version_id": version_id,
+        "revision": revision,
+        "anchors": [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "position_m": anchor_payload["position_m"],
+                "normal": anchor_payload["normal"],
+                "radius_m": anchor_payload["radius_m"],
+                "allowed_actions": anchor_payload["allowed_actions"],
+            }
+            for row in anchor_rows
+            for anchor_payload in [json.loads(row["payload"])]
+        ],
+    }
+    text = _canonical_json_text(payload)
+    return text, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@app.get("/api/v1/motion-templates")
+def list_motion_templates() -> list[dict]:
+    """V4 必需动作模板：approach / press_button / single_punch_target / celebrate。"""
+    return V4_MOTION_TEMPLATES
+
+
+@app.post("/api/v1/product-versions/{product_version_id}/anchors", status_code=201)
+def create_anchor(product_version_id: str, request: AnchorRequest) -> dict:
+    """创建交互锚点草稿。锚点绑定产品版本；产品版本升级后不自动沿用（需重新映射并确认）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    load_product_version_for_owner(product_version_id, owner_id, project_id)
+    payload = request.model_dump()
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    with connect() as db:
+        begin_immediate(db)
+        latest = db.execute(
+            "SELECT COALESCE(MAX(revision), 0) AS revision FROM interaction_anchors WHERE product_version_id = ?",
+            (product_version_id,),
+        ).fetchone()
+        revision = int(latest["revision"]) + 1
+        anchor_id = str(uuid.uuid4())
+        now = utc_now()
+        db.execute(
+            "INSERT INTO interaction_anchors(id, product_version_id, revision, name, status, payload, payload_sha256, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?)",
+            (anchor_id, product_version_id, revision, request.name, payload_text, digest, now, now),
+        )
+        row = db.execute("SELECT * FROM interaction_anchors WHERE id = ?", (anchor_id,)).fetchone()
+    return _anchor_public(row)
+
+
+@app.get("/api/v1/product-versions/{product_version_id}/anchors")
+def list_anchors(
+    product_version_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    load_product_version_for_owner(product_version_id, owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM interaction_anchors WHERE product_version_id = ? ORDER BY revision DESC",
+            (product_version_id,),
+        ).fetchall()
+    return [_anchor_public(row) for row in rows]
+
+
+@app.patch("/api/v1/anchors/{anchor_id}")
+def update_anchor(anchor_id: str, request: AnchorRequest) -> dict:
+    """修改锚点 → 生成新修订（旧修订不可改写）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute("SELECT * FROM interaction_anchors WHERE id = ?", (anchor_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "锚点不存在")
+    load_product_version_for_owner(row["product_version_id"], owner_id, project_id)
+    payload = request.model_dump()
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    with connect() as db:
+        begin_immediate(db)
+        latest = db.execute(
+            "SELECT COALESCE(MAX(revision), 0) AS revision FROM interaction_anchors WHERE product_version_id = ?",
+            (row["product_version_id"],),
+        ).fetchone()
+        revision = int(latest["revision"]) + 1
+        new_id = str(uuid.uuid4())
+        now = utc_now()
+        db.execute(
+            "INSERT INTO interaction_anchors(id, product_version_id, revision, name, status, payload, payload_sha256, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?)",
+            (new_id, row["product_version_id"], revision, request.name, payload_text, digest, now, now),
+        )
+        created = db.execute("SELECT * FROM interaction_anchors WHERE id = ?", (new_id,)).fetchone()
+    return _anchor_public(created)
+
+
+@app.post("/api/v1/product-versions/{product_version_id}/anchor-sets/approve")
+def approve_anchor_set(product_version_id: str, request: AnchorSetApproveRequest) -> dict:
+    """按修订冻结锚点集（幂等：同一修订重复批准返回同一集合，不新建）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    load_product_version_for_owner(product_version_id, owner_id, project_id)
+    with connect() as db:
+        existing = db.execute(
+            "SELECT * FROM anchor_sets WHERE product_version_id = ? AND revision = ?",
+            (product_version_id, request.revision),
+        ).fetchone()
+        if existing:
+            return _anchor_set_public(existing)
+        anchors = db.execute(
+            "SELECT * FROM interaction_anchors WHERE product_version_id = ? AND revision = ?",
+            (product_version_id, request.revision),
+        ).fetchall()
+        if not anchors:
+            raise HTTPException(404, f"该产品版本没有修订 {request.revision} 的锚点")
+        payload_text, digest = _canonical_anchor_set_payload(
+            product_version_id, request.revision, [row_to_dict(row) for row in anchors]
+        )
+        begin_immediate(db)
+        set_id = str(uuid.uuid4())
+        now = utc_now()
+        db.execute(
+            "INSERT INTO anchor_sets(id, product_version_id, revision, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (set_id, product_version_id, request.revision, payload_text, digest, now),
+        )
+        db.execute(
+            "UPDATE interaction_anchors SET status = 'APPROVED', approved_at = ? WHERE product_version_id = ? AND revision = ?",
+            (now, product_version_id, request.revision),
+        )
+        row = db.execute("SELECT * FROM anchor_sets WHERE id = ?", (set_id,)).fetchone()
+    return _anchor_set_public(row)
+
+
+def _anchor_set_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "product_version_id": row["product_version_id"],
+        "revision": row["revision"],
+        "payload_sha256": row["payload_sha256"],
+        "created_at": row["created_at"],
+        "set": json.loads(row["payload"]),
+    }
+
+
+@app.get("/api/v1/product-versions/{product_version_id}/anchor-sets")
+def list_anchor_sets(
+    product_version_id: str,
+    owner_id: str = DEFAULT_OWNER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    load_product_version_for_owner(product_version_id, owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM anchor_sets WHERE product_version_id = ? ORDER BY revision DESC",
+            (product_version_id,),
+        ).fetchall()
+    return [_anchor_set_public(row) for row in rows]
+
+
+@app.get("/api/v1/anchor-sets/{anchor_set_id}")
+def get_anchor_set(anchor_set_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute("SELECT * FROM anchor_sets WHERE id = ?", (anchor_set_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "锚点集不存在")
+    load_product_version_for_owner(row["product_version_id"], owner_id, project_id)
+    return _anchor_set_public(row)
+
+
+def _character_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "owner_id": row["owner_id"],
+        "project_id": row["project_id"],
+        "name": row["name"],
+        "status": row["status"],
+        "payload_sha256": row["payload_sha256"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "character": json.loads(row["payload"]),
+    }
+
+
+@app.post("/api/v1/characters", status_code=201)
+def create_character(request: CharacterRequest) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    payload = request.model_dump()
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    character_id = str(uuid.uuid4())
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO characters(id, owner_id, project_id, name, status, payload, payload_sha256, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?)",
+            (character_id, owner_id, project_id, request.name, payload_text, digest, now, now),
+        )
+        row = db.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
+    return _character_public(row)
+
+
+@app.get("/api/v1/characters")
+def list_characters(owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJECT_ID) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM characters WHERE owner_id = ? AND project_id = ? ORDER BY created_at DESC",
+            (owner_id, project_id),
+        ).fetchall()
+    return [_character_public(row) for row in rows]
 
 
 @app.post("/api/v1/product-versions/{product_version_id}/approve")

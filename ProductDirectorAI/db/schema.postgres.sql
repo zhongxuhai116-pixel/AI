@@ -244,3 +244,39 @@ CREATE TABLE IF NOT EXISTS qa_reports (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS interaction_anchors (
+  id TEXT PRIMARY KEY,
+  product_version_id TEXT NOT NULL REFERENCES product_versions(id),
+  revision INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'DRAFT',
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  approved_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (product_version_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS anchor_sets (
+  id TEXT PRIMARY KEY,
+  product_version_id TEXT NOT NULL REFERENCES product_versions(id),
+  revision INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (product_version_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS characters (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL REFERENCES owners(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'DRAFT',
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
