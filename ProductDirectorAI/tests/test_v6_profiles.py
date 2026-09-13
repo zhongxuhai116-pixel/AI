@@ -183,7 +183,7 @@ class PlatformProfileApiTests(unittest.TestCase):
         self.assertEqual([item["version"] for item in versions], [1])
         v1_hash = versions[0]["payload_sha256"]
         spec = copy.deepcopy(versions[0]["spec"])
-        spec["copy"]["max_length"] = 1500
+        spec["copy_spec"]["max_length"] = 1500
         created = self.client.post(
             f"/api/v1/platform-profiles/{profile_id}/versions",
             json={"spec": spec, "notes": "收紧文案上限"},
@@ -193,11 +193,11 @@ class PlatformProfileApiTests(unittest.TestCase):
         after = self.client.get(f"/api/v1/platform-profiles/{profile_id}/versions").json()
         self.assertEqual([item["version"] for item in after], [1, 2])
         self.assertEqual(after[0]["payload_sha256"], v1_hash)  # 旧版本未被改写
-        self.assertEqual(after[1]["spec"]["copy"]["max_length"], 1500)
+        self.assertEqual(after[1]["spec"]["copy_spec"]["max_length"], 1500)
         # 客户端指定的 identity.version 被服务端覆盖
         spec2 = copy.deepcopy(spec)
         spec2["identity"]["version"] = 99
-        spec2["copy"]["max_length"] = 1200
+        spec2["copy_spec"]["max_length"] = 1200
         third = self.client.post(
             f"/api/v1/platform-profiles/{profile_id}/versions",
             json={"spec": spec2},

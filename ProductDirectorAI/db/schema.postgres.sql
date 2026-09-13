@@ -377,3 +377,66 @@ CREATE TABLE IF NOT EXISTS postproduction_preset_versions (
   created_at TEXT NOT NULL,
   UNIQUE (preset_id, version)
 );
+
+-- V6-02：本地化文案、字幕轨与配音
+CREATE TABLE IF NOT EXISTS localizations (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  locale TEXT NOT NULL,
+  profile_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS localization_revisions (
+  id TEXT PRIMARY KEY,
+  localization_id TEXT NOT NULL REFERENCES localizations(id),
+  revision INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'DRAFT',
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  edited_from_revision INTEGER,
+  created_at TEXT NOT NULL,
+  UNIQUE (localization_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS audio_previews (
+  id TEXT PRIMARY KEY,
+  localization_id TEXT,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  locale TEXT NOT NULL,
+  engine TEXT NOT NULL,
+  voice TEXT NOT NULL,
+  text TEXT NOT NULL,
+  path TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voiceovers (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  asset_id TEXT NOT NULL,
+  locale TEXT NOT NULL,
+  license_ref TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subtitle_tracks (
+  id TEXT PRIMARY KEY,
+  localization_id TEXT NOT NULL REFERENCES localizations(id),
+  revision INTEGER NOT NULL,
+  locale TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);

@@ -13,7 +13,7 @@ import datetime as _dt
 import json
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 SCHEMA_VERSION = "1.0"
 # 规则核验有效期：超过该天数视为过期，需要重新核验（主规划 12.3「来源」行）。
@@ -182,7 +182,7 @@ class PlatformProfileSpec(BaseModel):
     market: ProfileMarket
     video: VideoSpec
     composition: CompositionSpec
-    copy: CopySpec
+    copy_spec: CopySpec = Field(validation_alias=AliasChoices("copy", "copy_spec"))
     subtitles: SubtitleSpec
     voice: VoiceSpec
     music: MusicSpec
@@ -318,15 +318,15 @@ def validate_spec(spec: PlatformProfileSpec, *, today: _dt.date | None = None) -
         ))
 
     # 6) 文案
-    if spec.copy.max_length <= 0:
+    if spec.copy_spec.max_length <= 0:
         problems.append(_problem("copy_max_length", "BLOCKING", "copy.max_length 必须为正", "copy.max_length"))
-    if spec.copy.length_algorithm == "platform_specific" and not spec.copy.style:
+    if spec.copy_spec.length_algorithm == "platform_specific" and not spec.copy_spec.style:
         problems.append(_problem(
             "copy_algorithm_undocumented", "WARNING",
             "声明按平台字符算法计数但未记录来源说明",
             "copy.length_algorithm",
         ))
-    if not spec.copy.prohibited_claims:
+    if not spec.copy_spec.prohibited_claims:
         problems.append(_problem(
             "no_prohibited_claims", "WARNING",
             "未声明禁止宣传语清单：自动生成文案不得添加未经证实的健康/性能宣传",
@@ -473,7 +473,7 @@ def _seed(
             "aspect_ratio": aspect, "safe_area": region_dict(safe_area),
             "subject_roi": region_dict(subject_roi), "crop_policy": crop_policy,
         },
-        "copy": {
+        "copy_spec": {
             "style": "简洁产品说明；事实字段与生成式宣传语分离",
             "max_length": max_length, "length_algorithm": "unicode_codepoints",
             "hashtag_policy": f"建议标签不超过 {hashtag_max} 个，去重且格式校验",

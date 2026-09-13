@@ -55,6 +55,7 @@ from .strict_background import (
 from . import strict_qa
 from . import interaction_geometry
 from . import interaction_validation
+from . import localization
 from . import platform_profiles
 from . import reference_analysis
 
@@ -577,6 +578,65 @@ def initialize_db() -> None:
               created_at TEXT NOT NULL,
               UNIQUE (preset_id, version),
               FOREIGN KEY(preset_id) REFERENCES postproduction_presets(id)
+            );
+            CREATE TABLE IF NOT EXISTS localizations (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              locale TEXT NOT NULL,
+              profile_id TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS localization_revisions (
+              id TEXT PRIMARY KEY,
+              localization_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'DRAFT',
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              edited_from_revision INTEGER,
+              created_at TEXT NOT NULL,
+              UNIQUE (localization_id, revision),
+              FOREIGN KEY(localization_id) REFERENCES localizations(id)
+            );
+            CREATE TABLE IF NOT EXISTS audio_previews (
+              id TEXT PRIMARY KEY,
+              localization_id TEXT,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              locale TEXT NOT NULL,
+              engine TEXT NOT NULL,
+              voice TEXT NOT NULL,
+              text TEXT NOT NULL,
+              path TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS voiceovers (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              asset_id TEXT NOT NULL,
+              locale TEXT NOT NULL,
+              license_ref TEXT NOT NULL DEFAULT '',
+              path TEXT NOT NULL DEFAULT '',
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS subtitle_tracks (
+              id TEXT PRIMARY KEY,
+              localization_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              locale TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(localization_id) REFERENCES localizations(id)
             );
             """
     with connect() as db:
@@ -7733,6 +7793,597 @@ def create_postproduction_preset_version(preset_id: str, request: PlatformProfil
         "validation": platform_profiles.summarize(platform_profiles.validate_preset_spec(spec)),
         "created_at": now,
     }
+
+
+# ---------------------------------------------------------------------------
+# V6-02：本地化文案、字幕生成/对齐与离线 TTS 试听
+# ---------------------------------------------------------------------------
+
+# 配音上传上限：授权配音通常为几十 MB；超过视为异常输入。
+MAX_VOICEOVER_BYTES = 200 * 1024 * 1024
+
+
+class LocalizationCreateRequest(BaseModel):
+    locale: Literal["es-MX", "en-US"] = "es-MX"
+    profile_id: str = Field(default="", max_length=80)
+    preset_id: str = Field(default="", max_length=80)
+    product_name: str = Field(default="", max_length=120)
+    facts: dict = Field(default_factory=dict)
+    style_index: int = Field(default=0, ge=0, le=20)
+    notes: str = Field(default="", max_length=2000)
+
+
+class LocalizationPatchRequest(BaseModel):
+    headline: str | None = Field(default=None, max_length=400)
+    body: str | None = Field(default=None, max_length=4000)
+    cta: str | None = Field(default=None, max_length=400)
+    hashtags: list[str] | None = Field(default=None, max_length=30)
+    notes: str = Field(default="", max_length=2000)
+
+
+class SubtitleGenerateRequest(BaseModel):
+    formats: list[Literal["srt", "vtt"]] = Field(default_factory=lambda: ["srt", "vtt"], min_length=1, max_length=2)
+    source: Literal["auto", "voice", "timeline"] = "auto"
+    voiceover_id: str = Field(default="", max_length=80)
+    video_duration_s: float | None = Field(default=None, gt=0, le=3600)
+    max_chars_per_line: int = Field(default=localization.DEFAULT_MAX_CHARS_PER_LINE, ge=16, le=80)
+    max_lines: int = Field(default=2, ge=1, le=6)
+    notes: str = Field(default="", max_length=2000)
+
+
+class AudioPreviewRequest(BaseModel):
+    locale: Literal["es-MX", "en-US"] = "es-MX"
+    text: str = Field(default="", max_length=2000)
+    localization_id: str = Field(default="", max_length=80)
+    voice_ref: str = Field(default="", max_length=80)
+    rate: float = Field(default=1.0, ge=0.5, le=2.0)
+    pronunciation_dictionary: list[dict] = Field(default_factory=list, max_length=200)
+    max_seconds: float = Field(default=60.0, gt=0, le=600)
+
+
+def _localization_public(revision_row) -> dict:
+    payload = json.loads(revision_row["payload"])
+    return {
+        "revision_id": revision_row["id"],
+        "revision": revision_row["revision"],
+        "status": revision_row["status"],
+        "edited_from_revision": revision_row["edited_from_revision"],
+        "payload_sha256": revision_row["payload_sha256"],
+        "created_at": revision_row["created_at"],
+        **payload,
+    }
+
+
+def _latest_localization_revision(db, localization_id: str):
+    return db.execute(
+        "SELECT * FROM localization_revisions WHERE localization_id = ? ORDER BY revision DESC LIMIT 1",
+        (localization_id,),
+    ).fetchone()
+
+
+def _product_facts_for_run(db, run_id: str) -> dict:
+    """从批准数据读取产品事实：仅使用已核实维度，没有就返回空（不猜）。"""
+    row = db.execute(
+        "SELECT p.product_asset_id FROM runs r JOIN plans p ON p.id = r.plan_id WHERE r.id = ?",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        return {}
+    asset = db.execute("SELECT name FROM assets WHERE id = ?", (row["product_asset_id"],)).fetchone()
+    facts: dict = {"product_asset_id": row["product_asset_id"]}
+    if asset:
+        facts["name"] = asset["name"]
+    version = db.execute(
+        "SELECT verified_dimensions FROM product_versions WHERE product_asset_id = ? AND verified_dimensions IS NOT NULL "
+        "ORDER BY version DESC LIMIT 1",
+        (row["product_asset_id"],),
+    ).fetchone()
+    if version and version["verified_dimensions"]:
+        try:
+            facts["verified_dimensions"] = json.loads(version["verified_dimensions"])
+        except json.JSONDecodeError:
+            pass
+    return facts
+
+
+def _resolve_run_scope(db, run_id: str) -> dict:
+    """Run → 计划/产品范围（owner/project 通过冻结合同关联，runs 表本身不存 owner）。"""
+    row = db.execute(
+        "SELECT r.*, p.product_asset_id, p.payload AS plan_payload, rv.owner_id AS owner_id, rv.project_id AS project_id "
+        "FROM runs r JOIN plans p ON p.id = r.plan_id "
+        "LEFT JOIN plan_contracts pc ON pc.id = r.plan_contract_id "
+        "LEFT JOIN product_versions rv ON rv.id = pc.product_version_id "
+        "WHERE r.id = ?",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Run 不存在")
+    keys = row.keys()
+    owner_id = row["owner_id"] if "owner_id" in keys and row["owner_id"] else DEFAULT_OWNER_ID
+    project_id = row["project_id"] if "project_id" in keys and row["project_id"] else DEFAULT_PROJECT_ID
+    return {
+        "id": row["id"], "job_id": row["job_id"], "plan_id": row["plan_id"],
+        "owner_id": owner_id, "project_id": project_id,
+        "product_asset_id": row["product_asset_id"], "plan_payload": row["plan_payload"],
+    }
+
+
+def _create_localization_revision(
+    db, localization_id: str, payload: dict, *, edited_from: int | None = None, status: str = "DRAFT"
+) -> dict:
+    latest = db.execute(
+        "SELECT COALESCE(MAX(revision), 0) AS revision FROM localization_revisions WHERE localization_id = ?",
+        (localization_id,),
+    ).fetchone()
+    revision = int(latest["revision"]) + 1
+    payload = dict(payload)
+    payload["revision"] = revision
+    problems = localization.find_prohibited_claims(
+        f"{payload.get('headline', '')}\n{payload.get('body', '')}\n{payload.get('cta', '')}"
+    )
+    payload["claims_scan"] = problems
+    # 修改文案/标签会改变下游包 hash：显式标记旧审批失效（V6-05 打包时对照）。
+    payload["downstream_invalidated"] = edited_from is not None
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    revision_id = str(uuid.uuid4())
+    now = utc_now()
+    db.execute(
+        "INSERT INTO localization_revisions(id, localization_id, revision, status, payload, payload_sha256, "
+        "edited_from_revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (revision_id, localization_id, revision, status, payload_text,
+         hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), edited_from, now),
+    )
+    db.execute("UPDATE localizations SET updated_at = ? WHERE id = ?", (now, localization_id))
+    return {
+        "id": revision_id, "localization_id": localization_id, "revision": revision,
+        "payload_sha256": hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
+        "edited_from_revision": edited_from, "created_at": now, **payload,
+    }
+
+
+@app.get("/api/v1/audio/engines")
+def list_audio_engines() -> dict:
+    """TTS 能力如实上报：无可引擎时 NOT_CONFIGURED，而不是假装能配音。"""
+    capability = localization.tts_capability()
+    return {
+        **capability,
+        "fallbacks": [
+            "上传授权配音（POST /runs/{id}/voiceovers）",
+            "显式关闭配音并在 Manifest 标注 disabled",
+        ],
+    }
+
+
+@app.post("/api/v1/runs/{run_id}/localizations", status_code=201)
+def create_localization(run_id: str, request: LocalizationCreateRequest) -> dict:
+    """按 Run 建立本地化草稿：文案（事实与生成语分离）+ 话题标签 + 字幕计划。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        run = _resolve_run_scope(db, run_id)
+        if run["owner_id"] != owner_id or run["project_id"] != project_id:
+            raise HTTPException(403, "越权访问 Run")
+        profile_spec = None
+        copy_spec = {"max_length": 2200, "hashtag_max_count": 8}
+        if request.profile_id:
+            row = db.execute(
+                "SELECT * FROM platform_profiles WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.profile_id, owner_id, project_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "Profile 不存在")
+            version = db.execute(
+                "SELECT * FROM platform_profile_versions WHERE profile_id = ? ORDER BY version DESC LIMIT 1",
+                (request.profile_id,),
+            ).fetchone()
+            profile_spec = platform_profiles.spec_from_payload(json.loads(version["payload"]))
+            copy_spec = {
+                "max_length": profile_spec.copy_spec.max_length,
+                "hashtag_max_count": profile_spec.copy_spec.hashtag_max_count,
+                "length_algorithm": profile_spec.copy_spec.length_algorithm,
+            }
+        facts = dict(_product_facts_for_run(db, run_id))
+        facts.update(request.facts or {})
+        product_name = request.product_name or str(facts.get("name") or "Producto")
+        copy_payload = localization.build_copy(
+            locale=request.locale, product_name=product_name, facts=facts,
+            style_index=request.style_index, hashtag_max_count=int(copy_spec.get("hashtag_max_count") or 5),
+        )
+        hashtag_problems = localization.validate_hashtags(
+            copy_payload["hashtags"], max_count=int(copy_spec.get("hashtag_max_count") or 5)
+        )
+        over_length = len(copy_payload["body"]) > int(copy_spec.get("max_length") or 2200)
+        localization_id = str(uuid.uuid4())
+        now = utc_now()
+        db.execute(
+            "INSERT INTO localizations(id, run_id, owner_id, project_id, locale, profile_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (localization_id, run_id, owner_id, project_id, request.locale,
+             request.profile_id or None, now, now),
+        )
+        payload = {
+            "locale": request.locale,
+            "profile_id": request.profile_id,
+            "preset_id": request.preset_id,
+            "headline": copy_payload["headline"],
+            "body": copy_payload["body"],
+            "cta": copy_payload["cta"],
+            "hashtags": copy_payload["hashtags"],
+            "facts": copy_payload["facts"],
+            "generated": copy_payload["generated"],
+            "generator": copy_payload["generator"],
+            "copy_limits": copy_spec,
+            "hashtag_problems": hashtag_problems,
+            "copy_over_length": over_length,
+            "notes": request.notes,
+        }
+        created = _create_localization_revision(db, localization_id, payload)
+    return {
+        "localization_id": localization_id,
+        "run_id": run_id,
+        "locale": request.locale,
+        "revision": created,
+        "issues": {
+            "claims": created.get("claims_scan", []),
+            "hashtags": hashtag_problems,
+            "copy_over_length": over_length,
+        },
+        "generated_by": copy_payload["generator"],
+    }
+
+
+@app.get("/api/v1/runs/{run_id}/localizations")
+def list_localizations(run_id: str) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM localizations WHERE run_id = ? AND owner_id = ? AND project_id = ? ORDER BY created_at ASC",
+            (run_id, owner_id, project_id),
+        ).fetchall()
+        return [
+            {"id": row["id"], "locale": row["locale"], "profile_id": row["profile_id"],
+             "created_at": row["created_at"], "updated_at": row["updated_at"],
+             "latest": _localization_public(_latest_localization_revision(db, row["id"]))}
+            for row in rows
+        ]
+
+
+@app.get("/api/v1/localizations/{localization_id}")
+def get_localization(localization_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM localizations WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (localization_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "本地化不存在")
+        revisions = db.execute(
+            "SELECT * FROM localization_revisions WHERE localization_id = ? ORDER BY revision ASC",
+            (localization_id,),
+        ).fetchall()
+        previews = db.execute(
+            "SELECT id, engine, voice, locale, path, created_at FROM audio_previews WHERE localization_id = ? "
+            "ORDER BY created_at ASC",
+            (localization_id,),
+        ).fetchall()
+        subtitles = db.execute(
+            "SELECT * FROM subtitle_tracks WHERE localization_id = ? ORDER BY created_at ASC",
+            (localization_id,),
+        ).fetchall()
+    return {
+        "localization": {
+            "id": row["id"], "run_id": row["run_id"], "locale": row["locale"],
+            "profile_id": row["profile_id"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+        },
+        "revisions": [_localization_public(item) for item in revisions],
+        "latest": _localization_public(revisions[-1]) if revisions else None,
+        "audio_previews": [dict(item) for item in previews],
+        "subtitle_tracks": [dict(item) for item in subtitles],
+    }
+
+
+@app.patch("/api/v1/localizations/{localization_id}")
+def edit_localization(localization_id: str, request: LocalizationPatchRequest) -> dict:
+    """人工修改文案/标签 → 生成新 revision（不覆盖已审核文案），并标记下游包审批失效。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM localizations WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (localization_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "本地化不存在")
+        latest = _latest_localization_revision(db, localization_id)
+        base = json.loads(latest["payload"])
+        profile_id = row["profile_id"]
+        max_count = int((base.get("copy_limits") or {}).get("hashtag_max_count") or 8)
+        payload = {
+            **base,
+            "headline": request.headline if request.headline is not None else base.get("headline", ""),
+            "body": request.body if request.body is not None else base.get("body", ""),
+            "cta": request.cta if request.cta is not None else base.get("cta", ""),
+            "hashtags": list(request.hashtags) if request.hashtags is not None else base.get("hashtags", []),
+            "notes": request.notes or base.get("notes", ""),
+            "profile_id": profile_id or "",
+        }
+        payload["hashtag_problems"] = localization.validate_hashtags(payload["hashtags"], max_count=max_count)
+        payload["copy_over_length"] = len(payload["body"]) > int((base.get("copy_limits") or {}).get("max_length") or 2200)
+        updated = _create_localization_revision(db, localization_id, payload, edited_from=latest["revision"])
+    return {
+        "localization_id": localization_id,
+        "revision": updated,
+        "issues": {
+            "claims": updated.get("claims_scan", []),
+            "hashtags": updated.get("hashtag_problems", []),
+            "copy_over_length": updated.get("copy_over_length", False),
+        },
+        "downstream_invalidated": True,
+    }
+
+
+@app.post("/api/v1/localizations/{localization_id}/subtitles", status_code=201)
+def generate_subtitles(localization_id: str, request: SubtitleGenerateRequest) -> dict:
+    """生成 SRT/VTT：优先按实际配音音频对齐；无配音时按时间线比例并如实标注。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM localizations WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (localization_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "本地化不存在")
+        latest = _latest_localization_revision(db, localization_id)
+        payload = json.loads(latest["payload"])
+        run = _resolve_run_scope(db, row["run_id"])
+        voiceover = None
+        if request.voiceover_id:
+            voiceover = db.execute(
+                "SELECT * FROM voiceovers WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.voiceover_id, owner_id, project_id),
+            ).fetchone()
+            if not voiceover:
+                raise HTTPException(404, "配音不存在")
+        elif request.source in ("auto", "voice"):
+            voiceover = db.execute(
+                "SELECT * FROM voiceovers WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+                (row["run_id"],),
+            ).fetchone()
+    plan_payload = json.loads(run["plan_payload"] or "{}")
+    output = plan_payload.get("output") or {}
+    fps = int(output.get("fps") or DEFAULT_FPS)
+    frame_count = int(output.get("frame_count") or (fps * int(output.get("duration_seconds") or 6)))
+    video_duration = float(request.video_duration_s or (frame_count / fps if fps else 6.0))
+    text = " ".join(filter(None, [payload.get("headline"), payload.get("body")]))
+    chunks = localization.split_copy_into_chunks(text)
+    alignment = {"status": "TIMELINE", "reason": "未提供配音：按时间线比例分配（不是语音精确同步）"}
+    cues: list[dict] = []
+    audio_report = None
+    if request.source in ("auto", "voice") and voiceover:
+        audio_path = Path(voiceover["path"]) if "path" in voiceover.keys() else None
+        if audio_path and audio_path.exists():
+            audio_report = localization.detect_speech_segments(audio_path)
+            cues, alignment = localization.cues_from_speech(
+                chunks, audio_report, duration_seconds=video_duration,
+                max_chars_per_line=request.max_chars_per_line, max_lines=request.max_lines,
+            )
+            alignment["voiceover_id"] = voiceover["id"]
+            if alignment["status"] != "ALIGNED":
+                alignment["fallback_to"] = "timeline_proportional"
+        else:
+            alignment = {"status": "TIMELINE", "reason": "配音记录缺少音频文件，回退时间线比例",
+                         "voiceover_id": voiceover["id"]}
+    if not cues:
+        cues = localization.cues_from_timeline(
+            chunks, duration_seconds=video_duration,
+            max_chars_per_line=request.max_chars_per_line, max_lines=request.max_lines,
+        )
+        if alignment.get("status") not in ("TIMELINE",):
+            alignment = {**alignment, "status": "TIMELINE", "fallback_used": True}
+    audio_duration = float((audio_report or {}).get("duration_s") or 0.0)
+    over_length = audio_duration > video_duration + (1.0 / max(1, fps))
+    problems = localization.validate_cues(
+        cues, video_duration_s=video_duration, max_lines=request.max_lines,
+        max_chars_per_line=request.max_chars_per_line,
+    )
+    if over_length:
+        # 配音过长：同一根因只保留一条显式问题（越界由它解释），并给出主规划 12.4 的适配策略。
+        problems = [item for item in problems if item["code"] != "cue_beyond_video"]
+        alignment = {**alignment, "status": "AUDIO_LONGER_THAN_VIDEO", "over_length_s": round(audio_duration - video_duration, 3)}
+        problems.append({
+            "code": "audio_longer_than_video",
+            "cue": None,
+            "message": (
+                f"配音时长 {audio_duration:.2f}s 超过视频 {video_duration:.2f}s："
+                "请选择允许的适配策略（在 Profile 范围内延长非接触镜头 / 在允许速率内调速 / 改文案重新生成），"
+                "不得截断视频或旁白，也不得对人物接触镜头变速"
+            ),
+            "audio_duration_s": round(audio_duration, 3),
+            "video_duration_s": round(video_duration, 3),
+            "overflow_s": round(audio_duration - video_duration, 3),
+        })
+    directory = VAR / "localizations" / localization_id / f"rev{latest['revision']}"
+    directory.mkdir(parents=True, exist_ok=True)
+    files = []
+    for fmt in request.formats:
+        content = localization.render_srt(cues) if fmt == "srt" else localization.render_vtt(cues)
+        path = directory / f"{row['locale']}.{fmt}"
+        path.write_text(content, encoding="utf-8")
+        files.append({
+            "format": fmt, "path": str(path), "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "mime": "application/x-subrip" if fmt == "srt" else "text/vtt",
+        })
+    track_payload = {
+        "localization_id": localization_id,
+        "revision": latest["revision"],
+        "locale": row["locale"],
+        "alignment": alignment,
+        "audio": ({"duration_s": audio_report.get("duration_s"),
+                   "speech_segments": len(audio_report.get("segments") or []),
+                   "method": audio_report.get("method")} if audio_report else None),
+        "video_duration_s": video_duration,
+        "cue_count": len(cues),
+        "cues": cues,
+        "problems": problems,
+        "files": files,
+        "notes": request.notes,
+    }
+    track_text = json.dumps(track_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    track_id = str(uuid.uuid4())
+    with connect() as db:
+        db.execute(
+            "INSERT INTO subtitle_tracks(id, localization_id, revision, locale, payload, payload_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (track_id, localization_id, latest["revision"], row["locale"], track_text,
+             hashlib.sha256(track_text.encode("utf-8")).hexdigest(), utc_now()),
+        )
+    return {
+        "subtitle_track_id": track_id,
+        "localization_id": localization_id,
+        "revision": latest["revision"],
+        "locale": row["locale"],
+        "alignment": alignment,
+        "cue_count": len(cues),
+        "problems": problems,
+        "files": files,
+        "cues": cues,
+        "audio": track_payload["audio"],
+    }
+
+
+@app.post("/api/v1/audio/previews", status_code=201)
+def create_audio_preview(request: AudioPreviewRequest) -> dict:
+    """试听配音：真实离线合成（引擎不可用时 NOT_CONFIGURED），可带发音词典与语速。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    text = request.text
+    localization_id = request.localization_id or None
+    with connect() as db:
+        if localization_id:
+            row = db.execute(
+                "SELECT * FROM localizations WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (localization_id, owner_id, project_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "本地化不存在")
+            if not text:
+                payload = json.loads(_latest_localization_revision(db, localization_id)["payload"])
+                text = " ".join(filter(None, [payload.get("headline"), payload.get("body")]))
+    if not text.strip():
+        raise HTTPException(422, "试听文本为空")
+    preview_id = str(uuid.uuid4())
+    out_path = VAR / "audio-previews" / f"{preview_id}.wav"
+    try:
+        result = localization.synthesize(
+            text, locale=request.locale, out_path=out_path, rate=request.rate,
+            pronunciation_dictionary=request.pronunciation_dictionary, voice_ref=request.voice_ref,
+        )
+    except RuntimeError as exc:
+        try:
+            detail = json.loads(str(exc))
+        except json.JSONDecodeError:
+            detail = {"code": "TTS_FAILED", "detail": str(exc)}
+        raise HTTPException(503 if detail.get("code") == "NOT_CONFIGURED" else 422, detail) from exc
+    if result["duration_s"] > request.max_seconds + 1e-6:
+        out_path.unlink(missing_ok=True)
+        raise HTTPException(422, {
+            "code": "PREVIEW_TOO_LONG",
+            "detail": f"合成时长 {result['duration_s']}s 超过上限 {request.max_seconds}s（不截断音频）",
+            "duration_s": result["duration_s"],
+        })
+    payload = {
+        "engine": result["engine"], "engine_kind": result["engine_kind"], "voice": result["voice"],
+        "locale": request.locale, "rate": request.rate, "speed": result["speed"],
+        "characters": result["characters"], "duration_s": result["duration_s"],
+        "pronunciation_applied": result["pronunciation_applied"],
+        "text": text, "localization_id": localization_id,
+        "note": "离线预览引擎产物；正式发行音色需接入已配置的 TTS Provider",
+    }
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO audio_previews(id, localization_id, owner_id, project_id, locale, engine, voice, text, path, "
+            "payload, payload_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (preview_id, localization_id, owner_id, project_id, request.locale, result["engine"],
+             result["voice"], text, str(out_path), payload_text,
+             hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+        )
+    return {"id": preview_id, "path": str(out_path), "sha256": _file_sha256(out_path), **payload,
+            "download_url": f"/api/v1/audio/previews/{preview_id}/content"}
+
+
+@app.get("/api/v1/audio/previews/{preview_id}/content")
+def get_audio_preview_content(preview_id: str) -> FileResponse:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM audio_previews WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (preview_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "试听不存在")
+    path = Path(row["path"])
+    if not path.exists():
+        raise HTTPException(404, "试听音频已不存在")
+    return FileResponse(path, media_type="audio/wav", filename=f"preview-{preview_id}.wav")
+
+
+@app.post("/api/v1/runs/{run_id}/voiceovers", status_code=201)
+async def upload_voiceover(
+    run_id: str,
+    file: UploadFile = File(...),
+    locale: str = Form(default="es-MX"),
+    license_ref: str = Form(default=""),
+    notes: str = Form(default=""),
+) -> dict:
+    """上传已授权配音（无 TTS Provider 时的合法路线）；记录许可引用，不做二次分发。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        run = _resolve_run_scope(db, run_id)
+    if run["owner_id"] != owner_id or run["project_id"] != project_id:
+        raise HTTPException(403, "越权访问 Run")
+    payload_bytes = await file.read()
+    if len(payload_bytes) > MAX_VOICEOVER_BYTES:
+        raise HTTPException(413, f"配音文件超过 {MAX_VOICEOVER_BYTES // (1024 * 1024)}MB 上限")
+    suffix = Path(file.filename or "voiceover.wav").suffix.lower() or ".wav"
+    if suffix not in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}:
+        raise HTTPException(422, f"不支持的配音格式 {suffix}")
+    voiceover_id = str(uuid.uuid4())
+    directory = VAR / "voiceovers" / voiceover_id
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"voiceover{suffix}"
+    path.write_bytes(payload_bytes)
+    if not FFMPEG:
+        raise HTTPException(503, "FFmpeg 未安装，无法校验配音")
+    probe = subprocess.run(
+        [FFPROBE, "-v", "error", "-show_entries", "format=duration,format_name", "-of", "json", str(path)],
+        capture_output=True, text=True,
+    )
+    try:
+        probe_payload = json.loads(probe.stdout)["format"]
+    except (KeyError, json.JSONDecodeError):
+        path.unlink(missing_ok=True)
+        raise HTTPException(422, "配音文件无法解析为音频")
+    duration = float(probe_payload.get("duration") or 0.0)
+    payload = {
+        "run_id": run_id, "locale": locale, "license_ref": license_ref, "notes": notes,
+        "bytes": len(payload_bytes), "duration_s": round(duration, 3),
+        "format": probe_payload.get("format_name"), "sha256": _file_sha256(path),
+        "origin": "owner_upload",
+        "note": "上传的已授权配音；音乐/配音原文件默认不进入发布包，仅保留许可引用与混音记录",
+    }
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO voiceovers(id, run_id, owner_id, project_id, asset_id, locale, license_ref, path, payload, "
+            "payload_sha256, created_at) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)",
+            (voiceover_id, run_id, owner_id, project_id, locale, license_ref, str(path), payload_text,
+             hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now),
+        )
+    return {"id": voiceover_id, "path": str(path), **payload}
 
 
 def main_cli(argv: list[str] | None = None) -> int:
