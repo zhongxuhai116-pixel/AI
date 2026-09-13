@@ -54,10 +54,12 @@ from .strict_background import (
 )
 from . import strict_qa
 from . import audio_post
+from . import batch as batch_rules
 from . import interaction_geometry
 from . import interaction_validation
 from . import localization
 from . import platform_profiles
+from . import publish_package
 from . import reference_analysis
 
 
@@ -695,6 +697,57 @@ def initialize_db() -> None:
               payload_sha256 TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS batches (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'DRAFT',
+              revision INTEGER NOT NULL DEFAULT 1,
+              paused INTEGER NOT NULL DEFAULT 0,
+              cancelled INTEGER NOT NULL DEFAULT 0,
+              idempotency_key TEXT,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS batch_items (
+              id TEXT PRIMARY KEY,
+              batch_id TEXT NOT NULL,
+              item_index INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'PENDING',
+              run_id TEXT,
+              job_id TEXT,
+              cache_key TEXT NOT NULL,
+              error TEXT,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (batch_id, item_index),
+              FOREIGN KEY(batch_id) REFERENCES batches(id)
+            );
+            CREATE TABLE IF NOT EXISTS publish_packages (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              batch_id TEXT,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              profile_id TEXT,
+              locale TEXT NOT NULL,
+              version INTEGER NOT NULL DEFAULT 1,
+              status TEXT NOT NULL DEFAULT 'DRAFT',
+              content_hash TEXT NOT NULL DEFAULT '',
+              directory TEXT NOT NULL,
+              zip_path TEXT NOT NULL DEFAULT '',
+              zip_sha256 TEXT NOT NULL DEFAULT '',
+              approved_at TEXT,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             """
     with connect() as db:
         db.executescript(schema_sql)
@@ -861,11 +914,41 @@ class ReenactmentOutputSpec(OutputSpec):
 
 
 def output_spec_for_plan(plan_snapshot: dict) -> OutputSpec:
-    """按冻结计划选择输出合同：V5 重演计划携带显式 frame_count，V1 计划沿用 5–8 秒合同。"""
+    """按冻结计划选择输出合同：**显式 frame_count 的计划（V5 重演 / V6 生产计划）**
+    使用 `ReenactmentOutputSpec`（整帧帧数 + 分数时长）；V1 导演计划沿用 5–8 秒合同。"""
     output = plan_snapshot.get("output") or {}
-    if plan_snapshot.get("from_reference") and isinstance(output.get("frame_count"), int):
+    if isinstance(output.get("frame_count"), int) and (
+        plan_snapshot.get("from_reference") or plan_snapshot.get("production_plan")
+    ):
         return ReenactmentOutputSpec.model_validate(output)
     return OutputSpec.model_validate(output)
+
+
+def validate_production_plan_snapshot(plan_snapshot: dict, profile_spec=None) -> None:
+    """V6 生产计划校验：2–8 镜头、单镜头 ≥24 帧、总帧数 = output.frame_count、
+    总时长落在 Profile 允许范围内（V1 的"三镜头 5–8 秒"合同不适用于 V6 生产计划）。"""
+    shots = plan_snapshot.get("shots") or []
+    output = plan_snapshot.get("output") or {}
+    if not 2 <= len(shots) <= 8:
+        raise HTTPException(409, f"V6 生产计划必须包含 2–8 个镜头（当前 {len(shots)}）")
+    total = 0
+    for index, shot in enumerate(shots, start=1):
+        duration = int(shot.get("duration_frames") or 0)
+        if duration < 24:
+            raise HTTPException(409, f"第 {index} 个镜头时长 {duration} 帧少于 24 帧下限")
+        if not shot.get("camera") or not shot.get("focal_length_mm"):
+            raise HTTPException(409, f"第 {index} 个镜头缺少相机或焦距")
+        total += duration
+    declared = output.get("frame_count")
+    if declared is not None and int(declared) != total:
+        raise HTTPException(409, f"output.frame_count={declared} 与镜头总帧数 {total} 不一致")
+    fps = int(output.get("fps") or DEFAULT_FPS)
+    seconds = total / fps if fps else 0.0
+    if profile_spec is not None:
+        low = profile_spec.video.duration_min_seconds
+        high = profile_spec.video.duration_max_seconds
+        if not (low <= seconds <= high):
+            raise HTTPException(409, f"总时长 {seconds:.2f}s 不在 Profile 允许范围 {low}–{high}s 内")
 
 
 class PlanRequest(BaseModel):
@@ -1727,30 +1810,47 @@ def freeze_fidelity_binding(
     }
 
 def append_job_event(db: sqlite3.Connection, job_id: str, event_type: str, payload: dict | None = None) -> None:
+    """追加任务事件。
+
+    并发写入（执行器 + 租约心跳 + 批次调度）会同时计算 MAX(sequence)+1，在 PostgreSQL 的
+    `(job_id, sequence)` 唯一约束下会撞键（真实故障：渲染到 75% 因 duplicate key 失败）。
+    这里对唯一键冲突做有界重试并重新计算 sequence，保证事件不丢、任务不因事件写入失败而中断。
+    """
     job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if not job:
         return
-    latest = db.execute("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM job_events WHERE job_id = ?", (job_id,)).fetchone()
-    sequence = int(latest["sequence"]) + 1
     event_payload = payload or {}
-    db.execute(
-        """
-        INSERT INTO job_events
-        (id, job_id, sequence, event_type, status, stage, progress, payload, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            str(uuid.uuid4()),
-            job_id,
-            sequence,
-            event_type,
-            job["status"],
-            job["stage"],
-            job["progress"],
-            json.dumps(event_payload, ensure_ascii=False),
-            utc_now(),
-        ),
-    )
+    created = utc_now()
+    for _ in range(6):
+        latest = db.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM job_events WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        sequence = int(latest["sequence"]) + 1
+        try:
+            db.execute(
+                """
+                INSERT INTO job_events
+                (id, job_id, sequence, event_type, status, stage, progress, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    job_id,
+                    sequence,
+                    event_type,
+                    job["status"],
+                    job["stage"],
+                    job["progress"],
+                    json.dumps(event_payload, ensure_ascii=False),
+                    created,
+                ),
+            )
+        except Exception as exc:  # 唯一键冲突：重新计算 sequence 后重试（其他错误原样抛出）
+            message = str(exc)
+            if "job_events" not in message or "sequence" not in message:
+                raise
+            continue
+        return
 
 
 def latest_run_job(db: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
@@ -6895,6 +6995,11 @@ def create_run(request: RunRequest, background: BackgroundTasks) -> dict:
             if plan_snapshot.get("from_reference"):
                 # V5 重演计划：时长与镜头数来自参考映射（量化整帧），不套用 V1 三镜头 5–8 秒合同。
                 _validate_from_reference_plan_snapshot(db, plan_snapshot, plan["id"])
+            elif plan_snapshot.get("production_plan"):
+                # V6 生产计划：按 Profile 规格校验多场景时长与镜头数。
+                profile_ref = plan_snapshot["production_plan"].get("profile_id") or ""
+                profile = _profile_for_request(db, profile_ref, owner_id, project_id) if profile_ref else None
+                validate_production_plan_snapshot(plan_snapshot, profile["spec"] if profile else None)
             else:
                 PlanUpdate.model_validate(
                     {
@@ -7885,6 +7990,8 @@ class SubtitleGenerateRequest(BaseModel):
     video_duration_s: float | None = Field(default=None, gt=0, le=3600)
     max_chars_per_line: int = Field(default=localization.DEFAULT_MAX_CHARS_PER_LINE, ge=16, le=80)
     max_lines: int = Field(default=2, ge=1, le=6)
+    # 广告/多场景必须能精确对位文案：显式给出每条字幕的起止时间（秒）与文本
+    cues: list[dict] = Field(default_factory=list, max_length=64)
     notes: str = Field(default="", max_length=2000)
 
 
@@ -8213,11 +8320,30 @@ def generate_subtitles(localization_id: str, request: SubtitleGenerateRequest) -
     frame_count = int(output.get("frame_count") or (fps * int(output.get("duration_seconds") or 6)))
     video_duration = float(request.video_duration_s or (frame_count / fps if fps else 6.0))
     text = " ".join(filter(None, [payload.get("headline"), payload.get("body")]))
+    explicit_cues = [cue for cue in (request.cues or []) if str(cue.get("text") or "").strip()]
     chunks = localization.split_copy_into_chunks(text)
     alignment = {"status": "TIMELINE", "reason": "未提供配音：按时间线比例分配（不是语音精确同步）"}
     cues: list[dict] = []
     audio_report = None
-    if request.source in ("auto", "voice") and voiceover:
+    if explicit_cues:
+        # 广告场景文案：按显式时间轴排布，仍走同一套合法性校验（不与配音做语音对齐）
+        cues = []
+        for index, cue in enumerate(explicit_cues, start=1):
+            start = float(cue.get("start_s") or 0.0)
+            end = float(cue.get("end_s") or 0.0)
+            value = str(cue["text"]).strip()
+            cues.append({
+                "index": index, "start_s": round(start, 3), "end_s": round(end, 3), "text": value,
+                "lines": localization.wrap_text(value, max_chars_per_line=request.max_chars_per_line,
+                                                max_lines=request.max_lines),
+            })
+        alignment = {"status": "EXPLICIT_SCENE_TIMELINE",
+                     "reason": "按显式场景时间轴排布（广告文案），不与配音做语音对齐",
+                     "cue_count": len(cues)}
+        audio_report = None
+        if voiceover and "path" in voiceover.keys() and Path(voiceover["path"]).exists():
+            audio_report = localization.detect_speech_segments(Path(voiceover["path"]))
+    elif request.source in ("auto", "voice") and voiceover:
         audio_path = Path(voiceover["path"]) if "path" in voiceover.keys() else None
         if audio_path and audio_path.exists():
             audio_report = localization.detect_speech_segments(audio_path)
@@ -9011,6 +9137,1170 @@ def get_output_rendition_content(rendition_id: str) -> FileResponse:
         raise HTTPException(404, "成片文件已不存在")
     media = "image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "video/mp4"
     return FileResponse(path, media_type=media, filename=path.name)
+
+
+# ---------------------------------------------------------------------------
+# V6-04：批次与变体（矩阵展开、并发调度、暂停/取消/失败重试）
+# ---------------------------------------------------------------------------
+
+
+class BatchMatrixSpec(BaseModel):
+    product_version_ids: list[str] = Field(default_factory=list, max_length=50)
+    plan_ids: list[str] = Field(default_factory=list, max_length=50)
+    profile_ids: list[str] = Field(default_factory=list, max_length=50)
+    variations_per_combination: int = Field(default=1, ge=1, le=20)
+    seed_policy: Literal["plan_derived", "fixed", "per_variation"] = "plan_derived"
+    base_seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    postproduction_preset_id: str = Field(default="", max_length=80)
+
+
+class BatchCreateRequest(BaseModel):
+    name: str = Field(default="", max_length=120)
+    matrix: BatchMatrixSpec | None = None
+    items: list[dict] = Field(default_factory=list, max_length=100)
+    idempotency_key: str | None = Field(default=None, max_length=120)
+    budget_limit: float | None = Field(default=None, ge=0)
+    publish_intent: dict = Field(default_factory=dict)
+    max_concurrent: int = Field(default=batch_rules.DEFAULT_MAX_CONCURRENT, ge=1, le=8)
+    notes: str = Field(default="", max_length=2000)
+
+
+class BatchPreviewRequest(BaseModel):
+    matrix: BatchMatrixSpec | None = None
+    items: list[dict] = Field(default_factory=list, max_length=100)
+    max_concurrent: int = Field(default=batch_rules.DEFAULT_MAX_CONCURRENT, ge=1, le=8)
+
+
+class BatchActionRequest(BaseModel):
+    reason: str = Field(default="", max_length=500)
+    scope: Literal["not_started", "all_unfinished"] = "not_started"
+    item_filter: list[str] = Field(default_factory=list, max_length=100)
+
+
+def _batch_public(db, row) -> dict:
+    items = db.execute(
+        "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (row["id"],),
+    ).fetchall()
+    summary = batch_rules.summarize([dict(item) for item in items])
+    return {
+        "id": row["id"], "name": row["name"], "status": row["status"],
+        "revision": row["revision"], "paused": bool(row["paused"]), "cancelled": bool(row["cancelled"]),
+        "summary": summary,
+        "publish_status": json.loads(row["payload"]).get("publish_status", "NOT_REQUESTED"),
+        "created_at": row["created_at"], "updated_at": row["updated_at"],
+        "payload": json.loads(row["payload"]),
+    }
+
+
+def _batch_item_public(row) -> dict:
+    payload = json.loads(row["payload"])
+    return {
+        "id": row["id"], "batch_id": row["batch_id"], "index": row["item_index"],
+        "status": row["status"], "run_id": row["run_id"], "job_id": row["job_id"],
+        "cache_key": row["cache_key"], "error": row["error"],
+        "updated_at": row["updated_at"], **payload,
+    }
+
+
+def _resolve_matrix_inputs(db, matrix: BatchMatrixSpec, owner_id: str, project_id: str) -> dict:
+    """把矩阵字段解析为具体的版本行；任何缺失/越权都如实报错，不静默替换。"""
+    products: list[dict] = []
+    for version_id in matrix.product_version_ids:
+        row = db.execute(
+            "SELECT * FROM product_versions WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (version_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"产品版本不存在或越权: {version_id}")
+        products.append({"id": row["id"], "product_asset_id": row["product_asset_id"],
+                         "status": row["status"]})
+    plans: list[dict] = []
+    for plan_id in matrix.plan_ids:
+        row = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"计划不存在: {plan_id}")
+        if not row["approved"]:
+            raise HTTPException(409, f"计划未批准，不能进入批次: {plan_id}")
+        ensure_plan_contract(db, row, owner_id, project_id)
+        contract = get_default_contract(plan_id, db, owner_id, project_id)
+        plans.append({"plan_id": plan_id, "product_asset_id": row["product_asset_id"],
+                      "product_version_id": contract["product_version_id"] if contract else None})
+    profiles: list[dict] = []
+    for profile_id in matrix.profile_ids:
+        row = db.execute(
+            "SELECT * FROM platform_profiles WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (profile_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Profile 不存在: {profile_id}")
+        version = db.execute(
+            "SELECT * FROM platform_profile_versions WHERE profile_id = ? ORDER BY version DESC LIMIT 1",
+            (profile_id,),
+        ).fetchone()
+        profiles.append({"profile_id": profile_id, "id": version["id"], "version": version["version"]})
+    preset_version_id = ""
+    if matrix.postproduction_preset_id:
+        preset = db.execute(
+            "SELECT * FROM postproduction_presets WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (matrix.postproduction_preset_id, owner_id, project_id),
+        ).fetchone()
+        if not preset:
+            raise HTTPException(404, "后期模板不存在")
+        preset_version = db.execute(
+            "SELECT * FROM postproduction_preset_versions WHERE preset_id = ? ORDER BY version DESC LIMIT 1",
+            (matrix.postproduction_preset_id,),
+        ).fetchone()
+        preset_version_id = preset_version["id"]
+    return {"products": products, "plans": plans, "profiles": profiles,
+            "preset_version_id": preset_version_id}
+
+
+def _expand_batch_request(db, request: BatchPreviewRequest | BatchCreateRequest, owner_id: str, project_id: str) -> dict:
+    """矩阵与 items[] 互斥；展开结果同时给出总数与逐项明细。"""
+    has_matrix = request.matrix is not None
+    has_items = bool(request.items)
+    if has_matrix and has_items:
+        raise HTTPException(422, {
+            "code": "matrix_and_items_exclusive",
+            "detail": "矩阵展开字段与 items[] 不能同时使用：请二选一",
+        })
+    if not has_matrix and not has_items:
+        raise HTTPException(422, {"code": "nothing_to_expand", "detail": "需要 matrix 或 items[] 之一"})
+    try:
+        if has_items:
+            expanded = batch_rules.expand_items(request.items)
+            expanded["mode"] = "items"
+        else:
+            resolved = _resolve_matrix_inputs(db, request.matrix, owner_id, project_id)
+            expanded = batch_rules.expand_matrix(
+                product_versions=resolved["products"], plan_versions=resolved["plans"],
+                profile_versions=resolved["profiles"],
+                variations_per_combination=request.matrix.variations_per_combination,
+                seed_policy=request.matrix.seed_policy, base_seed=request.matrix.base_seed,
+                postproduction_preset_version_id=resolved["preset_version_id"],
+            )
+            expanded["mode"] = "matrix"
+            expanded["resolved"] = resolved
+    except batch_rules.ExpansionError as exc:
+        raise HTTPException(422, exc.as_detail()) from exc
+    # 计划绑定产品一致性（items 路线也要校验）
+    conflicts = []
+    for item in expanded["items"]:
+        plan_row = db.execute("SELECT * FROM plans WHERE id = ?", (item["plan_id"],)).fetchone()
+        if not plan_row or not plan_row["approved"]:
+            conflicts.append({"index": item["index"], "plan_id": item["plan_id"],
+                              "reason": "计划不存在或未批准"})
+            continue
+        if item.get("product_version_id"):
+            version = db.execute(
+                "SELECT * FROM product_versions WHERE id = ?", (item["product_version_id"],),
+            ).fetchone()
+            if not version or version["product_asset_id"] != plan_row["product_asset_id"]:
+                conflicts.append({
+                    "index": item["index"], "plan_id": item["plan_id"],
+                    "product_version_id": item["product_version_id"],
+                    "reason": "产品版本与已批准计划绑定的产品不一致",
+                })
+    if conflicts:
+        raise HTTPException(422, {
+            "code": "incompatible_combination",
+            "detail": f"{len(conflicts)} 项与已批准计划的产品绑定不一致",
+            "conflicts": conflicts,
+        })
+    return expanded
+
+
+@app.post("/api/v1/batches/preview")
+def preview_batch(request: BatchPreviewRequest) -> dict:
+    """只做展开与校验，不创建任何任务（展开数量由服务端给出）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        expanded = _expand_batch_request(db, request, owner_id, project_id)
+    return {
+        "mode": expanded["mode"],
+        "expanded_count": expanded["expanded_count"],
+        "items": expanded["items"],
+        "duplicates": expanded["duplicates"],
+        "dedupe_note": expanded["dedupe_note"],
+        "limits": {"max_expanded_items": batch_rules.MAX_EXPANDED_ITEMS,
+                   "max_concurrent": request.max_concurrent},
+        "side_effects": "none（预览不创建任务）",
+    }
+
+
+@app.post("/api/v1/batches", status_code=202)
+def create_batch(request: BatchCreateRequest, background: BackgroundTasks) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        if request.idempotency_key:
+            existing = db.execute(
+                "SELECT * FROM batches WHERE owner_id = ? AND idempotency_key = ?",
+                (owner_id, request.idempotency_key),
+            ).fetchone()
+            if existing:
+                return {"batch": _batch_public(db, existing), "reused_idempotent": True, "created": False}
+        expanded = _expand_batch_request(db, request, owner_id, project_id)
+        batch_id = str(uuid.uuid4())
+        now = utc_now()
+        publish_intent = batch_rules.normalize_publish_intent(request.publish_intent)
+        payload = {
+            "mode": expanded["mode"],
+            "expanded_count": expanded["expanded_count"],
+            "duplicates": expanded["duplicates"],
+            "max_concurrent": request.max_concurrent,
+            "budget_limit": request.budget_limit,
+            "publish_intent": publish_intent,
+            "publish_status": "NOT_REQUESTED",
+            "notes": request.notes,
+            "requested_total": expanded.get("requested_total"),
+        }
+        payload_text = _canonical_json_text(payload)
+        db.execute(
+            "INSERT INTO batches(id, owner_id, project_id, name, status, revision, paused, cancelled, "
+            "idempotency_key, payload, payload_sha256, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'QUEUED', 1, 0, 0, ?, ?, ?, ?, ?)",
+            (batch_id, owner_id, project_id, request.name or f"批次 {batch_id[:8]}", request.idempotency_key,
+             payload_text, hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now, now),
+        )
+        for item in expanded["items"]:
+            item_payload = {
+                "product_version_id": item.get("product_version_id"),
+                "plan_id": item["plan_id"],
+                "profile_id": item.get("profile_id"),
+                "profile_version_id": item.get("profile_version_id"),
+                "variation": item.get("variation", 1),
+                "seed": item.get("seed"),
+                "request_item_key": item.get("request_item_key", ""),
+                "index": item["index"],
+            }
+            item_text = _canonical_json_text(item_payload)
+            db.execute(
+                "INSERT INTO batch_items(id, batch_id, item_index, status, run_id, job_id, cache_key, error, "
+                "payload, payload_sha256, created_at, updated_at) VALUES (?, ?, ?, 'PENDING', NULL, NULL, ?, NULL, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), batch_id, item["index"], item["cache_key"], item_text,
+                 hashlib.sha256(item_text.encode("utf-8")).hexdigest(), now, now),
+            )
+        row = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        public = _batch_public(db, row)
+    if not INLINE_EXECUTOR_DISABLED:
+        background.add_task(advance_batch, batch_id)
+    return {"batch": public, "reused_idempotent": False, "created": True}
+
+
+def start_batch_item_run(db, batch_row, item_row) -> dict:
+    """为批次项创建独立 Run（每项独立失败/取消，不影响其他项）。"""
+    payload = json.loads(item_row["payload"])
+    plan_row = db.execute("SELECT * FROM plans WHERE id = ?", (payload["plan_id"],)).fetchone()
+    if not plan_row:
+        raise HTTPException(409, f"计划不存在: {payload['plan_id']}")
+    contract = get_default_contract(plan_row["id"], db, batch_row["owner_id"], batch_row["project_id"])
+    if contract is None:
+        raise HTTPException(409, f"计划缺少冻结合同，无法启动批次项: {payload['plan_id']}")
+    asset = db.execute("SELECT * FROM assets WHERE id = ?", (plan_row["product_asset_id"],)).fetchone()
+    if not asset:
+        raise HTTPException(409, "计划绑定的产品素材不存在")
+    run_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    now = utc_now()
+    request_hash = hashlib.sha256(
+        _canonical_json_text({"batch_id": item_row["batch_id"], "index": item_row["item_index"],
+                              "cache_key": item_row["cache_key"]}).encode("utf-8")
+    ).hexdigest()
+    # 先写 jobs 再写 runs：runs.job_id 有外键指向 jobs（SQLite 默认不校验，PostgreSQL 会拒绝）
+    db.execute(
+        "INSERT INTO jobs VALUES (?, ?, ?, ?, 'QUEUED', 'QUEUED', 0, NULL, NULL, NULL, 0, ?, ?)",
+        (job_id, payload["plan_id"], asset["id"], asset["kind"], now, now),
+    )
+    db.execute(
+        "INSERT INTO runs(id, plan_id, plan_contract_id, owner_id, request_hash, idempotency_key, status, stage, "
+        "progress, job_id, attempt_count, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', 'QUEUED', 0, ?, 1, ?, ?)",
+        (run_id, payload["plan_id"], contract["id"], batch_row["owner_id"], request_hash,
+         f"batch:{item_row['batch_id']}:{item_row['item_index']}", job_id, now, now),
+    )
+    # 队列行（run_jobs）必须一起写：Worker 只从 run_jobs 领取任务，缺了它任务永远不会被执行
+    run_job_id = str(uuid.uuid4())
+    db.execute(
+        "INSERT INTO run_jobs (id, run_id, job_id, attempt, status, stage, created_at, updated_at, error) "
+        "VALUES (?, ?, ?, 1, 'QUEUED', 'PREPARE', ?, ?, NULL)",
+        (run_job_id, run_id, job_id, now, now),
+    )
+    db.execute(
+        "INSERT INTO job_attempts (id, run_job_id, attempt, status, started_at, completed_at, error, metadata) "
+        "VALUES (?, ?, 1, 'CREATED', ?, NULL, NULL, NULL)",
+        (str(uuid.uuid4()), run_job_id, now),
+    )
+    return {"run_id": run_id, "job_id": job_id, "plan_contract_id": contract["id"]}
+
+
+def advance_batch(batch_id: str) -> dict:
+    """批次调度：按并发上限为 PENDING 项创建 Run，并更新聚合状态。暂停时只停新调度。"""
+    with connect() as db:
+        begin_immediate(db)
+        batch = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        if not batch:
+            raise HTTPException(404, "批次不存在")
+        batch_payload = json.loads(batch["payload"])
+        max_concurrent = int(batch_payload.get("max_concurrent") or batch_rules.DEFAULT_MAX_CONCURRENT)
+        items = db.execute(
+            "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
+        ).fetchall()
+        active = [item for item in items if item["status"] in ("QUEUED", "RUNNING")]
+        # 与批次项关联的 Run 状态回写
+        for item in items:
+            if item["run_id"] and item["status"] in ("QUEUED", "RUNNING"):
+                run = db.execute("SELECT * FROM runs WHERE id = ?", (item["run_id"],)).fetchone()
+                job = db.execute("SELECT * FROM jobs WHERE id = ?", (item["job_id"],)).fetchone() if item["job_id"] else None
+                if job and job["status"] in ("SUCCEEDED", "VERIFICATION_PASSED", "FAILED", "CANCELLED", "QA_REJECTED"):
+                    new_status = {
+                        "SUCCEEDED": "SUCCEEDED", "VERIFICATION_PASSED": "SUCCEEDED",
+                        "FAILED": "FAILED", "QA_REJECTED": "FAILED", "CANCELLED": "CANCELLED",
+                    }[job["status"]]
+                    db.execute(
+                        "UPDATE batch_items SET status = ?, error = ?, updated_at = ? WHERE id = ?",
+                        (new_status, job["error"], utc_now(), item["id"]),
+                    )
+                elif job and job["status"] == "RUNNING" and item["status"] != "RUNNING":
+                    db.execute("UPDATE batch_items SET status = 'RUNNING', updated_at = ? WHERE id = ?",
+                               (utc_now(), item["id"]))
+        items = db.execute(
+            "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
+        ).fetchall()
+        active = [item for item in items if item["status"] in ("QUEUED", "RUNNING")]
+        started = []
+        if not batch["paused"] and not batch["cancelled"]:
+            for item in items:
+                if len(active) >= max_concurrent:
+                    break
+                if item["status"] != "PENDING":
+                    continue
+                try:
+                    created = start_batch_item_run(db, batch, item)
+                except HTTPException as exc:
+                    # 调度失败必须可见：记录到该项并继续尝试其他项（不阻塞、不静默）
+                    db.execute("UPDATE batch_items SET status = 'FAILED', error = ?, updated_at = ? WHERE id = ?",
+                               (f"调度失败: {exc.detail}", utc_now(), item["id"]))
+                    continue
+                db.execute(
+                    "UPDATE batch_items SET status = 'QUEUED', run_id = ?, job_id = ?, error = NULL, updated_at = ? WHERE id = ?",
+                    (created["run_id"], created["job_id"], utc_now(), item["id"]),
+                )
+                started.append({"item_id": item["id"], "index": item["item_index"], **created})
+                active.append(item)
+        items = db.execute(
+            "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
+        ).fetchall()
+        statuses = [item["status"] for item in items]
+        new_status = batch_rules.aggregate_status(statuses, paused=bool(batch["paused"]),
+                                                 cancelled=bool(batch["cancelled"]))
+        db.execute("UPDATE batches SET status = ?, updated_at = ? WHERE id = ?",
+                   (new_status, utc_now(), batch_id))
+        row = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        public = _batch_public(db, row)
+    for start in started:
+        if not INLINE_EXECUTOR_DISABLED:
+            execute_job(start["job_id"])
+    return {"batch": public, "started": started}
+
+
+@app.get("/api/v1/batches")
+def list_batches(owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJECT_ID) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM batches WHERE owner_id = ? AND project_id = ? ORDER BY created_at DESC LIMIT 100",
+            (owner_id, project_id),
+        ).fetchall()
+        return [_batch_public(db, row) for row in rows]
+
+
+@app.get("/api/v1/batches/{batch_id}")
+def get_batch(batch_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM batches WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (batch_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "批次不存在")
+        return _batch_public(db, row)
+
+
+@app.get("/api/v1/batches/{batch_id}/items")
+def list_batch_items(batch_id: str, cursor: int = 0, limit: int = 50, status: str = "") -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    limit = max(1, min(200, limit))
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM batches WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (batch_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "批次不存在")
+        query = "SELECT * FROM batch_items WHERE batch_id = ? AND item_index >= ?"
+        params: list = [batch_id, cursor]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY item_index ASC LIMIT ?"
+        params.append(limit + 1)
+        items = db.execute(query, tuple(params)).fetchall()
+        next_cursor = items[limit]["item_index"] if len(items) > limit else None
+        items = items[:limit]
+        summary = batch_rules.summarize([
+            dict(item) for item in db.execute(
+                "SELECT * FROM batch_items WHERE batch_id = ?", (batch_id,)
+            ).fetchall()
+        ])
+    return {
+        "batch_id": batch_id,
+        "items": [_batch_item_public(item) for item in items],
+        "next_cursor": next_cursor,
+        "summary": summary,
+        "note": "total 为服务端聚合，不从本页行数推算",
+    }
+
+
+@app.post("/api/v1/batches/{batch_id}/pause")
+def pause_batch(batch_id: str, request: BatchActionRequest) -> dict:
+    """暂停只停新调度：已在跑的任务继续（取消需显式调用 cancel）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM batches WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (batch_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "批次不存在")
+        db.execute("UPDATE batches SET paused = 1, revision = revision + 1, status = 'PAUSED', updated_at = ? "
+                   "WHERE id = ?", (utc_now(), batch_id))
+        updated = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        public = _batch_public(db, updated)
+    return {"batch": public, "reason": request.reason,
+            "note": "暂停只停新调度；已运行的任务保持运行，取消请显式调用 cancel"}
+
+
+@app.post("/api/v1/batches/{batch_id}/resume")
+def resume_batch(batch_id: str, request: BatchActionRequest, background: BackgroundTasks) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM batches WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (batch_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "批次不存在")
+        db.execute("UPDATE batches SET paused = 0, revision = revision + 1, updated_at = ? WHERE id = ?",
+                   (utc_now(), batch_id))
+    if not INLINE_EXECUTOR_DISABLED:
+        background.add_task(advance_batch, batch_id)
+    return {"batch": get_batch(batch_id), "reason": request.reason}
+
+
+@app.post("/api/v1/batches/{batch_id}/cancel")
+def cancel_batch(batch_id: str, request: BatchActionRequest) -> dict:
+    """取消可选范围：只取消未开始的项（not_started）或全部未完成项（all_unfinished）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    cancelled_items: list[dict] = []
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM batches WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (batch_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "批次不存在")
+        items = db.execute(
+            "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
+        ).fetchall()
+        for item in items:
+            target = item["status"] == "PENDING" or (
+                request.scope == "all_unfinished" and item["status"] in ("QUEUED", "RUNNING")
+            )
+            if not target:
+                continue
+            db.execute("UPDATE batch_items SET status = 'CANCELLED', updated_at = ? WHERE id = ?",
+                       (utc_now(), item["id"]))
+            cancelled_items.append({"item_id": item["id"], "index": item["item_index"],
+                                    "run_id": item["run_id"]})
+            if item["job_id"] and item["status"] in ("QUEUED", "RUNNING"):
+                db.execute("UPDATE jobs SET cancel_requested = 1, updated_at = ? WHERE id = ?",
+                           (utc_now(), item["job_id"]))
+        full = request.scope == "all_unfinished"
+        db.execute("UPDATE batches SET cancelled = ?, paused = 0, revision = revision + 1, updated_at = ? WHERE id = ?",
+                   (1 if full else 0, utc_now(), batch_id))
+        remaining = db.execute(
+            "SELECT status FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
+        ).fetchall()
+        new_status = batch_rules.aggregate_status([item["status"] for item in remaining],
+                                                  cancelled=full)
+        db.execute("UPDATE batches SET status = ?, updated_at = ? WHERE id = ?",
+                   (new_status, utc_now(), batch_id))
+        updated = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        public = _batch_public(db, updated)
+    return {"batch": public, "scope": request.scope, "cancelled": cancelled_items,
+            "reason": request.reason,
+            "note": "取消只影响所选范围的项；已成功的产物保留"}
+
+
+@app.post("/api/v1/batches/{batch_id}/retry-failed")
+def retry_failed_batch_items(batch_id: str, request: BatchActionRequest, background: BackgroundTasks) -> dict:
+    """重试只针对失败/已取消项；已成功产物不会被重跑。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM batches WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (batch_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "批次不存在")
+        items = [dict(item) for item in db.execute(
+            "SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (batch_id,),
+        ).fetchall()]
+        targets = batch_rules.select_retry_targets(items, item_filter=request.item_filter)
+        for item in targets:
+            db.execute(
+                "UPDATE batch_items SET status = 'PENDING', run_id = NULL, job_id = NULL, error = NULL, "
+                "updated_at = ? WHERE id = ?", (utc_now(), item["id"]),
+            )
+        db.execute("UPDATE batches SET paused = 0, cancelled = 0, revision = revision + 1, updated_at = ? WHERE id = ?",
+                   (utc_now(), batch_id))
+        retried = [{"item_id": item["id"], "index": item["item_index"], "previous_status": item["status"]}
+                   for item in targets]
+        public = _batch_public(db, db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone())
+    if retried and not INLINE_EXECUTOR_DISABLED:
+        background.add_task(advance_batch, batch_id)
+    return {"batch": public, "retried": retried,
+            "skipped_succeeded": [item["item_index"] for item in items if item["status"] == "SUCCEEDED"],
+            "reason": request.reason,
+            "note": "只重置失败/取消项；已成功项保持不动（复用需输入快照/能力/许可完全相符）"}
+
+
+# ---------------------------------------------------------------------------
+# V6-05：发布包（build → verify → approve，审批后不可变）
+# ---------------------------------------------------------------------------
+
+
+class PackageBuildRequest(BaseModel):
+    profile_id: str = Field(default="", max_length=80)
+    localization_id: str = Field(default="", max_length=80)
+    subtitle_track_id: str = Field(default="", max_length=80)
+    audio_mix_id: str = Field(default="", max_length=80)
+    final_rendition_id: str = Field(default="", max_length=80)
+    clean_master_rendition_id: str = Field(default="", max_length=80)
+    thumbnail_rendition_id: str = Field(default="", max_length=80)
+    include_voice_file: bool = False
+    include_mixed_audio: bool = True
+    batch_id: str = Field(default="", max_length=80)
+    notes: str = Field(default="", max_length=2000)
+
+
+class PackageApproveRequest(BaseModel):
+    content_hash: str = Field(min_length=8, max_length=128)
+    reason: str = Field(default="", max_length=500)
+
+
+def _latest_row(db, table: str, where: str, params: tuple, order: str = "created_at DESC"):
+    return db.execute(f"SELECT * FROM {table} WHERE {where} ORDER BY {order} LIMIT 1", params).fetchone()
+
+
+def _run_qa_summary(db, run_id: str, job_id: str) -> dict | None:
+    """QA 来源如实标注：优先严格 QA 报告，其次运行 manifest 的媒体质量门。"""
+    row = _latest_row(db, "qa_reports", "run_id = ?", (run_id,))
+    if row:
+        payload = json.loads(row["payload"])
+        return {
+            "source": "strict_qa_report",
+            "passed": bool(payload.get("passed")),
+            "blocked": bool(payload.get("blocked", not payload.get("passed"))),
+            "report_id": row["id"],
+            "report_sha256": row["payload_sha256"],
+            "approval_ref": {"kind": "qa_report", "id": row["id"], "sha256": row["payload_sha256"]},
+        }
+    manifest_path = RUNS / job_id / "metadata.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        qa = manifest.get("qa") or {}
+        if qa:
+            return {
+                "source": "run_manifest_media_gate",
+                "passed": bool(qa.get("passed")),
+                "blocked": not bool(qa.get("passed")),
+                "failures": qa.get("failures", []),
+                "approval_ref": {"kind": "run_manifest", "id": job_id,
+                                 "sha256": _file_sha256(manifest_path)},
+                "note": "媒体质量门（黑帧/可见性）结果；完整保真 QA 属严格管线",
+            }
+    return None
+
+
+@app.post("/api/v1/runs/{run_id}/packages", status_code=201)
+def build_publish_package(run_id: str, request: PackageBuildRequest) -> dict:
+    """构建发布包：先 build → verify，通过后才可 approve（审批后不可变）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        run = _resolve_run_scope(db, run_id)
+        if run["owner_id"] != owner_id or run["project_id"] != project_id:
+            raise HTTPException(403, "越权访问 Run")
+        final = None
+        if request.final_rendition_id:
+            final = db.execute("SELECT * FROM output_renditions WHERE id = ? AND run_id = ? AND kind = 'final'",
+                               (request.final_rendition_id, run_id)).fetchone()
+        else:
+            final = _latest_row(db, "output_renditions", "run_id = ? AND kind = 'final'", (run_id,))
+        if not final:
+            raise HTTPException(409, "缺少成片（final rendition）：请先编码成片再打包")
+        clean = None
+        if request.clean_master_rendition_id:
+            clean = db.execute("SELECT * FROM output_renditions WHERE id = ? AND run_id = ?",
+                               (request.clean_master_rendition_id, run_id)).fetchone()
+        else:
+            clean = _latest_row(db, "output_renditions", "run_id = ? AND kind = 'clean_master'", (run_id,))
+        thumbnail = _latest_row(db, "output_renditions", "run_id = ? AND kind = 'thumbnail'", (run_id,))
+        localization = None
+        if request.localization_id:
+            localization = db.execute(
+                "SELECT * FROM localizations WHERE id = ? AND owner_id = ? AND project_id = ?",
+                (request.localization_id, owner_id, project_id),
+            ).fetchone()
+        else:
+            localization = _latest_row(db, "localizations", "run_id = ? AND owner_id = ? AND project_id = ?",
+                                       (run_id, owner_id, project_id), order="created_at DESC")
+        if not localization:
+            raise HTTPException(409, "缺少本地化文案：请先创建 localizations 再打包")
+        revision = _latest_localization_revision(db, localization["id"])
+        copy_payload = json.loads(revision["payload"])
+        if request.subtitle_track_id:
+            subtitle = db.execute("SELECT * FROM subtitle_tracks WHERE id = ? AND localization_id = ?",
+                                  (request.subtitle_track_id, localization["id"])).fetchone()
+        else:
+            subtitle = _latest_row(db, "subtitle_tracks", "localization_id = ?", (localization["id"],))
+        mix = (db.execute("SELECT * FROM audio_mixes WHERE id = ? AND run_id = ?",
+                          (request.audio_mix_id, run_id)).fetchone() if request.audio_mix_id
+               else _latest_row(db, "audio_mixes", "run_id = ?", (run_id,)))
+        profile = None
+        if request.profile_id:
+            profile = _profile_for_request(db, request.profile_id, owner_id, project_id)
+        if profile is None and localization["profile_id"]:
+            profile = _profile_for_request(db, localization["profile_id"], owner_id, project_id)
+        qa = _run_qa_summary(db, run_id, run["job_id"])
+        job = db.execute("SELECT * FROM jobs WHERE id = ?", (run["job_id"],)).fetchone()
+        existing_versions = db.execute(
+            "SELECT COUNT(*) AS n FROM publish_packages WHERE run_id = ? AND locale = ?",
+            (run_id, localization["locale"]),
+        ).fetchone()["n"]
+    if qa is None:
+        raise HTTPException(409, "缺少 QA 结果：没有质量门结果的成片不能打包")
+    rendition_payload = json.loads(final["payload"])
+    subtitle_payload = json.loads(subtitle["payload"]) if subtitle else None
+    profile_spec = profile["spec"] if profile else None
+    output_info = {
+        "width": rendition_payload["spec"]["width"], "height": rendition_payload["spec"]["height"],
+        "fps": rendition_payload["spec"]["fps"], "duration_s": final and rendition_payload["report"]["duration_s"],
+        "frame_count": int(rendition_payload["report"].get("nb_frames") or 0),
+    }
+    aspect = None
+    if output_info["width"] and output_info["height"]:
+        for name, (w, h) in (("9:16", (9, 16)), ("1:1", (1, 1)), ("2:3", (2, 3))):
+            if abs(output_info["width"] / output_info["height"] - w / h) <= 0.005 * (w / h):
+                aspect = name
+                break
+    subtitle_state = (
+        {"enabled": True, "alignment": subtitle_payload["alignment"], "locale": subtitle["locale"],
+         "files": subtitle_payload["files"], "cue_count": subtitle_payload["cue_count"]}
+        if subtitle else publish_package.disabled_state(False, "未生成字幕轨（显式关闭）")
+    )
+    voice_state = publish_package.disabled_state(False, "未包含配音原文件（许可策略默认不分发原始音频）")
+    music_state = publish_package.disabled_state(False, "未包含 BGM 原文件（许可策略不允许单独分发音乐）")
+    if mix:
+        mix_payload = json.loads(mix["payload"])
+        voice_state = {"enabled": mix_payload["voice"]["enabled"],
+                       "status": "mixed_only" if mix_payload["voice"]["enabled"] else "disabled",
+                       "reason": "配音已进入混音轨；原始配音文件默认不入包",
+                       "duration_s": mix_payload["duration_s"]}
+        music_state = {
+            "enabled": mix_payload["music"]["enabled"],
+            "status": "licensed_reference_only" if mix_payload["music"]["enabled"] else "disabled",
+            "reason": "只保留许可引用与混音记录",
+            "license_ref": mix_payload.get("music_license_ref"),
+            "commercial_use_allowed": mix_payload.get("music_commercial_use_allowed"),
+        }
+    problems = publish_package.validate_package_request(
+        profile_spec={"aspect_ratio": profile_spec.composition.aspect_ratio} if profile_spec else {},
+        output={"aspect_ratio": aspect}, qa={"passed": qa["passed"], "approval_ref": qa["approval_ref"]},
+        subtitle_state=subtitle_state,
+    )
+    if problems:
+        raise HTTPException(422, {"code": "package_preflight_failed", "detail": problems})
+    package_id = str(uuid.uuid4())
+    version = int(existing_versions) + 1
+    directory_name = f"publish-package_{package_id}_v{version}"
+    directory = VAR / "packages" / directory_name
+    (directory / "video").mkdir(parents=True, exist_ok=True)
+    (directory / "subtitles").mkdir(parents=True, exist_ok=True)
+    (directory / "audio").mkdir(parents=True, exist_ok=True)
+    (directory / "images").mkdir(parents=True, exist_ok=True)
+    (directory / "copy").mkdir(parents=True, exist_ok=True)
+    (directory / "metadata").mkdir(parents=True, exist_ok=True)
+    (directory / "publish").mkdir(parents=True, exist_ok=True)
+    files: list[dict] = []
+
+    def place(source: Path, relative: str, role: str) -> None:
+        target = directory / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+        files.append(publish_package.file_entry(target, role=role,
+                                                arcname=f"{directory_name}/{relative}"))
+
+    place(Path(final["path"]), "video/final.mp4", "video")
+    if clean and clean["path"] != final["path"]:
+        place(Path(clean["path"]), "video/clean_master.mp4", "clean_master")
+    if subtitle_payload:
+        for item in subtitle_payload["files"]:
+            place(Path(item["path"]), f"subtitles/{subtitle['locale']}.{item['format']}", "subtitle")
+    if mix and request.include_mixed_audio:
+        place(Path(mix["path"]), "audio/mixed.wav", "audio")
+    if request.include_voice_file:
+        voiceover = _latest_row(db, "voiceovers", "run_id = ?", (run_id,))
+        if voiceover and voiceover["license_ref"]:
+            place(Path(voiceover["path"]), "audio/voice.wav", "audio")
+        else:
+            request.include_voice_file = False
+    if thumbnail:
+        place(Path(thumbnail["path"]), "images/thumbnail.jpg", "image")
+    caption_text = "\n\n".join(filter(None, [copy_payload.get("headline"), copy_payload.get("body"),
+                                             copy_payload.get("cta")]))
+    (directory / "copy" / "caption.txt").write_text(caption_text + "\n", encoding="utf-8")
+    (directory / "copy" / "hashtags.txt").write_text(
+        " ".join(copy_payload.get("hashtags", [])) + "\n", encoding="utf-8")
+    (directory / "copy" / "product_facts.json").write_text(
+        json.dumps({"facts": copy_payload.get("facts", {}),
+                    "generated": copy_payload.get("generated", {}),
+                    "note": "事实字段来自批准数据；生成式文案单独标注"},
+                   ensure_ascii=False, indent=2), encoding="utf-8")
+    for relative, role in (("copy/caption.txt", "copy"), ("copy/hashtags.txt", "copy"),
+                           ("copy/product_facts.json", "copy")):
+        files.append(publish_package.file_entry(directory / relative, role=role,
+                                                arcname=f"{directory_name}/{relative}"))
+    profile_doc = {
+        "profile_id": request.profile_id or (localization["profile_id"] or ""),
+        "profile_version": profile["version"]["version"] if profile else None,
+        "payload_sha256": profile["version"]["payload_sha256"] if profile else None,
+        "spec": profile_spec.model_dump() if profile_spec else None,
+        "rules_status": platform_profiles.rules_status(profile_spec) if profile_spec else None,
+        "note": "Profile 是产品预设；不代表账号存在或已核验平台规则",
+    }
+    (directory / "metadata" / "platform_profile.json").write_text(
+        json.dumps(profile_doc, ensure_ascii=False, indent=2), encoding="utf-8")
+    lineage = {
+        "schema_version": "1.0", "run_id": run_id, "job_id": run["job_id"], "plan_id": run["plan_id"],
+        "product_version_id": rendition_payload.get("product_version_id"),
+        "video_source_sha256": rendition_payload.get("video_source_sha256"),
+        "audio_mix_sha256": rendition_payload.get("audio_mix_sha256"),
+        "final_sha256": rendition_payload.get("sha256"),
+        "clean_master_sha256": json.loads(clean["payload"]).get("sha256") if clean else None,
+        "subtitle_track_id": subtitle["id"] if subtitle else None,
+        "localization_id": localization["id"], "localization_revision": revision["revision"],
+        "profile": {"profile_id": request.profile_id or localization["profile_id"],
+                    "profile_version": profile["version"]["version"] if profile else None},
+        "note": "保留渲染 Master → 混音 → 编码成片 → 发布包 的来源链",
+    }
+    (directory / "metadata" / "lineage.json").write_text(
+        json.dumps(lineage, ensure_ascii=False, indent=2), encoding="utf-8")
+    (directory / "metadata" / "qa_report.json").write_text(
+        json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+    rights = publish_package.rights_manifest(
+        profile={"platform": profile_spec.identity.platform if profile_spec else "",
+                 "rules_source_url": profile_spec.rules.rules_source_url if profile_spec else "",
+                 "rules_verified_at": profile_spec.rules.rules_verified_at if profile_spec else ""},
+        music=music_state, voice=voice_state,
+        fonts=[{"font_ref": profile_spec.subtitles.font_ref,
+                "license": profile_spec.subtitles.font_license}] if profile_spec else [],
+        materials=[{"role": "video", "source": "本产品真实渲染/合成链路"},
+                   {"role": "music", "included": False, "license_ref": music_state.get("license_ref")}],
+    )
+    (directory / "metadata" / "rights_manifest.json").write_text(
+        json.dumps(rights, ensure_ascii=False, indent=2), encoding="utf-8")
+    (directory / "metadata" / "cost_summary.json").write_text(
+        json.dumps({"note": "成本账本属于 V6-06；此处不编造数字"}, ensure_ascii=False, indent=2),
+        encoding="utf-8")
+    for relative, role in (("metadata/platform_profile.json", "metadata"),
+                           ("metadata/lineage.json", "metadata"),
+                           ("metadata/qa_report.json", "metadata"),
+                           ("metadata/rights_manifest.json", "metadata"),
+                           ("metadata/cost_summary.json", "metadata")):
+        files.append(publish_package.file_entry(directory / relative, role=role,
+                                                arcname=f"{directory_name}/{relative}"))
+    template = publish_package.publish_request_template(
+        package_id=package_id, package_version=version,
+        platform=profile_spec.identity.platform if profile_spec else "",
+        locale=localization["locale"],
+        output_target=profile_spec.publish.output_target if profile_spec else "feed",
+        suggested_visibility=profile_spec.publish.suggested_visibility if profile_spec else "private",
+        disclosure_flags=profile_spec.publish.disclosure_flags if profile_spec else [],
+    )
+    (directory / "publish" / "request.template.json").write_text(
+        json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
+    (directory / "publish" / "README.md").write_text(
+        publish_package.publish_readme(
+            profile_spec.identity.platform if profile_spec else "", localization["locale"],
+            profile_spec.publish.suggested_visibility if profile_spec else "private"),
+        encoding="utf-8")
+    for relative, role in (("publish/request.template.json", "publish_template"),
+                           ("publish/README.md", "publish_template")):
+        files.append(publish_package.file_entry(directory / relative, role=role,
+                                                arcname=f"{directory_name}/{relative}"))
+    manifest = publish_package.build_manifest(
+        package_id=package_id, version=version, project_id=project_id,
+        product_version_id=rendition_payload.get("product_version_id"),
+        plan_id=run["plan_id"], profile_id=request.profile_id or (localization["profile_id"] or ""),
+        profile_version=profile["version"]["version"] if profile else 0,
+        locale=localization["locale"], batch_id=request.batch_id or None, run_id=run_id,
+        files=files,
+        duration_s=float(output_info["duration_s"] or 0), fps=int(output_info["fps"] or 24),
+        resolution=f"{output_info['width']}x{output_info['height']}",
+        qa={"source": qa["source"], "passed": qa["passed"],
+            "approval_ref": qa["approval_ref"], "note": qa.get("note", "")},
+        approval_ref={"kind": "package_content_hash", "content_hash": publish_package.package_content_hash(files)},
+        rights_refs={"rights_manifest": f"{directory_name}/metadata/rights_manifest.json",
+                     "music_license_ref": music_state.get("license_ref")},
+        warnings=([] if subtitle_payload else ["字幕未启用：清单标注 disabled，不代表已生成"]),
+        subtitles_state=subtitle_state, voice_state=voice_state, music_state=music_state,
+        publish_template_ref=f"{directory_name}/publish/request.template.json",
+        created_at=utc_now(),
+    )
+    (directory / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 以包目录的父目录为根校验：manifest 内的路径自带 publish-package_<id>_v<n>/ 前缀
+    verification = publish_package.verify_package(directory.parent, manifest)
+    content_hash = publish_package.package_content_hash(files)
+    zip_info = publish_package.zip_package(directory, VAR / "package-zips" / f"{directory_name}.zip")
+    now = utc_now()
+    payload = {
+        "manifest": manifest, "verification": verification, "zip": zip_info,
+        "content_hash": content_hash, "include_voice_file": request.include_voice_file,
+        "include_mixed_audio": request.include_mixed_audio, "notes": request.notes,
+        "built_from": {
+            "final_rendition_id": final["id"], "clean_master_rendition_id": clean["id"] if clean else None,
+            "thumbnail_rendition_id": thumbnail["id"] if thumbnail else None,
+            "audio_mix_id": mix["id"] if mix else None,
+            "subtitle_track_id": subtitle["id"] if subtitle else None,
+            "localization_revision_id": revision["id"],
+        },
+    }
+    payload_text = _canonical_json_text(payload)
+    with connect() as db:
+        db.execute(
+            "INSERT INTO publish_packages(id, run_id, batch_id, owner_id, project_id, profile_id, locale, version, "
+            "status, content_hash, directory, zip_path, zip_sha256, approved_at, payload, payload_sha256, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            (package_id, run_id, request.batch_id or None, owner_id, project_id,
+             request.profile_id or (localization["profile_id"] or None), localization["locale"], version,
+             "BUILT" if not verification else "INVALID", content_hash, str(directory),
+             zip_info["path"], zip_info["sha256"], payload_text,
+             hashlib.sha256(payload_text.encode("utf-8")).hexdigest(), now, now),
+        )
+    return {
+        "id": package_id, "status": "BUILT" if not verification else "INVALID",
+        "content_hash": content_hash, "verification": verification, "manifest": manifest,
+        "zip": zip_info, "directory": str(directory),
+        "download_url": f"/api/v1/packages/{package_id}/download",
+        "next": "verify → approve：审批绑定 content_hash，审批后不可变",
+    }
+
+
+@app.get("/api/v1/packages")
+def list_publish_packages(run_id: str = "", batch_id: str = "") -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        query = "SELECT * FROM publish_packages WHERE owner_id = ? AND project_id = ?"
+        params: list = [owner_id, project_id]
+        if run_id:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        if batch_id:
+            query += " AND batch_id = ?"
+            params.append(batch_id)
+        query += " ORDER BY created_at DESC LIMIT 200"
+        rows = db.execute(query, tuple(params)).fetchall()
+    return [{
+        "id": row["id"], "run_id": row["run_id"], "batch_id": row["batch_id"],
+        "locale": row["locale"], "profile_id": row["profile_id"], "version": row["version"],
+        "status": row["status"], "content_hash": row["content_hash"],
+        "zip_sha256": row["zip_sha256"], "approved_at": row["approved_at"],
+        "created_at": row["created_at"], "download_url": f"/api/v1/packages/{row['id']}/download",
+    } for row in rows]
+
+
+@app.get("/api/v1/packages/{package_id}")
+def get_publish_package(package_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM publish_packages WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (package_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "发布包不存在")
+    payload = json.loads(row["payload"])
+    return {
+        "id": row["id"], "run_id": row["run_id"], "batch_id": row["batch_id"], "locale": row["locale"],
+        "profile_id": row["profile_id"], "version": row["version"], "status": row["status"],
+        "content_hash": row["content_hash"], "zip": payload.get("zip"),
+        "verification": payload.get("verification"), "manifest": payload.get("manifest"),
+        "created_at": row["created_at"], "approved_at": row["approved_at"],
+        "download_url": f"/api/v1/packages/{package_id}/download",
+    }
+
+
+@app.post("/api/v1/packages/{package_id}/verify")
+def verify_publish_package(package_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM publish_packages WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (package_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "发布包不存在")
+    payload = json.loads(row["payload"])
+    directory = Path(row["directory"])
+    if not directory.exists():
+        raise HTTPException(409, "包目录已不存在")
+    failures = publish_package.verify_package(directory.parent, payload["manifest"])
+    recomputed = publish_package.package_content_hash(payload["manifest"]["files"])
+    hash_matches = recomputed == row["content_hash"]
+    if not hash_matches:
+        failures.append("内容哈希与构建时不一致（文件被修改）")
+    with connect() as db:
+        db.execute("UPDATE publish_packages SET status = ?, updated_at = ? WHERE id = ?",
+                   ("BUILT" if not failures else "INVALID", utc_now(), package_id))
+    return {"id": package_id, "verified": not failures, "failures": failures,
+            "content_hash": recomputed, "stored_hash": row["content_hash"], "hash_matches": hash_matches,
+            "status": "BUILT" if not failures else "INVALID"}
+
+
+@app.post("/api/v1/packages/{package_id}/approve")
+def approve_publish_package(package_id: str, request: PackageApproveRequest) -> dict:
+    """审批绑定 content_hash；审批后包不可变（任何修改都会让审批失效）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute(
+            "SELECT * FROM publish_packages WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (package_id, owner_id, project_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "发布包不存在")
+        if request.content_hash != row["content_hash"]:
+            raise HTTPException(409, {
+                "code": "content_hash_mismatch",
+                "detail": "审批必须绑定当前包内容哈希；内容已变化，请重新构建或重新校验",
+            })
+        payload = json.loads(row["payload"])
+        directory = Path(row["directory"])
+        failures = publish_package.verify_package(directory.parent, payload["manifest"])
+        if failures:
+            raise HTTPException(409, {"code": "package_invalid", "detail": failures[:5]})
+        now = utc_now()
+        db.execute("UPDATE publish_packages SET status = 'APPROVED', approved_at = ?, "
+                   "content_hash = ?, updated_at = ? WHERE id = ?",
+                   (now, request.content_hash, now, package_id))
+    return {"id": package_id, "status": "APPROVED", "approved_at": now,
+            "content_hash": request.content_hash, "reason": request.reason,
+            "note": "审批绑定内容哈希；此后修改任何文件都会使审批失效"}
+
+
+@app.get("/api/v1/packages/{package_id}/download")
+def download_publish_package(package_id: str) -> FileResponse:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM publish_packages WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (package_id, owner_id, project_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "发布包不存在")
+    path = Path(row["zip_path"])
+    if not path.exists():
+        raise HTTPException(404, "包 ZIP 已不存在，请重新构建")
+    digest = _file_sha256(path)
+    if digest != row["zip_sha256"]:
+        raise HTTPException(409, {
+            "code": "zip_hash_mismatch",
+            "detail": "ZIP 内容哈希与记录不一致：包已被修改，请重新构建",
+        })
+    return FileResponse(path, media_type="application/zip", filename=path.name)
+
+
+@app.post("/api/v1/batches/{batch_id}/packages/archive", status_code=201)
+def build_batch_archive(batch_id: str) -> dict:
+    """批次聚合 ZIP：只收集已审批的包（未审批内容不进入可发布归档）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        batch = db.execute(
+            "SELECT * FROM batches WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (batch_id, owner_id, project_id),
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, "批次不存在")
+        packages = db.execute(
+            "SELECT * FROM publish_packages WHERE batch_id = ? AND owner_id = ? AND project_id = ? "
+            "ORDER BY created_at ASC", (batch_id, owner_id, project_id),
+        ).fetchall()
+    approved = [row for row in packages if row["status"] == "APPROVED"]
+    if not approved:
+        raise HTTPException(409, {
+            "code": "no_approved_packages",
+            "detail": "批次没有已审批的发布包：请先 build → verify → approve，未审批内容不进入归档",
+        })
+    archive_dir = VAR / "package-zips" / f"batch-{batch_id}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    members = []
+    for row in approved:
+        zip_path = Path(row["zip_path"])
+        if not zip_path.exists():
+            continue
+        target = archive_dir / zip_path.name
+        target.write_bytes(zip_path.read_bytes())
+        members.append({"package_id": row["id"], "zip": zip_path.name,
+                        "sha256": _file_sha256(zip_path), "content_hash": row["content_hash"]})
+    archive_path = VAR / "package-zips" / f"batch-{batch_id}-packages.zip"
+    info = publish_package.zip_package(archive_dir, archive_path)
+    manifest = {
+        "schema_version": "1.0", "kind": "batch_package_archive", "batch_id": batch_id,
+        "package_count": len(members), "packages": members, "created_at": utc_now(),
+        "note": "只包含已审批的发布包；未审批内容不进入可发布归档",
+    }
+    (archive_dir / "batch-archive-manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    info = publish_package.zip_package(archive_dir, archive_path)
+    return {"batch_id": batch_id, "package_count": len(members), "archive": info, "manifest": manifest,
+            "download_url": f"/api/v1/batches/{batch_id}/packages/archive/download"}
+
+
+@app.get("/api/v1/batches/{batch_id}/packages/archive/download")
+def download_batch_archive(batch_id: str) -> FileResponse:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        batch = db.execute(
+            "SELECT * FROM batches WHERE id = ? AND owner_id = ? AND project_id = ?",
+            (batch_id, owner_id, project_id),
+        ).fetchone()
+    if not batch:
+        raise HTTPException(404, "批次不存在")
+    path = VAR / "package-zips" / f"batch-{batch_id}-packages.zip"
+    if not path.exists():
+        raise HTTPException(404, "批次归档不存在，请先生成")
+    return FileResponse(path, media_type="application/zip", filename=path.name)
+
+
+class ProductionShotInput(BaseModel):
+    id: str = Field(default="", max_length=40)
+    name: str = Field(default="", max_length=120)
+    camera: Literal["dolly_in", "side_track", "hero_orbit", "static"] = "static"
+    focal_length_mm: int = Field(default=35, ge=15, le=120)
+    duration_frames: int = Field(ge=24, le=1440)
+    camera_target_m: Vector3 | None = None
+    camera_path: CameraPath | None = None
+    caption_text: str = Field(default="", max_length=300)
+
+
+class ProductionPlanRequest(BaseModel):
+    """V6 生产计划：按 Profile 规格做多场景（2–8 镜头、3–60 秒），不受 V1 三镜头合同限制。"""
+
+    product_asset_id: str
+    profile_id: str = Field(min_length=1, max_length=80)
+    intent: str = Field(min_length=1, max_length=4000)
+    shots: list[ProductionShotInput] = Field(min_length=2, max_length=8)
+    locale: str = Field(default="es-MX", max_length=20)
+    voiceover_text: str = Field(default="", max_length=2000)
+    notes: str = Field(default="", max_length=2000)
+
+
+@app.post("/api/v1/plans/production", status_code=201)
+def create_production_plan(request: ProductionPlanRequest) -> dict:
+    """按 Profile 规格创建多场景生产计划（V6 loop：完整有声视频 → 批量 → 发布包）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        asset = db.execute("SELECT * FROM assets WHERE id = ?", (request.product_asset_id,)).fetchone()
+        if not asset:
+            raise HTTPException(404, "产品素材不存在")
+        profile = _profile_for_request(db, request.profile_id, owner_id, project_id)
+        if profile is None:
+            raise HTTPException(404, "Profile 不存在")
+        spec = profile["spec"]
+        total_frames = sum(int(shot.duration_frames) for shot in request.shots)
+        seconds = total_frames / DEFAULT_FPS
+        low, high = spec.video.duration_min_seconds, spec.video.duration_max_seconds
+        if not (low <= seconds <= high):
+            raise HTTPException(422, {
+                "code": "duration_out_of_profile_range",
+                "detail": f"计划总时长 {seconds:.2f}s 不在 Profile {request.profile_id} 允许范围 {low}–{high}s 内",
+            })
+        shots = []
+        for index, shot in enumerate(request.shots, start=1):
+            payload = {
+                "id": shot.id or f"shot_{index:02d}",
+                "name": shot.name or f"场景 {index}",
+                "camera": shot.camera,
+                "focal_length_mm": shot.focal_length_mm,
+                "duration_frames": shot.duration_frames,
+            }
+            if shot.camera_target_m is not None:
+                payload["camera_target_m"] = list(shot.camera_target_m)
+            if shot.camera_path is not None:
+                payload["camera_path"] = shot.camera_path.model_dump()
+            if shot.caption_text:
+                payload["caption_text"] = shot.caption_text
+            shots.append(payload)
+        plan_id = str(uuid.uuid4())
+        payload = {
+            "schema_version": "1.0",
+            "product_asset_id": asset["id"],
+            "intent": request.intent,
+            "output": {
+                "width": spec.video.width, "height": spec.video.height, "fps": spec.video.fps,
+                "duration_seconds": round(seconds, 3), "frame_count": total_frames,
+            },
+            "fidelity_mode": "STRICT_REQUESTED",
+            "crop_anchor": "center",
+            "product_pose": {"position_m": [0.0, 0.0, 0.0], "rotation_xyz_deg": [0.0, 0.0, 0.0], "scale": 1.0},
+            "scene": {"template": "studio_product", "background_color": "#0A0A0C", "lighting_preset": "softbox"},
+            "shots": shots,
+            "production_plan": {
+                "profile_id": request.profile_id,
+                "profile_version": profile["version"]["version"],
+                "profile_payload_sha256": profile["version"]["payload_sha256"],
+                "locale": request.locale,
+                "voiceover_text": request.voiceover_text,
+                "aspect_ratio": spec.composition.aspect_ratio,
+            },
+        }
+        validate_production_plan_snapshot(payload, spec)
+        _, payload_sha256 = plan_contract_payload_hash(payload)
+        product_version_id = create_product_version(asset["id"], owner_id, project_id, payload_sha256, db)
+        db.execute("INSERT INTO plans VALUES (?, ?, ?, ?, 0, ?)",
+                   (plan_id, asset["id"], payload["intent"],
+                    json.dumps(payload, ensure_ascii=False), utc_now()))
+        contract = upsert_plan_contract(plan_id, product_version_id, payload, db=db)
+    return {
+        "id": plan_id, "approved": False, "created_at": utc_now(),
+        "contract_id": contract["contract_id"], "product_version_id": product_version_id,
+        "intent": payload["intent"], "output": payload["output"], "shots": shots,
+        "production_plan": payload["production_plan"],
+        "duration_seconds": round(seconds, 3), "total_frames": total_frames,
+        "note": "V6 生产计划：按 Profile 规格的多场景计划；批准后即可创建 Run 真实渲染",
+    }
 
 
 def main_cli(argv: list[str] | None = None) -> int:

@@ -502,3 +502,60 @@ CREATE TABLE IF NOT EXISTS output_renditions (
   payload_sha256 TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- V6-04：批次与批次项（矩阵展开 / 并发调度 / 暂停取消重试）
+CREATE TABLE IF NOT EXISTS batches (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'DRAFT',
+  revision INTEGER NOT NULL DEFAULT 1,
+  paused INTEGER NOT NULL DEFAULT 0,
+  cancelled INTEGER NOT NULL DEFAULT 0,
+  idempotency_key TEXT,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS batch_items (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES batches(id),
+  item_index INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING',
+  run_id TEXT,
+  job_id TEXT,
+  cache_key TEXT NOT NULL,
+  error TEXT,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (batch_id, item_index)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_idempotency ON batches (owner_id, idempotency_key);
+
+-- V6-05：发布包（build → verify → approve，审批后不可变）
+CREATE TABLE IF NOT EXISTS publish_packages (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  batch_id TEXT,
+  owner_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  profile_id TEXT,
+  locale TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'DRAFT',
+  content_hash TEXT NOT NULL DEFAULT '',
+  directory TEXT NOT NULL,
+  zip_path TEXT NOT NULL DEFAULT '',
+  zip_sha256 TEXT NOT NULL DEFAULT '',
+  approved_at TEXT,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
