@@ -176,3 +176,30 @@ button { color: inherit; }
 .timeline-bars i { flex: 1; min-width: 3px; background: #b9c8e8; border-radius: 2px 2px 0 0; display: block; }
 .timeline-bars i.marked { background: var(--accent); }
 @media (max-width: 760px) { .timeline-bars { height: 60px; } }
+
+.reference-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.reference-grid .card { grid-column: auto; }
+.reference-player { width: 100%; border-radius: 6px; background: #0f1420; margin-top: 12px; max-height: 260px; }
+.segment-observations { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.segment-observations h3 { font-size: 13px; margin: 0 0 2px; }
+.segment-block { border: 1px solid var(--border); border-radius: 6px; padding: 9px 11px; background: #fbfcfd; }
+.segment-block b { font-size: 11px; }
+.segment-block p { margin: 6px 0 0; font-size: 10px; color: #5b6a7d; display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.segment-block p span { font-weight: 600; color: #26344d; }
+.segment-block p small { color: #97a1b2; }
+.reuse-dimensions { display: flex; flex-wrap: wrap; gap: 7px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.reuse-dimensions label { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: #4b5a6e; background: #f4f6f9; border: 1px solid #e3e8ef; border-radius: 20px; padding: 5px 11px; cursor: pointer; }
+.reuse-dimensions input { accent-color: var(--blue); }
+.mapping-diff { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.mapping-diff h3 { font-size: 13px; margin: 0; }
+.mapping-diff p { margin: 0; font-size: 10px; color: #4b5a6e; border-left: 2px solid #cfd9ec; padding-left: 8px; }
+.mapping-diff p b { font-size: 10px; }
+.mapping-diff p small { color: #97a1b2; }
+.capability-note { display: flex; gap: 6px; align-items: flex-start; color: #8a5a12 !important; background: #fdf6e7; border-left-color: #e7c36a !important; padding: 7px 9px !important; }
+.capability-note svg { width: 13px; flex: none; margin-top: 1px; }
+.aligned-timeline { margin-top: 16px; }
+.timeline-row { display: flex; gap: 2px; height: 30px; margin-top: 6px; border-radius: 5px; overflow: hidden; }
+.timeline-row.source i { background: #93b4f0; display: block; height: 100%; }
+.timeline-row.target i { background: var(--accent); display: block; height: 100%; }
+.timeline-row i:not(:last-child) { border-right: 2px solid white; }
+@media (max-width: 900px) { .reference-grid { grid-template-columns: 1fr; } }

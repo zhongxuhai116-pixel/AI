@@ -3,7 +3,7 @@ import {
   Archive, ArrowClockwise, Bell, BoxArrowDown, Camera, CaretDown, CaretRight, Check, CheckCircle,
   Clock, Cpu, Cube, DownloadSimple, FilmSlate, FolderOpen, Gear, Image, ListChecks,
   MagnifyingGlass, MonitorPlay, Package, PencilSimple, Play, Plus, Queue,
-  ShieldCheck, SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, User, WarningCircle, X,
+  ShieldCheck, SlidersHorizontal, Sparkle, SquaresFour, StopCircle, UploadSimple, User, VideoCamera, WarningCircle, X,
 } from "@phosphor-icons/react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -17,7 +17,7 @@ const navItems = [
   ["director", "导演台", SlidersHorizontal], ["storyboard", "分镜", FilmSlate],
   ["preview", "3D 预演", MonitorPlay], ["jobs", "渲染任务", Queue],
   ["assets", "素材库", Archive], ["fidelity", "保真审核", ShieldCheck],
-  ["interaction", "人物互动", User], ["settings", "设置", Gear],
+  ["interaction", "人物互动", User], ["reference", "参考重演", VideoCamera], ["settings", "设置", Gear],
 ];
 const defaultShots = [
   { id: "shot_01", name: "正面推近", camera: "dolly_in", focal_length_mm: 35, duration_frames: 48 },
@@ -555,6 +555,130 @@ function InteractionPage() {
   </section>;
 }
 
+const reuseDimensions = [
+  ["duration", "镜头长度"], ["shot_size", "景别"], ["composition", "构图"],
+  ["motion_direction", "运动方向"], ["action_rhythm", "动作节奏"], ["transition", "转场"],
+];
+const cameraLabelsV5 = { static: "Static · 定格", side_track: "Side Track · 侧移", dolly_in: "Dolly In · 推近", hero_orbit: "Hero Orbit · 环绕" };
+
+function ReferencePage() {
+  const [references, setReferences] = useState([]);
+  const [versions, setVersions] = useState([]);
+  const [plans, setPlans] = useState([]);
+  const [selectedRefId, setSelectedRefId] = useState("");
+  const [analyses, setAnalyses] = useState([]);
+  const [versionId, setVersionId] = useState("");
+  const [dimensions, setDimensions] = useState(["duration", "motion_direction", "transition"]);
+  const [mapping, setMapping] = useState(null);
+  const [targetPlan, setTargetPlan] = useState(null);
+  const [selectedPlanId, setSelectedPlanId] = useState("");
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    Promise.all([apiRequest("/references"), apiRequest("/product-versions"), apiRequest("/plans")]).then(async ([r, v, p]) => {
+      if (r.ok) setReferences(await r.json());
+      if (v.ok) setVersions(await v.json());
+      if (p.ok) setPlans(await p.json());
+    }).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (notice) { const timer = setTimeout(() => setNotice(null), 5000); return () => clearTimeout(timer); }
+  }, [notice]);
+
+  async function selectReference(referenceId) {
+    setSelectedRefId(referenceId); setAnalyses([]); setMapping(null); setTargetPlan(null);
+    const response = await apiRequest(`/references/${referenceId}/analyses`);
+    if (response.ok) setAnalyses(await response.json());
+  }
+  function toggleDimension(dimension) {
+    setDimensions((value) => value.includes(dimension) ? value.filter((item) => item !== dimension) : [...value, dimension]);
+  }
+  async function createPlan() {
+    const approved = analyses.find((item) => item.status === "APPROVED");
+    if (!approved || !versionId) { setNotice(["danger", "请选择已批准的分析与产品版本。"]); return; }
+    setBusy(true);
+    try {
+      const response = await apiRequest("/projects/project-default/plans/from-reference", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ analysis_id: approved.id, product_version_id: versionId, selected_dimensions: dimensions }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || "计划生成失败");
+      setMapping(body.reference_mapping);
+      setTargetPlan({ id: body.id, shots: body.shots, output: body.output });
+      setSelectedPlanId(body.id);
+      setNotice(["success", `目标计划已生成（${body.shots.length} 个镜头，总时长误差 ${body.reference_mapping.total_duration_error_frames} 帧）。`]);
+    } catch (error) { setNotice(["danger", error.message]); } finally { setBusy(false); }
+  }
+  async function loadMapping(planId) {
+    setSelectedPlanId(planId); setMapping(null); setTargetPlan(null);
+    const [plan, mappingResponse] = await Promise.all([
+      apiRequest(`/plans/${planId}`),
+      apiRequest(`/plans/${planId}/reference-mapping`),
+    ]);
+    if (plan.ok) { const body = await plan.json(); setTargetPlan({ id: body.id, shots: body.payload?.shots || [], output: body.payload?.output || {} }); }
+    if (mappingResponse.ok) setMapping((await mappingResponse.json()).mapping);
+  }
+  const selectedReference = references.find((item) => item.id === selectedRefId);
+  const totalSource = mapping ? Math.max(...mapping.shots.map((shot) => shot.source_range_s[1] || 0), 1) : 1;
+  const totalTarget = mapping ? mapping.total_frames : 1;
+
+  return <section className="page">
+    <div className="page-head"><div><b>V5 REFERENCE RE-ENACTMENT</b><h1>参考重演</h1><p>左栏参考视频与切镜观察，右栏目标分镜与对齐时间线。景别/动作节奏等无模型支持的维度如实标 unsupported，不悄悄复用。</p></div></div>
+    {notice && <div className={`notice ${notice[0]}`}><span>{notice[1]}</span><button onClick={() => setNotice(null)}><X /></button></div>}
+    <div className="reference-grid">
+      <section className="card">
+        <div className="card-head"><div><h2>参考视频</h2><span className="count">{references.length}</span></div><small>上传与摄取见 API（/references/upload）</small></div>
+        <div className="qa-pick">
+          <select value={selectedRefId} onChange={(event) => selectReference(event.target.value)}>
+            <option value="">选择参考视频…</option>
+            {references.map((item) => <option key={item.id} value={item.id}>参考 {item.id.slice(0, 8)} · {item.status}</option>)}
+          </select>
+        </div>
+        {selectedReference?.status === "READY" && <video className="reference-player" src={`${API}/references/${selectedReference.id}/proxy`} controls muted playsInline />}
+        {analyses.length > 0 && <div className="table-wrap"><table><thead><tr><th>修订</th><th>状态</th><th>切点数</th><th /></tr></thead><tbody>{analyses.map((item) => <tr key={item.id}><td>r{item.revision}{item.edited_from_revision ? `（改自 r${item.edited_from_revision}）` : ""}</td><td><Pill status={item.status === "APPROVED" ? "SUCCEEDED" : "DRAFT"} /></td><td>{item.analysis.cuts.length}</td><td><button onClick={() => selectReference(selectedRefId)}>刷新</button></td></tr>)}</tbody></table></div>}
+        {analyses.length > 0 && <div className="segment-observations">
+          <h3>切镜观察（观察与推断分离）</h3>
+          {analyses[0].analysis.segments.map((segment) => <div className="segment-block" key={segment.index}>
+            <b>段 {segment.index + 1} · {segment.start_s}s–{segment.end_s ?? "末"}s{segment.transition_in ? ` · ${segment.transition_in}` : ""}</b>
+            {Object.entries(segment.observations || {}).map(([key, item]) => <p key={key}><span>{key}</span> {item.value === null ? "—（不可推断）" : String(item.value)}{item.confidence != null ? ` · 置信 ${Number(item.confidence).toFixed(2)}` : ""}<small> {item.method}</small></p>)}
+          </div>)}
+        </div>}
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>目标计划</h2>{mapping && <small>总时长误差 {mapping.total_duration_error_frames} 帧</small>}</div><small>仅已批准分析版本可生成</small></div>
+        <div className="qa-pick">
+          <select value={selectedPlanId} onChange={(event) => loadMapping(event.target.value)}>
+            <option value="">选择已有计划…</option>
+            {plans.map((item) => <option key={item.id} value={item.id}>计划 {item.id.slice(0, 8)} · {item.intent.slice(0, 20)}</option>)}
+          </select>
+        </div>
+        <div className="reuse-dimensions">{reuseDimensions.map(([value, label]) => <label key={value}><input type="checkbox" checked={dimensions.includes(value)} onChange={() => toggleDimension(value)} />{label}</label>)}</div>
+        <div className="qa-pick">
+          <select value={versionId} onChange={(event) => setVersionId(event.target.value)}>
+            <option value="">选择产品版本…</option>
+            {versions.map((item) => <option key={item.id} value={item.id}>v{item.version} · {item.id.slice(0, 8)}</option>)}
+          </select>
+        </div>
+        <button className="primary wide" disabled={busy || !selectedRefId} onClick={createPlan}><Sparkle weight="fill" />从参考生成目标计划</button>
+        {targetPlan && <div className="table-wrap"><table><thead><tr><th>镜头</th><th>机位</th><th>帧数</th><th>时长误差</th></tr></thead><tbody>{targetPlan.shots.map((shot, index) => <tr key={shot.id}><td>SHOT {index + 1}</td><td>{cameraLabelsV5[shot.camera] || shot.camera}</td><td>{shot.duration_frames}</td><td>{mapping?.shots[index]?.duration_error_frames ?? "—"}</td></tr>)}</tbody></table></div>}
+        {mapping && <div className="mapping-diff">
+          <h3>映射差异（保留/修改/不支持）</h3>
+          {mapping.shots.map((shot) => <p key={shot.target_shot_id}><b>{shot.target_shot_id}</b> 源 {shot.source_range_s[0]}s–{shot.source_range_s[1] ?? "末"}s → 帧 {shot.target_frames[0]}–{shot.target_frames[1]}<br /><small>保留: {shot.kept_dimensions.join("、") || "无"} · 修改: {shot.changed_dimensions.join("、")} · 不支持: {shot.unsupported_dimensions.join("、") || "无"}</small></p>)}
+          {mapping.capability_notes.map((note, index) => <p className="capability-note" key={index}><WarningCircle weight="fill" />{note}</p>)}
+        </div>}
+      </section>
+    </div>
+    {mapping && <section className="card aligned-timeline">
+      <div className="card-head"><div><h2>对齐时间线</h2></div><small>上：源片段（秒） · 下：目标镜头（帧）</small></div>
+      <div className="timeline-row source">{mapping.shots.map((shot) => <i key={shot.source_segment_index} style={{ width: `${(((shot.source_range_s[1] || totalSource) - shot.source_range_s[0]) / totalSource) * 100}%` }} title={`源 ${shot.source_range_s[0]}–${shot.source_range_s[1]}s`} />)}</div>
+      <div className="timeline-row target">{mapping.shots.map((shot) => <i key={shot.target_shot_id} style={{ width: `${((shot.target_frames[1] - shot.target_frames[0] + 1) / totalTarget) * 100}%` }} title={`${shot.target_shot_id} 帧 ${shot.target_frames[0]}–${shot.target_frames[1]}`} />)}</div>
+    </section>}
+  </section>;
+}
+
 export function App() {
   const [session, setSession] = useState(null);
   const [accessKey, setAccessKey] = useState("");
@@ -778,7 +902,7 @@ export function App() {
   return <div className="shell">
     <Sidebar active={active} onSelect={setActive} />
     <div className="main"><Header connected={!!health} onSearch={setSearch} /><main className="workspace">
-      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
+      {["products", "assets"].includes(active) ? <Library assets={assets} onSelect={selectAsset} /> : active === "fidelity" ? <FidelityPage jobs={jobs} /> : active === "interaction" ? <InteractionPage /> : active === "reference" ? <ReferencePage /> : active === "settings" ? <Settings health={health} provider={provider} onSaveProvider={saveProvider} onTestProvider={testProvider} busy={busy} /> : <>
         <div className="title-row"><div><div><h1>通用产品导演</h1><button><PencilSimple /></button><span>V1 Director MVP</span></div><p>上传任意产品图片或 GLB，确认三个镜头，然后在本机生成可追踪的预演视频。</p></div><small><CheckCircle weight="fill" />本地保存</small></div>
         <Steps asset={asset} plan={plan} job={job} />
         <div className="grid">

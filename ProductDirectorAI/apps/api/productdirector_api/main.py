@@ -4814,6 +4814,23 @@ def list_plans(owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJE
     ]
 
 
+@app.get("/api/v1/plans/{plan_id}")
+def get_plan(plan_id: str) -> dict:
+    """计划详情（V5 双栏对照读取目标分镜）。"""
+    with connect() as db:
+        row = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "计划不存在")
+    return {
+        "id": row["id"],
+        "product_asset_id": row["product_asset_id"],
+        "intent": row["intent"],
+        "approved": bool(row["approved"]),
+        "created_at": row["created_at"],
+        "payload": json.loads(row["payload"]) if row["payload"] else {},
+    }
+
+
 @app.get("/api/v1/plans/{plan_id}/contracts")
 def list_plan_contracts(
     plan_id: str,
