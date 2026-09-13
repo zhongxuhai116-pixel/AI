@@ -52,6 +52,7 @@ from .strict_background import (
 )
 from . import strict_qa
 from . import interaction_geometry
+from . import interaction_validation
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -482,6 +483,19 @@ def initialize_db() -> None:
               payload_sha256 TEXT NOT NULL,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS interaction_plans (
+              id TEXT PRIMARY KEY,
+              plan_id TEXT NOT NULL,
+              product_version_id TEXT NOT NULL,
+              anchor_set_id TEXT NOT NULL,
+              character_id TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              payload TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (plan_id, version)
             );
             """
     with connect() as db:
@@ -5606,6 +5620,183 @@ def list_characters(owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_
             (owner_id, project_id),
         ).fetchall()
     return [_character_public(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# V4-02/03：交互计划合同、校验与数据版预演
+# ---------------------------------------------------------------------------
+
+class InteractionRequest(BaseModel):
+    character_id: str = Field(min_length=1, max_length=80)
+    anchor_set_id: str = Field(min_length=1, max_length=80)
+    action: str = Field(min_length=1, max_length=80)
+    prepare_frame: int = Field(ge=1, le=100000)
+    contact_frame: int = Field(ge=1, le=100000)
+    end_frame: int = Field(ge=1, le=100000)
+    speed_scale: float = Field(default=1.0, ge=0.5, le=1.5)
+    occlusion_strategy: Literal["front_depth_priority", "generated_segmentation_estimate"] = "front_depth_priority"
+    notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_frames(self):
+        if not (self.prepare_frame < self.contact_frame <= self.end_frame):
+            raise ValueError("帧范围需满足 prepare < contact ≤ end")
+        if self.action not in V4_MOTION_TEMPLATES_BY_ID:
+            raise ValueError(f"未知动作模板：{self.action}（可用: {sorted(V4_MOTION_TEMPLATES_BY_ID)}）")
+        template = V4_MOTION_TEMPLATES_BY_ID[self.action]
+        allowed_range = template["allowed_speed_range"]
+        if not (allowed_range[0] <= self.speed_scale <= allowed_range[1]):
+            raise ValueError(f"speed_scale 超出动作模板允许范围 {allowed_range}")
+        return self
+
+
+def _plan_frame_count(plan_row) -> int:
+    try:
+        payload = json.loads(plan_row["payload"])
+        return sum(int(shot.get("duration_frames") or 0) for shot in payload.get("shots", []))
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return 0
+
+
+def _interaction_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "plan_id": row["plan_id"],
+        "product_version_id": row["product_version_id"],
+        "anchor_set_id": row["anchor_set_id"],
+        "character_id": row["character_id"],
+        "version": row["version"],
+        "payload_sha256": row["payload_sha256"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "interaction": json.loads(row["payload"]),
+    }
+
+
+def _load_interaction_bindings(interaction_row) -> dict:
+    """读取交互计划的冻结绑定（计划当前合同、锚点集、人物、动作模板），并校验版本仍有效。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        plan = db.execute("SELECT * FROM plans WHERE id = ?", (interaction_row["plan_id"],)).fetchone()
+        if not plan:
+            raise HTTPException(404, "计划不存在")
+        contract = ensure_plan_contract(db, plan, owner_id, project_id)
+        if contract["product_version_id"] != interaction_row["product_version_id"]:
+            raise HTTPException(409, "计划已更新（产品版本变化），旧交互计划失效，请基于新版本重建")
+        anchor_set = db.execute(
+            "SELECT * FROM anchor_sets WHERE id = ?", (interaction_row["anchor_set_id"],),
+        ).fetchone()
+        if not anchor_set or anchor_set["product_version_id"] != interaction_row["product_version_id"]:
+            raise HTTPException(409, "锚点集不属于当前计划的产品版本，交互计划失效")
+        character = db.execute(
+            "SELECT * FROM characters WHERE id = ?", (interaction_row["character_id"],),
+        ).fetchone()
+    if not character:
+        raise HTTPException(404, "人物不存在")
+    anchor_payload = json.loads(anchor_set["payload"])
+    return {
+        "plan": plan,
+        "plan_frame_count": _plan_frame_count(plan),
+        "anchor_set_payload": anchor_payload,
+        "anchors": anchor_payload.get("anchors", []),
+        "character_payload": json.loads(character["payload"]),
+        "template": V4_MOTION_TEMPLATES_BY_ID[json.loads(interaction_row["payload"])["action"]],
+    }
+
+
+@app.post("/api/v1/plans/{plan_id}/interactions", status_code=201)
+def create_interaction(plan_id: str, request: InteractionRequest) -> dict:
+    """创建交互计划草稿（版本化）：绑定当前计划合同的产品版本、冻结锚点集、人物与动作模板。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        plan = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if not plan:
+            raise HTTPException(404, "计划不存在")
+        contract = ensure_plan_contract(db, plan, owner_id, project_id)
+        product_version_id = contract["product_version_id"]
+        frame_count = _plan_frame_count(plan)
+        anchor_set = db.execute(
+            "SELECT * FROM anchor_sets WHERE id = ? AND product_version_id = ?",
+            (request.anchor_set_id, product_version_id),
+        ).fetchone()
+        character = db.execute(
+            "SELECT * FROM characters WHERE id = ? AND owner_id = ?",
+            (request.character_id, owner_id),
+        ).fetchone()
+        latest = db.execute(
+            "SELECT COALESCE(MAX(version), 0) AS version FROM interaction_plans WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        version = int(latest["version"]) + 1
+    if not anchor_set:
+        raise HTTPException(409, "锚点集不存在或不属于该计划当前的产品版本（必须先批准锚点集）")
+    if not character:
+        raise HTTPException(404, "人物不存在或不属于当前 Owner")
+    template = V4_MOTION_TEMPLATES_BY_ID[request.action]
+    anchor_payload = json.loads(anchor_set["payload"])
+    anchors = anchor_payload.get("anchors", [])
+    if template.get("requires_anchor") and not any(
+        request.action in anchor.get("allowed_actions", []) for anchor in anchors
+    ):
+        raise HTTPException(409, f"动作 {request.action} 需要允许该动作的锚点，但冻结锚点集没有匹配项")
+    if frame_count and request.end_frame > frame_count:
+        raise HTTPException(422, f"end_frame({request.end_frame}) 超过计划总帧数({frame_count})")
+    payload = request.model_dump()
+    interaction_id = str(uuid.uuid4())
+    payload["interaction_plan_id"] = interaction_id
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO interaction_plans(id, plan_id, product_version_id, anchor_set_id, character_id, version, payload, payload_sha256, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (interaction_id, plan_id, product_version_id, request.anchor_set_id, request.character_id,
+             version, payload_text, digest, now, now),
+        )
+        row = db.execute("SELECT * FROM interaction_plans WHERE id = ?", (interaction_id,)).fetchone()
+    return _interaction_public(row)
+
+
+@app.get("/api/v1/plans/{plan_id}/interactions")
+def list_interactions(plan_id: str) -> list[dict]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM interaction_plans WHERE plan_id = ? ORDER BY version DESC", (plan_id,),
+        ).fetchall()
+    return [_interaction_public(row) for row in rows]
+
+
+@app.post("/api/v1/interaction-plans/{interaction_id}/validate")
+def validate_interaction_plan(interaction_id: str) -> dict:
+    with connect() as db:
+        row = db.execute("SELECT * FROM interaction_plans WHERE id = ?", (interaction_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "交互计划不存在")
+    bindings = _load_interaction_bindings(row)
+    interaction = json.loads(row["payload"])
+    report = interaction_validation.validate_interaction(
+        interaction, bindings["anchors"], bindings["character_payload"],
+        bindings["template"], bindings["plan_frame_count"],
+    )
+    report["interaction_plan_id"] = interaction_id
+    report["version"] = row["version"]
+    return report
+
+
+@app.post("/api/v1/interaction-plans/{interaction_id}/previz")
+def previz_interaction_plan(interaction_id: str) -> dict:
+    """数据版预演：确定性事件时间线与逐帧代理手部位置（Blender 人体 Proxy 渲染在渲染侧接入）。"""
+    with connect() as db:
+        row = db.execute("SELECT * FROM interaction_plans WHERE id = ?", (interaction_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "交互计划不存在")
+    bindings = _load_interaction_bindings(row)
+    interaction = json.loads(row["payload"])
+    timeline = interaction_validation.previz_timeline(interaction, bindings["anchors"], bindings["character_payload"])
+    timeline["interaction_plan_id"] = interaction_id
+    timeline["version"] = row["version"]
+    return timeline
 
 
 @app.post("/api/v1/product-versions/{product_version_id}/approve")

@@ -280,3 +280,17 @@ CREATE TABLE IF NOT EXISTS characters (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS interaction_plans (
+  id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL REFERENCES plans(id),
+  product_version_id TEXT NOT NULL REFERENCES product_versions(id),
+  anchor_set_id TEXT NOT NULL REFERENCES anchor_sets(id),
+  character_id TEXT NOT NULL REFERENCES characters(id),
+  version INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (plan_id, version)
+);
