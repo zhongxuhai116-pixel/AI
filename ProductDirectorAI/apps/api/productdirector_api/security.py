@@ -15,6 +15,8 @@ WORKER_ID = os.getenv("PRODUCTDIRECTOR_WORKER_ID", "cloud-worker")
 COOKIE = "pd_session"
 SESSION_SECONDS = 8 * 60 * 60
 current_owner: ContextVar[str | None] = ContextVar("current_owner", default=None)
+# V6-16：成员身份（角色权限）；浏览器会话与 Owner 令牌视为 owner 角色
+current_member: ContextVar[dict | None] = ContextVar("current_member", default=None)
 # V6-07：Automation Key 身份（只放非敏感字段；密钥明文永不进入上下文或日志）
 current_automation_key: ContextVar[dict | None] = ContextVar("current_automation_key", default=None)
 
@@ -45,11 +47,14 @@ def authenticate(request: Request, connect, allowed_origins: list[str]) -> str:
     check_origin(request, allowed_origins)
     authorization = request.headers.get("authorization", "")
     if authorization:
+        if authorization.startswith(f"Bearer {_MEMBER_PREFIX}_"):
+            return authenticate_member(request, authorization[len("Bearer "):], connect)
         if authorization.startswith(f"Bearer pda_"):
             return authenticate_automation(request, authorization[len("Bearer "):], connect)
         if not matches(authorization, f"Bearer {OWNER_TOKEN}"):
             raise HTTPException(401, "未授权")
         request.state.csrf_token = None
+        request.state.member = {"role": "owner", "name": "owner", "member_id": "owner"}
         return OWNER_ID
     token = request.cookies.get(COOKIE, "")
     with connect() as db:
@@ -83,6 +88,35 @@ def create_session(request: Request, response, token: str, connect, allowed_orig
     response.set_cookie(COOKIE, session_token, max_age=SESSION_SECONDS, httponly=True,
                         secure=secure, samesite="strict", path="/")
     return {"owner_id": OWNER_ID, "csrf_token": csrf_token}
+
+
+_MEMBER_PREFIX = "pdm"
+
+
+def authenticate_member(request: Request, raw_token: str, connect) -> str:
+    """V6-16：成员令牌认证（角色权限）。令牌只存哈希；撤销后立即失效。"""
+    from . import roles
+    parsed = roles.parse_token(raw_token)
+    if parsed is None:
+        raise HTTPException(401, "成员令牌格式无效")
+    member_id, secret = parsed
+    with connect() as db:
+        row = db.execute("SELECT * FROM members WHERE member_id = ? AND revoked_at IS NULL", (member_id,)).fetchone()
+    if not row or not roles.token_matches(secret, row["token_hash"]):
+        raise HTTPException(401, "成员令牌无效")
+    identity = {"member_id": member_id, "name": row["name"], "role": row["role"], "row_id": row["id"]}
+    request.state.member = identity
+    request.state.csrf_token = None
+    with connect() as db:
+        db.execute("UPDATE members SET last_used_at = ?, call_count = call_count + 1 WHERE id = ?",
+                   (row["last_used_at"] and row["last_used_at"] or _iso_now(), row["id"]))
+    return row["owner_id"]
+
+
+def _iso_now() -> str:
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def authenticate_automation(request: Request, raw_key: str, connect) -> str:

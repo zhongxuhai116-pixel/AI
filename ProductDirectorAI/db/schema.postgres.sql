@@ -822,3 +822,20 @@ CREATE TABLE IF NOT EXISTS publish_jobs (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- V6-16：成员与角色（Owner / Editor / Reviewer / Publisher）
+CREATE TABLE IF NOT EXISTS members (
+  id TEXT PRIMARY KEY,
+  member_id TEXT NOT NULL UNIQUE,
+  owner_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  token_hint TEXT NOT NULL DEFAULT '',
+  revoked_at TEXT,
+  revoked_reason TEXT NOT NULL DEFAULT '',
+  last_used_at TEXT,
+  call_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);

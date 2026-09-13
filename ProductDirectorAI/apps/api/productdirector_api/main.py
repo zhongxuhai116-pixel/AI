@@ -62,6 +62,7 @@ from . import automation
 from . import webhooks
 from . import publishing
 from . import publishing_connectors
+from . import roles
 from . import ledger
 from . import localization
 from . import platform_profiles
@@ -841,6 +842,22 @@ def initialize_db() -> None:
               moved_at TEXT NOT NULL,
               replayed_at TEXT,
               UNIQUE (endpoint_id, event_id)
+            );
+            CREATE TABLE IF NOT EXISTS members (
+              id TEXT PRIMARY KEY,
+              member_id TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              role TEXT NOT NULL,
+              token_hash TEXT NOT NULL,
+              token_hint TEXT NOT NULL DEFAULT '',
+              revoked_at TEXT,
+              revoked_reason TEXT NOT NULL DEFAULT '',
+              last_used_at TEXT,
+              call_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (member_id)
             );
             CREATE TABLE IF NOT EXISTS connected_accounts (
               id TEXT PRIMARY KEY,
@@ -4676,6 +4693,14 @@ def _epoch_from_iso(value: str | None) -> float:
     return parsed.timestamp()
 
 
+def enforce_member_access(request: Request, identity: dict) -> None:
+    """V6-16：成员角色权限（服务端强制；未登记的写操作默认拒绝）。"""
+    try:
+        roles.check_permission(identity["role"], request.method, request.url.path)
+    except roles.RoleError as exc:
+        raise HTTPException(exc.status_code, exc.as_detail()) from exc
+
+
 def enforce_automation_access(request: Request, identity: dict) -> None:
     """V6-07：scope、Key 管理边界、双层限流、Key 周期预算。"""
     path = request.url.path.rstrip("/") or "/api/v1"
@@ -4819,11 +4844,17 @@ app.add_middleware(
 async def security_middleware(request: Request, call_next):
     context = None
     key_context = None
+    member_context = None
     try:
         if request.method != "OPTIONS" and not request.url.path.startswith("/internal/"):
             if not (request.url.path == "/api/v1/session" and request.method == "POST"):
                 owner = security.authenticate(request, connect, ALLOWED_ORIGINS)
                 context = security.current_owner.set(owner)
+                member_identity = getattr(request.state, "member", None)
+                member_context = None
+                if member_identity is not None and member_identity.get("role") != "owner":
+                    member_context = security.current_member.set(member_identity)
+                    enforce_member_access(request, member_identity)
                 key_identity = getattr(request.state, "automation_key", None)
                 if key_identity is not None:
                     key_context = security.current_automation_key.set(key_identity)
@@ -4842,6 +4873,8 @@ async def security_middleware(request: Request, call_next):
     finally:
         if key_context is not None:
             security.current_automation_key.reset(key_context)
+        if member_context is not None:
+            security.current_member.reset(member_context)
         if context is not None:
             security.current_owner.reset(context)
 
@@ -13012,6 +13045,73 @@ def cancel_publishing_job(job_id: str, request: PublishingActionRequest) -> dict
         updated = db.execute("SELECT * FROM publish_jobs WHERE id = ?", (job_id,)).fetchone()
     return {**publishing.job_public(updated), "cancel": capability, "cancelled": target == "CANCELLED",
             "reason": request.reason, "upstream": outcome}
+
+
+# ---------------------------------------------------------------------------
+# V6-16 成员与角色（Owner / Editor / Reviewer / Publisher）
+# ---------------------------------------------------------------------------
+
+class MemberCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    role: Literal["editor", "reviewer", "publisher"]
+
+
+class MemberRevokeRequest(BaseModel):
+    reason: str = Field(default="", max_length=300)
+
+
+@app.get("/api/v1/roles/matrix")
+def role_matrix() -> dict:
+    """权限矩阵（角色 → 权限、职责分离说明）。"""
+    return roles.matrix()
+
+
+@app.get("/api/v1/members")
+def list_members() -> list[dict]:
+    owner_id, _, _ = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        rows = db.execute("SELECT * FROM members WHERE owner_id = ? ORDER BY created_at DESC LIMIT 200",
+                          (owner_id,)).fetchall()
+    return [roles.member_public(row) for row in rows]
+
+
+@app.post("/api/v1/members", status_code=201)
+def create_member(request: MemberCreateRequest) -> dict:
+    """创建成员（只允许 Owner）：令牌只显示一次，角色决定服务端权限。"""
+    owner_id, _, _ = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    generated = roles.generate_member_token()
+    member_row_id = str(uuid.uuid4())
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO members(id, member_id, owner_id, name, role, token_hash, token_hint, revoked_at, "
+            "revoked_reason, last_used_at, call_count, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, '', NULL, 0, ?, ?)",
+            (member_row_id, generated["member_id"], owner_id, request.name, request.role,
+             generated["token_hash"], generated["hint"], now, now),
+        )
+        row = db.execute("SELECT * FROM members WHERE id = ?", (member_row_id,)).fetchone()
+    return {**roles.member_public(row, reveal=generated["plaintext"]),
+            "matrix": roles.matrix()["separation_of_duties"]}
+
+
+@app.delete("/api/v1/members/{member_row_id}")
+def revoke_member(member_row_id: str, request: MemberRevokeRequest) -> dict:
+    owner_id, _, _ = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        begin_immediate(db)
+        row = db.execute("SELECT * FROM members WHERE id = ? AND owner_id = ?",
+                         (member_row_id, owner_id)).fetchone()
+        if not row:
+            raise HTTPException(404, "成员不存在")
+        if row["revoked_at"]:
+            return {**roles.member_public(row), "revoked": True, "note": "该成员早已撤销（幂等）"}
+        now = utc_now()
+        db.execute("UPDATE members SET revoked_at = ?, revoked_reason = ?, updated_at = ? WHERE id = ?",
+                   (now, request.reason or "管理员撤销", now, member_row_id))
+        updated = db.execute("SELECT * FROM members WHERE id = ?", (member_row_id,)).fetchone()
+    return {**roles.member_public(updated), "revoked": True,
+            "note": "撤销立即生效：该成员令牌的新调用返回 401"}
 
 
 class ProductionShotInput(BaseModel):
