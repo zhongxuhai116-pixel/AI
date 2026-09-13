@@ -2548,6 +2548,21 @@ export function App() {
     } catch (error) { setToast(["danger", error.message]); } finally { setBusy(false); }
   }
   const filtered = useMemo(() => jobs.filter((item) => !search || JSON.stringify(item).toLowerCase().includes(search.toLowerCase())).slice(0, 6), [jobs, search]);
+  async function openJob(next) {
+    setJob(next);
+    try {
+      const response = await apiRequest(`/plans/${next.plan_id}`);
+      if (!response.ok) throw new Error("无法读取此任务的场景计划");
+      const detail = await response.json();
+      if (detail.payload?.scene_generation) {
+        const restored = { ...detail.payload, id: detail.id };
+        setPlan(restored); setIntent(restored.intent); setOutput(restored.output);
+        setDurationSeconds(restored.output.duration_seconds);
+        const source = assets.find(item => item.id === restored.product_asset_id);
+        if (source) { setAsset(source); setAssetUrl(`${API}/assets/${source.id}/content`); }
+      }
+    } catch (error) { setToast(["danger", error.message]); }
+  }
   function selectAsset(next) { setAsset(next); setAssetUrl(`${API}/assets/${next.id}/content`); setPlan(null); setJob(null); setActive("project"); }
 
   if (!session) return <main style={{ maxWidth: 440, margin: "12vh auto", padding: 24 }}>
@@ -2608,7 +2623,7 @@ export function App() {
             {plan.shots.map(shot=><article key={shot.id}><h3>{shot.name} · {shot.start_frame/24}–{shot.end_frame/24}秒</h3><p>{shot.scene_description}</p>{shot.caption_text && <p>字幕文案：{shot.caption_text}（可在后期添加）</p>}</article>)}
             <p>确认后逐段调用H3；失败会明确停止，不再回退成默认摄影棚镜头。修改场景请编辑提示词并重新解析。</p></section>
             : <Shots plan={plan} setPlan={setPlan} assetUrl={asset?.kind === "image" ? assetUrl : ""} />}
-          <Jobs jobs={filtered} selected={job?.id} onOpen={setJob} />
+          <Jobs jobs={filtered} selected={job?.id} onOpen={openJob} />
         </div>
       </>}
     </main></div>
