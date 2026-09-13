@@ -3,13 +3,17 @@
 
 数学（全部在线性空间）：
 - 干净底板 P = 无产品场景渲染（render_product.py --layers 的 layers/plate）；
-  Beauty B = 含产品渲染（passes/beauty，EXR 线性浮点或 PNG sRGB）。
+  Beauty B = 含产品渲染（render_product.py --layers 的 layers/plate_full，
+  原始线性 EXR）。
 - 非产品像素上：
   - 阴影因子 S = clip(B / P, 0, 1)——光照被产品遮蔽后的残留比例（1.0 = 无阴影）；
   - 反射能量 R = clip(B - P, 0, ∞)——产品在地面上新增的光照（倒影/互反射/高光溢出）。
 - 产品掩码内像素恒为 S=1、R=0：产品区由像素锁定保护，层只作用于背景。
 - 遮挡层由 render_product.py --layers 直接落盘（RGBA PNG），本脚本只校验帧数、
   统计覆盖率，并在全零时如实注明"场景无遮挡物"。
+
+帧号合同：输出帧号沿用输入帧号（Blender 产物为 frame_0001 起），
+strict_composite.py 的冻结帧集合校验要求层帧号与全片帧号一致。
 
 落盘（PNG，校验器与 strict_composite.py 可读）：
 - <out>/shadow/frame_XXXX.png：16 位灰度，值 = 线性因子 × 65535（不做 gamma）；
@@ -20,7 +24,7 @@ EXR 读取在函数内延迟导入 OpenEXR；本机托管 Python 用 PNG 输入�
 
 用法：
     .venv/bin/python scripts/build_layers.py \
-        --beauty <passes/beauty> --plate <passes/layers/plate> --mask <passes/mask> \
+        --beauty <passes/layers/plate_full> --plate <passes/layers/plate> --mask <passes/mask> \
         --occlusion <passes/layers/occlusion> --out <layers_out>
 """
 from __future__ import annotations
@@ -28,7 +32,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 from PIL import Image
@@ -99,6 +105,25 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def parse_frame_index(path: Path) -> int | None:
+    match = re.search(r"(?:^|[^0-9])(\d+)(?:$|[^0-9])", path.stem)
+    return int(match.group(1)) if match else None
+
+
+def discover_indexed_frames(paths: Iterable[Path], *, label: str, failures: list[str]) -> dict[int, Path]:
+    frames: dict[int, Path] = {}
+    for path in sorted(paths):
+        index = parse_frame_index(path)
+        if index is None:
+            failures.append(f"{label} 包含不可识别帧名：{path.name}")
+            continue
+        if index in frames:
+            failures.append(f"{label} 存在重复帧 {index}: {frames[index].name}, {path.name}")
+            continue
+        frames[index] = path
+    return frames
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="V3-05：beauty × 干净底板差分构建阴影/反射独立层")
     parser.add_argument("--beauty", required=True,
@@ -115,11 +140,40 @@ def main() -> int:
     reflection_dir = out_root / "reflection"
     shadow_dir.mkdir(parents=True, exist_ok=True)
     reflection_dir.mkdir(parents=True, exist_ok=True)
-    beauty_files = sorted([p for p in beauty_dir.glob("*") if p.suffix.lower() in {".exr", ".png"}])
-    plate_files = sorted(plate_dir.glob("frame_*.exr")) or sorted(plate_dir.glob("frame_*.png"))
-    mask_files = sorted(mask_dir.glob("frame_*.png"))
-    occlusion_files = sorted(Path(args.occlusion).glob("frame_*.png")) if args.occlusion else []
-    count = min(len(beauty_files), len(plate_files), len(mask_files))
+    failures: list[str] = []
+    beauty_files = discover_indexed_frames(
+        [p for p in beauty_dir.glob("*") if p.suffix.lower() in {".exr", ".png"}],
+        label="beauty", failures=failures,
+    )
+    plate_files = discover_indexed_frames(
+        [p for p in plate_dir.glob("*") if p.suffix.lower() in {".exr", ".png"}],
+        label="plate", failures=failures,
+    )
+    mask_files = discover_indexed_frames(mask_dir.glob("frame_*.png"), label="mask", failures=failures)
+    occlusion_files: dict[int, Path] = {}
+    if args.occlusion:
+        occlusion_files = discover_indexed_frames(
+            Path(args.occlusion).glob("frame_*.png"), label="occlusion", failures=failures
+        )
+
+    beauty_set, plate_set, mask_set = set(beauty_files), set(plate_files), set(mask_files)
+    common = sorted(beauty_set & plate_set & mask_set)
+    for label, frame_set in (("beauty", beauty_set), ("plate", plate_set), ("mask", mask_set)):
+        if set(common) != frame_set:
+            missing = sorted(set(common) - frame_set)
+            extra = sorted(frame_set - set(common))
+            if missing:
+                failures.append(f"{label} 缺少帧：{missing}")
+            if extra:
+                failures.append(f"{label} 有多余帧：{extra}")
+    if occlusion_files and set(occlusion_files) != set(common):
+        missing = sorted(set(common) - set(occlusion_files))
+        extra = sorted(set(occlusion_files) - set(common))
+        if missing:
+            failures.append(f"occlusion 缺少帧：{missing}")
+        if extra:
+            failures.append(f"occlusion 有多余帧：{extra}")
+    count = len(common)
     if args.limit:
         count = min(count, args.limit)
     report: dict = {
@@ -134,14 +188,14 @@ def main() -> int:
         "notes": [],
         "passed": True,
     }
+    if failures:
+        report["failures"] = failures
+        report["passed"] = False
+        print(json.dumps(report, ensure_ascii=False))
+        return 1
     if count == 0:
         report["passed"] = False
         report["failures"] = ["输入帧不足（beauty/plate/mask 至少各需 1 帧）"]
-        print(json.dumps(report, ensure_ascii=False))
-        return 1
-    if occlusion_files and len(occlusion_files) < count:
-        report["passed"] = False
-        report["failures"] = [f"遮挡层帧数 {len(occlusion_files)} < {count}"]
         print(json.dumps(report, ensure_ascii=False))
         return 1
 
@@ -149,7 +203,8 @@ def main() -> int:
     shadow_mins: list[float] = []
     reflection_maxs: list[float] = []
     reflection_coverages: list[float] = []
-    for index in range(count):
+    processed = common[:count]
+    for index in processed:
         beauty = read_linear_rgb(beauty_files[index])
         plate = read_linear_rgb(plate_files[index])
         mask = read_mask(mask_files[index])
@@ -164,26 +219,27 @@ def main() -> int:
         reflection_coverages.append(float((reflection > 1e-3).mean()))
 
     occlusion_coverages: list[float] = []
-    for index in range(count):
+    for index in processed:
         if not occlusion_files:
             break
         with Image.open(occlusion_files[index]) as image:
             alpha = np.asarray(image.convert("RGBA").split()[3], dtype=np.float32) / 255.0
         occlusion_coverages.append(float((alpha > 0.5).mean()))
 
+    first_frame_name = f"frame_{processed[0]:04d}.png"
     report["shadow"] = {
         "dir": str(shadow_dir),
         "frames": count,
         "coverage_mean": round(float(np.mean(shadow_coverages)), 4),
         "factor_min": round(float(min(shadow_mins)), 4),
-        "first_frame_sha256": sha256_bytes((shadow_dir / "frame_0000.png").read_bytes()),
+        "first_frame_sha256": sha256_bytes((shadow_dir / first_frame_name).read_bytes()),
     }
     report["reflection"] = {
         "dir": str(reflection_dir),
         "frames": count,
         "coverage_mean": round(float(np.mean(reflection_coverages)), 4),
         "energy_max": round(float(max(reflection_maxs)), 4),
-        "first_frame_sha256": sha256_bytes((reflection_dir / "frame_0000.png").read_bytes()),
+        "first_frame_sha256": sha256_bytes((reflection_dir / first_frame_name).read_bytes()),
     }
     if max(reflection_maxs) <= 1e-3:
         report["notes"].append("反射层全零：底板差分无新增能量（场景无显著反射面/互反射）")
