@@ -30,6 +30,8 @@ def parse_args():
     parser.add_argument("--passes", required=True)
     parser.add_argument("--frames", type=int, default=72)
     parser.add_argument("--json", default="")
+    parser.add_argument("--layers", default="",
+                        help="V3-05 可选：层根目录（含 plate/shadow/reflection/occlusion 子目录），校验帧数与覆盖率")
     return parser.parse_args()
 
 
@@ -83,6 +85,41 @@ def pick_first(planes: dict, *needles: str):
         if found is not None:
             return found
     return None
+
+
+def read_layer_frame(path: Path) -> np.ndarray:
+    """读一帧独立层：EXR（底板）取 RGB 均值，16 位灰度（阴影）归一到 0-1，
+    RGBA（遮挡）取 alpha，RGB（反射）取灰度。"""
+    if path.suffix.lower() == ".exr":
+        exr = read_exr(path)
+        plane = next(iter(exr["planes"].values()))
+        if plane.ndim == 3:
+            return plane[:, :, : min(3, plane.shape[2])].mean(axis=2)
+        return plane
+    with Image.open(path) as image:
+        if image.mode.startswith("I"):
+            return np.asarray(image, dtype=np.float32) / 65535.0
+        if image.mode == "RGBA":
+            return np.asarray(image.split()[3], dtype=np.float32) / 255.0
+        return np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+
+
+def validate_layers(root: Path, frames: int, report: dict) -> None:
+    """V3-05 独立层校验：每层逐帧可读、帧数对齐，并记录覆盖率（全零层如实注明）。"""
+    layer_report: dict = {}
+    for name in ("plate_full", "plate", "shadow", "reflection", "occlusion"):
+        files = sorted((root / name).glob("frame_*.exr")) or sorted((root / name).glob("frame_*.png"))
+        entry: dict = {"frames": len(files)}
+        if len(files) != frames:
+            report["failures"].append(f"独立层 {name} 帧数 {len(files)} != {frames}")
+        if files:
+            samples = [read_layer_frame(files[index]) for index in sorted({0, len(files) // 2, len(files) - 1})]
+            coverage = float(np.mean([float((sample > 0.02).mean()) for sample in samples]))
+            entry["coverage_mean_sampled"] = round(coverage, 4)
+            if coverage == 0.0:
+                entry["note"] = "全零层（无遮挡物/无反射能量时属预期，见 layers_report.json）"
+        layer_report[name] = entry
+    report["layers"] = layer_report
 
 
 def main() -> int:
@@ -156,6 +193,9 @@ def main() -> int:
             report["failures"].append(f"帧 {index} 遮罩与 Beauty Alpha 覆盖差异过大")
 
     report["passed"] = not report["failures"]
+    if args.layers:
+        validate_layers(Path(args.layers), args.frames, report)
+        report["passed"] = not report["failures"]
     print("FIDELITY_PASSES " + json.dumps(report, ensure_ascii=False))
     if args.json:
         Path(args.json).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

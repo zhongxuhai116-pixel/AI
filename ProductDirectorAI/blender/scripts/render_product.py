@@ -20,6 +20,8 @@ def parse_args():
     parser.add_argument("--plan", required=True, help="Frozen DirectorPlan JSON created for this render job")
     parser.add_argument("--passes", action="store_true",
                         help="V3：额外输出 Beauty/Alpha/Depth/Normal/Index 多通道（不改动既有单帧产物）")
+    parser.add_argument("--layers", action="store_true",
+                        help="V3-05：在 --passes 基础上额外输出独立层素材（干净底板 + 遮挡层），需与 --passes 同用")
     return parser.parse_args(sys.argv[sys.argv.index("--") + 1 :])
 
 
@@ -232,6 +234,126 @@ def configure_passes(product_meshes, pass_root: Path) -> None:
     print(f"DIRECTOR_PASSES root={pass_root} layout={layout}", flush=True)
 
 
+def detect_reflective_surfaces(product_meshes) -> list[str]:
+    """V3-05：检查非产品网格是否有近似镜面材质（Principled：metallic≥0.5 且 roughness≤0.3）。
+
+    仅用于渲染日志/报告注明；反射能量本身由 build_layers.py 通过底板差分提取，
+    对任意材质都成立，因此这里不改变任何渲染设置。
+    """
+    product = set(product_meshes)
+    names: list[str] = []
+    for obj in bpy.context.scene.objects:
+        if obj.type != "MESH" or obj in product:
+            continue
+        for slot in obj.material_slots:
+            material = slot.material
+            if not material or not material.use_nodes:
+                continue
+            for node in material.node_tree.nodes:
+                if node.bl_idname == "ShaderNodeBsdfPrincipled":
+                    metallic = node.inputs["Metallic"].default_value
+                    roughness = node.inputs["Roughness"].default_value
+                    if metallic >= 0.5 and roughness <= 0.3 and obj.name not in names:
+                        names.append(obj.name)
+    return names
+
+
+def render_layer_passes(product_meshes, output: Path) -> None:
+    """V3-05 独立层素材（仅 --layers 开启时执行；默认渲染路径完全不变）。
+
+    - `passes/layers/plate_full/`：含产品的完整场景渲染（不透底，16 位半浮点 EXR）；
+    - `passes/layers/plate/`：干净底板——隐藏产品网格后的同一完整场景渲染
+      （地面/灯光/世界环境原样、不透底，16 位半浮点 EXR）；
+      两者同为原始线性值，build_layers.py 用这对底板差分提取阴影与反射
+      （不能用 passes/beauty：在 Blender 5 下它会被遮罩渲染改写为透明产品层）；
+    - `passes/layers/occlusion/`：遮挡层 RGBA（RGB=遮挡物颜色，A=覆盖度）。
+      遮挡物 = 名称以 "Occluder" 开头或带自定义属性 pd_occluder 的网格；
+      场景没有遮挡物时渲一遍全隐藏画面，得到逐帧全零层并在日志注明。
+    """
+    scene = bpy.context.scene
+    layers_root = output / "passes" / "layers"
+    plate_full_dir = layers_root / "plate_full"
+    plate_dir = layers_root / "plate"
+    occlusion_dir = layers_root / "occlusion"
+    plate_full_dir.mkdir(parents=True, exist_ok=True)
+    plate_dir.mkdir(parents=True, exist_ok=True)
+    occlusion_dir.mkdir(parents=True, exist_ok=True)
+    product = set(product_meshes)
+    occluders = [
+        obj for obj in scene.objects
+        if obj.type == "MESH" and obj not in product
+        and (obj.name.startswith("Occluder") or obj.get("pd_occluder"))
+    ]
+    reflective = detect_reflective_surfaces(product_meshes)
+    previous = (
+        scene.render.filepath,
+        scene.render.image_settings.file_format,
+        scene.render.image_settings.color_mode,
+        scene.render.image_settings.color_depth,
+        scene.use_nodes,
+        scene.render.film_transparent,
+        scene.view_settings.view_transform,
+    )
+    scene.use_nodes = False
+    # Blender 5 忽略 scene.use_nodes=False（合成器由 compositing_node_group 驱动，
+    # 每次渲染都会执行），因此必须显式摘下合成器节点组，否则层渲染会把
+    # passes/ 下的 beauty/alpha/depth/normal EXR 覆盖成层渲染的画面。
+    comp_group = None
+    if hasattr(scene, "compositing_node_group"):
+        comp_group = scene.compositing_node_group
+        scene.compositing_node_group = None
+    # 层素材必须与 beauty EXR 的原始线性值对齐：用 Standard 视图变换
+    # （PNG = 线性的直接 sRGB 编码），避免默认 AgX 色调映射污染底板差分。
+    scene.view_settings.view_transform = "Standard"
+    hidden: list = []
+    try:
+        # 完整场景（含产品）：差分对的"有"侧，与底板共享全部渲染设置
+        scene.render.film_transparent = False
+        scene.render.image_settings.file_format = "OPEN_EXR"
+        scene.render.image_settings.color_mode = "RGB"
+        scene.render.image_settings.color_depth = "16"
+        scene.render.filepath = str(plate_full_dir / "frame_")
+        bpy.ops.render.render(animation=True)
+        print(f"DIRECTOR_LAYER_PLATE_FULL dir={plate_full_dir} frames={len(list(plate_full_dir.glob('frame_*.exr')))}", flush=True)
+        # 干净底板：只隐藏产品，其余场景元素原样渲染（不透底，保留地面受光）
+        for obj in product:
+            if obj.hide_render is False:
+                obj.hide_render = True
+                hidden.append(obj)
+        scene.render.filepath = str(plate_dir / "frame_")
+        bpy.ops.render.render(animation=True)
+        print(f"DIRECTOR_LAYER_PLATE dir={plate_dir} frames={len(list(plate_dir.glob('frame_*.exr')))}", flush=True)
+        for obj in hidden:
+            obj.hide_render = False
+        hidden.clear()
+        # 遮挡层：隐藏全部非遮挡物网格；无遮挡物时画面全透明（=逐帧全零层）
+        for obj in scene.objects:
+            if obj.type != "MESH" or obj in occluders:
+                continue
+            if obj.hide_render is False:
+                obj.hide_render = True
+                hidden.append(obj)
+        scene.render.film_transparent = True
+        scene.render.image_settings.file_format = "PNG"
+        scene.render.image_settings.color_depth = "8"
+        scene.render.image_settings.color_mode = "RGBA"
+        scene.render.filepath = str(occlusion_dir / "frame_")
+        bpy.ops.render.render(animation=True)
+        note = "occluders=" + ",".join(o.name for o in occluders) if occluders else "no_occluders_zero_layer"
+        print(f"DIRECTOR_LAYER_OCCLUSION dir={occlusion_dir} frames={len(list(occlusion_dir.glob('frame_*.png')))} {note}", flush=True)
+        reflection_note = "reflective_surfaces=" + ",".join(reflective) if reflective else "no_reflective_surface"
+        print(f"DIRECTOR_LAYER_REFLECTION {reflection_note}（反射能量由 build_layers.py 差分提取）", flush=True)
+    finally:
+        for obj in hidden:
+            obj.hide_render = False
+        if hasattr(scene, "compositing_node_group"):
+            scene.compositing_node_group = comp_group
+        (scene.render.filepath, scene.render.image_settings.file_format,
+         scene.render.image_settings.color_mode, scene.render.image_settings.color_depth,
+         scene.use_nodes, scene.render.film_transparent,
+         scene.view_settings.view_transform) = previous
+
+
 def load_plan(path: str, total_frames: int) -> list[dict]:
     """Read the API-frozen plan and reject malformed timing before rendering."""
     try:
@@ -372,6 +494,10 @@ def main():
     bpy.ops.render.render(animation=True)
     if args.passes:
         render_mask_pass(meshes, output, args)
+        if args.layers:
+            render_layer_passes(meshes, output)
+    elif args.layers:
+        raise RuntimeError("--layers 需与 --passes 一起使用（独立层素材依赖多通道产物布局）")
 
 
 if __name__ == "__main__":
