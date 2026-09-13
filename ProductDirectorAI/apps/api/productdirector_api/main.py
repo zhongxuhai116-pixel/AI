@@ -4,12 +4,14 @@ import argparse
 import contextvars
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import mimetypes
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import struct
 import subprocess
@@ -496,6 +498,21 @@ def initialize_db() -> None:
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               UNIQUE (plan_id, version)
+            );
+            CREATE TABLE IF NOT EXISTS reference_assets (
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              source_kind TEXT NOT NULL,
+              uploaded_asset_id TEXT,
+              source_url TEXT,
+              status TEXT NOT NULL DEFAULT 'INGEST',
+              error TEXT,
+              source_hash TEXT,
+              proxy_hash TEXT,
+              payload TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
             );
             """
     with connect() as db:
@@ -5312,6 +5329,280 @@ def decide_qa_report(report_id: str, request: QaDecisionRequest) -> dict:
         )
         updated = db.execute("SELECT * FROM qa_reports WHERE id = ?", (report_id,)).fetchone()
     return qa_report_public(updated, db)
+
+
+# ---------------------------------------------------------------------------
+# V5-01：参考视频上传、代理与时间戳映射、URL 获取约束
+# ---------------------------------------------------------------------------
+
+V5_MAX_REFERENCE_BYTES = 500 * 1024 * 1024
+V5_URL_FETCH_TIMEOUT = 60
+V5_PROXY_MAX_WIDTH = 640
+
+
+def _url_host_is_public(hostname: str) -> bool:
+    """URL 直连获取只允许公网主机（防 SSRF；登录/DRM/访问控制媒体一律不绕过）。"""
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            return False
+    return True
+
+
+def _fetch_reference_url(url: str, workdir: Path) -> Path:
+    """仅支持可直接公开取得的媒体 URL；任何失败都提示改用本地上传。"""
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise RuntimeError("仅支持 http(s) 直连媒体地址；无法访问的链接请上传本地文件")
+    if not _url_host_is_public(parts.hostname):
+        raise RuntimeError("拒绝访问内网/本机地址；无法访问的链接请上传本地文件")
+    request = urllib.request.Request(url, headers={"User-Agent": "ProductDirectorAI/1.0"})
+    target = workdir / "source.mp4"
+    with urllib.request.urlopen(request, timeout=V5_URL_FETCH_TIMEOUT) as response:
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if not content_type.startswith("video/"):
+            raise RuntimeError("链接不是可直接取得的视频媒体；请上传本地文件")
+        length_header = response.headers.get("Content-Length")
+        if length_header and int(length_header) > V5_MAX_REFERENCE_BYTES:
+            raise RuntimeError("媒体超过大小上限")
+        data = response.read(V5_MAX_REFERENCE_BYTES + 1)
+        if len(data) > V5_MAX_REFERENCE_BYTES:
+            raise RuntimeError("媒体超过大小上限")
+        target.write_bytes(data)
+    return target
+
+
+def _ingest_reference_media(source_path: Path, workdir: Path) -> dict:
+    """ffprobe 检测 + 生成分析代理 + 时间戳映射（source_to_proxy_map）。"""
+    if not FFPROBE or not FFMPEG:
+        raise RuntimeError("ffprobe/ffmpeg 未安装或未找到")
+    probe = subprocess.run(
+        [FFPROBE, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=r_frame_rate,width,height:format=duration",
+         "-of", "json", str(source_path)],
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError("无法解析媒体（损坏或不支持的格式）；请提供有效视频文件")
+    try:
+        info = json.loads(probe.stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("无法解析媒体信息") from exc
+    stream = (info.get("streams") or [{}])[0]
+    fmt = info.get("format") or {}
+    rate_text = stream.get("r_frame_rate") or ""
+    numerator, _, denominator = rate_text.partition("/")
+    try:
+        fps = float(numerator) / float(denominator) if denominator else None
+    except (ValueError, ZeroDivisionError):
+        fps = None
+    duration = float(fmt.get("duration") or 0.0)
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    proxy_path = workdir / "proxy.mp4"
+    proxy_width = min(V5_PROXY_MAX_WIDTH, width) if width else V5_PROXY_MAX_WIDTH
+    proxy_height = max(1, round(height * proxy_width / width)) if width else max(1, height)
+    encode = subprocess.run(
+        [FFMPEG, "-y", "-v", "error", "-i", str(source_path),
+         "-vf", f"scale={proxy_width}:{proxy_height}", "-an",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+         str(proxy_path)],
+        capture_output=True,
+    )
+    if encode.returncode != 0 or not proxy_path.exists():
+        raise RuntimeError("分析代理生成失败")
+    proxy_probe = subprocess.run(
+        [FFPROBE, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "format=duration", "-of", "json", str(proxy_path)],
+        capture_output=True,
+    )
+    proxy_duration = duration
+    if proxy_probe.returncode == 0:
+        try:
+            proxy_duration = float(json.loads(proxy_probe.stdout.decode("utf-8", "replace")).get("format", {}).get("duration") or duration)
+        except (json.JSONDecodeError, ValueError):
+            proxy_duration = duration
+    return {
+        "source": {
+            "width": width, "height": height, "fps": fps,
+            "duration_s": round(duration, 4), "sha256": _file_sha256(source_path),
+        },
+        "proxy": {
+            "width": proxy_width, "height": proxy_height, "fps": fps,
+            "duration_s": round(proxy_duration, 4), "sha256": _file_sha256(proxy_path),
+        },
+        "timebase": {
+            "fps": fps, "duration_s": round(duration, 4),
+            "estimated_frames": int(round(duration * fps)) if fps else 0,
+        },
+        "source_to_proxy_map": {
+            "scale_width": proxy_width / width if width else 1.0,
+            "scale_height": proxy_height / height if height else 1.0,
+            "fps_ratio": 1.0,
+            "source_duration_s": round(duration, 4),
+            "proxy_duration_s": round(proxy_duration, 4),
+        },
+    }
+
+
+class ReferenceRequest(BaseModel):
+    uploaded_asset_id: str | None = None
+    source_url: str | None = None
+    notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def exactly_one_source(self):
+        if (self.uploaded_asset_id is None) == (self.source_url is None):
+            raise ValueError("必须且只能提供 uploaded_asset_id 或 source_url 之一")
+        return self
+
+
+def _reference_public(row) -> dict:
+    payload = json.loads(row["payload"]) if row["payload"] else {}
+    return {
+        "id": row["id"],
+        "source_kind": row["source_kind"],
+        "uploaded_asset_id": row["uploaded_asset_id"],
+        "source_url": row["source_url"],
+        "status": row["status"],
+        "error": row["error"],
+        "source_hash": row["source_hash"],
+        "proxy_hash": row["proxy_hash"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "payload": payload,
+    }
+
+
+@app.post("/api/v1/references", status_code=201)
+def create_reference(request: ReferenceRequest) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    source_kind = "uploaded_asset" if request.uploaded_asset_id else "source_url"
+
+    def resolve_source(workdir: Path) -> Path:
+        if request.uploaded_asset_id:
+            with connect() as db:
+                asset = db.execute("SELECT * FROM assets WHERE id = ?", (request.uploaded_asset_id,)).fetchone()
+            if not asset:
+                raise HTTPException(404, "素材不存在")
+            if asset["owner_id"] != owner_id:
+                raise HTTPException(403, "素材不属于当前 Owner")
+            if asset["kind"] != "video":
+                raise HTTPException(422, "参考素材必须是视频")
+            return Path(resolve_asset_path(row_to_dict(asset)))
+        return _fetch_reference_url(request.source_url or "", workdir)
+
+    return _ingest_and_store_reference(
+        owner_id, project_id, source_kind, resolve_source,
+        uploaded_asset_id=request.uploaded_asset_id, source_url=request.source_url,
+    )
+
+
+@app.post("/api/v1/references/upload", status_code=201)
+def upload_reference(file: UploadFile = File(...)) -> dict:
+    """本地文件上传入口：V1 素材库只接受图片/GLB，参考视频走独立入口并落盘到参考工作区。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    if not (file.content_type or "").lower().startswith("video/"):
+        raise HTTPException(422, "参考文件必须是视频")
+
+    def resolve_source(workdir: Path) -> Path:
+        target = workdir / "source.mp4"
+        total = 0
+        with open(target, "wb") as handle:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > V5_MAX_REFERENCE_BYTES:
+                    raise RuntimeError("媒体超过大小上限")
+                handle.write(chunk)
+        if total == 0:
+            raise RuntimeError("上传文件为空")
+        return target
+
+    return _ingest_and_store_reference(owner_id, project_id, "uploaded_file", resolve_source)
+
+
+def _ingest_and_store_reference(
+    owner_id: str, project_id: str, source_kind: str, resolve_source,
+    uploaded_asset_id: str | None = None, source_url: str | None = None,
+) -> dict:
+    reference_id = str(uuid.uuid4())
+    workdir = VAR / "references" / reference_id
+    workdir.mkdir(parents=True, exist_ok=True)
+    payload: dict = {"source_kind": source_kind}
+    status = "READY"
+    error = None
+    source_hash = None
+    proxy_hash = None
+    try:
+        source_path = resolve_source(workdir)
+        payload = _ingest_reference_media(source_path, workdir)
+        source_hash = payload["source"]["sha256"]
+        proxy_hash = payload["proxy"]["sha256"]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        status = "BLOCKED" if source_kind == "source_url" else "FAILED"
+        error = str(exc) + ("（无法取回链接时请上传本地文件）" if source_kind == "source_url" else "")
+    now = utc_now()
+    with connect() as db:
+        db.execute(
+            "INSERT INTO reference_assets(id, owner_id, project_id, source_kind, uploaded_asset_id, source_url, status, error, source_hash, proxy_hash, payload, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (reference_id, owner_id, project_id, source_kind, uploaded_asset_id,
+             source_url, status, error, source_hash, proxy_hash,
+             json.dumps(payload, ensure_ascii=False), now, now),
+        )
+        row = db.execute("SELECT * FROM reference_assets WHERE id = ?", (reference_id,)).fetchone()
+    return _reference_public(row)
+
+
+@app.get("/api/v1/references")
+def list_references(owner_id: str = DEFAULT_OWNER_ID, project_id: str = DEFAULT_PROJECT_ID) -> list[dict]:
+    owner_id, _, project_id = normalize_contract_context(owner_id, project_id)
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM reference_assets WHERE owner_id = ? AND project_id = ? ORDER BY created_at DESC LIMIT 200",
+            (owner_id, project_id),
+        ).fetchall()
+    return [_reference_public(row) for row in rows]
+
+
+@app.get("/api/v1/references/{reference_id}")
+def get_reference(reference_id: str) -> dict:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute("SELECT * FROM reference_assets WHERE id = ?", (reference_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "参考视频不存在")
+    if row["owner_id"] != owner_id or row["project_id"] != project_id:
+        raise HTTPException(403, "越权访问参考视频")
+    return _reference_public(row)
+
+
+@app.get("/api/v1/references/{reference_id}/proxy")
+def get_reference_proxy(reference_id: str) -> FileResponse:
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute("SELECT * FROM reference_assets WHERE id = ?", (reference_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "参考视频不存在")
+    if row["owner_id"] != owner_id or row["project_id"] != project_id:
+        raise HTTPException(403, "越权访问参考视频")
+    if row["status"] != "READY":
+        raise HTTPException(409, "参考视频尚未完成摄取")
+    proxy_path = VAR / "references" / reference_id / "proxy.mp4"
+    if not proxy_path.exists():
+        raise HTTPException(404, "代理文件不存在")
+    return FileResponse(proxy_path, media_type="video/mp4", filename="reference_proxy.mp4")
 
 
 # ---------------------------------------------------------------------------

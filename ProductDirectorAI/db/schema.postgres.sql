@@ -294,3 +294,19 @@ CREATE TABLE IF NOT EXISTS interaction_plans (
   updated_at TEXT NOT NULL,
   UNIQUE (plan_id, version)
 );
+
+CREATE TABLE IF NOT EXISTS reference_assets (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL REFERENCES owners(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  source_kind TEXT NOT NULL,
+  uploaded_asset_id TEXT,
+  source_url TEXT,
+  status TEXT NOT NULL DEFAULT 'INGEST',
+  error TEXT,
+  source_hash TEXT,
+  proxy_hash TEXT,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
