@@ -148,6 +148,41 @@ class V4ContractTests(unittest.TestCase):
         )
         self.assertEqual(bad_height.status_code, 422, bad_height.text)
 
+    def test_character_asset_refs_validated_and_capability(self) -> None:
+        missing = self.client.post(
+            "/api/v1/characters",
+            json={
+                "name": "缺素材人物", "source": "licensed_asset", "height_range_m": [1.7, 1.8],
+                "license_record": "x", "consent_record": "y", "asset_refs": ["no-such-asset"],
+            },
+        )
+        self.assertEqual(missing.status_code, 404, missing.text)
+        asset = self._create_asset()
+        licensed = self.client.post(
+            "/api/v1/characters",
+            json={
+                "name": "带素材人物", "source": "licensed_asset", "height_range_m": [1.7, 1.8],
+                "license_record": "CC0 pack", "consent_record": "consent #1",
+                "asset_refs": [asset["id"]],
+            },
+        )
+        self.assertEqual(licensed.status_code, 201, licensed.text)
+        capability = self.client.get(f"/api/v1/characters/{licensed.json()['id']}/capability")
+        self.assertEqual(capability.status_code, 200, capability.text)
+        body = capability.json()
+        self.assertEqual(body["generation_route"]["status"], "NOT_CONFIGURED")
+        self.assertEqual(body["proxy_previz"]["status"], "AVAILABLE")
+        self.assertTrue(body["usable_for_previz"])
+        self.assertTrue(body["usable_for_final_person_layer"])
+        self.assertEqual(body["licensed_assets"][0]["status"], "BOUND")
+        proxy = self.client.post(
+            "/api/v1/characters",
+            json={"name": "纯合成人物", "source": "synthesized_proxy", "height_range_m": [1.7, 1.8]},
+        ).json()
+        proxy_capability = self.client.get(f"/api/v1/characters/{proxy['id']}/capability").json()
+        self.assertTrue(proxy_capability["usable_for_previz"])
+        self.assertFalse(proxy_capability["usable_for_final_person_layer"])
+
     def test_motion_templates_required_set(self) -> None:
         response = self.client.get("/api/v1/motion-templates")
         self.assertEqual(response.status_code, 200)

@@ -5596,6 +5596,14 @@ def _character_public(row) -> dict:
 @app.post("/api/v1/characters", status_code=201)
 def create_character(request: CharacterRequest) -> dict:
     owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    # 授权素材引用必须真实存在且属于同一 Owner（与产品审核证据同规则）
+    with connect() as db:
+        for asset_id in request.asset_refs:
+            asset = db.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
+            if not asset:
+                raise HTTPException(404, f"素材引用不存在: {asset_id}")
+            if asset["owner_id"] != owner_id:
+                raise HTTPException(403, f"素材引用不属于当前 Owner: {asset_id}")
     payload = request.model_dump()
     payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
@@ -5609,6 +5617,50 @@ def create_character(request: CharacterRequest) -> dict:
         )
         row = db.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
     return _character_public(row)
+
+
+@app.get("/api/v1/characters/{character_id}/capability")
+def character_capability(character_id: str) -> dict:
+    """人物能力校验报告：来源、可用预演、生成路线配置状态与授权素材绑定情况（如实报告）。"""
+    owner_id, _, project_id = normalize_contract_context(DEFAULT_OWNER_ID, DEFAULT_PROJECT_ID)
+    with connect() as db:
+        row = db.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "人物不存在")
+    if row["owner_id"] != owner_id or row["project_id"] != project_id:
+        raise HTTPException(403, "越权访问人物")
+    payload = json.loads(row["payload"])
+    licensed_assets = []
+    with connect() as db:
+        for asset_id in payload.get("asset_refs", []):
+            asset = db.execute("SELECT id, name, kind FROM assets WHERE id = ?", (asset_id,)).fetchone()
+            licensed_assets.append({
+                "asset_id": asset_id,
+                "status": "BOUND" if asset else "MISSING",
+                "name": asset["name"] if asset else "",
+                "kind": asset["kind"] if asset else "",
+            })
+    records_complete = True
+    if payload.get("source") == "licensed_asset":
+        records_complete = bool(payload.get("license_record") and payload.get("consent_record"))
+    generation_route = "NOT_CONFIGURED"
+    generation_detail = "未配置经批准的真人感人物生成工作流；接入前不得宣称可用"
+    return {
+        "schema_version": "1.0",
+        "character_id": character_id,
+        "person_layer_source": payload.get("source"),
+        "proxy_previz": {"status": "AVAILABLE", "detail": "确定性人体 Proxy（V4-02/03）可用于尺度/路径/遮挡与接触预演"},
+        "generation_route": {"status": generation_route, "detail": generation_detail},
+        "licensed_assets": licensed_assets,
+        "records_complete": records_complete,
+        "usable_for_previz": True,
+        "usable_for_final_person_layer": (
+            payload.get("source") == "licensed_asset"
+            and bool(payload.get("asset_refs"))
+            and all(item["status"] == "BOUND" for item in licensed_assets)
+            and records_complete
+        ),
+    }
 
 
 @app.get("/api/v1/characters")
