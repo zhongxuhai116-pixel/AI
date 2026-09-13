@@ -63,6 +63,11 @@ class StrictCompositeRegressionTests(unittest.TestCase):
         image[:] = color
         Image.fromarray(image, mode="RGB").save(path)
 
+    def _write_shadow_factor(self, path: Path, value: float = 1.0, size: tuple[int, int] = (8, 8)) -> None:
+        """V3-05 阴影层：16 位灰度因子 PNG（1.0 = 无阴影，线性因子 × 65535）。"""
+        array = np.full((size[1], size[0]), int(np.clip(value, 0.0, 1.0) * 65535 + 0.5), dtype=np.uint16)
+        Image.fromarray(array).save(path)
+
     def _write_mask(self, path: Path, *, on: bool, size: tuple[int, int] = (8, 8), rect=(1, 1, 5, 5)) -> None:
         image = Image.new("RGBA", size, (0, 0, 0, 0))
         if on:
@@ -135,7 +140,7 @@ class StrictCompositeRegressionTests(unittest.TestCase):
             self._write_background(self.background / name, (10, 10, 10))
         shadow = self.workdir / "shadow"
         shadow.mkdir()
-        self._write_product(shadow / "frame_0001.png", (30, 30, 30), alpha_rect=(1, 1, 5, 5))
+        self._write_shadow_factor(shadow / "frame_0001.png", value=1.0)
         plan = self.workdir / "plan.json"
         plan.write_text(json.dumps({"frame_count": 3, "start_frame": 1, "background_frame_offset": 0, "required_layers": {}}), encoding="utf-8")
 
@@ -173,14 +178,14 @@ class StrictCompositeRegressionTests(unittest.TestCase):
             self._write_product(self.product / name, (20 * index, 10 * index, 30 * index))
             self._write_mask(self.mask / name, on=True)
             self._write_background(self.background / name, (10, 10, 10))
-        shadow = self.workdir / "shadow"
-        shadow.mkdir()
-        self._write_rgb_product_without_alpha(shadow / "frame_0001.png", (30, 30, 30))
+        occlusion = self.workdir / "occlusion"
+        occlusion.mkdir()
+        self._write_rgb_product_without_alpha(occlusion / "frame_0001.png", (30, 30, 30))
         plan = self.workdir / "plan.json"
         plan.write_text(json.dumps({"frame_count": 3, "start_frame": 1, "background_frame_offset": 0, "required_layers": {}}), encoding="utf-8")
 
         code, report = self._run(self.product, self.mask, self.background, self.out,
-                                 extra_args=["--plan", str(plan), "--shadow", str(shadow)])
+                                 extra_args=["--plan", str(plan), "--occlusion", str(occlusion)])
 
         self.assertEqual(code, 1)
         self.assertFalse(report["passed"])

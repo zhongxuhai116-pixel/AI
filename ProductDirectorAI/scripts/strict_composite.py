@@ -18,6 +18,20 @@
   `--expected-frames/--start-frame`，不能从已有文件“猜出”缺尾帧。
   背景编号通过 `--background-frame-offset` 显式映射。
 - 预检隔离：所有输入先整体预检；非预览失败不写任何最终 PNG。
+- 独立层（V3-05，规格 9.5：阴影/反射/人物遮挡是单独层；
+  通过 `--layers shadow=<dir> reflection=<dir> occlusion=<dir>` 提供，
+  也接受 `--shadow/--reflection/--occlusion` 单一目录参数，两者不能重复指定同一层）：
+  - shadow：16 位灰度 PNG（也接受 8 位灰度），线性因子（1.0=无阴影），
+    **乘算到背景**（display-linear 空间），产品掩码内不受影响；
+  - reflection：8 位 RGB PNG（sRGB 编码），解码后**加算到背景**（display-linear 空间）；
+  - occlusion：RGBA PNG（RGB=遮挡物颜色 sRGB，A=覆盖度），在最后**盖回产品上方**；
+    遮挡区（occ_alpha>0 且在产品掩码内）从像素锁定断言中豁免，
+    豁免像素数逐帧累加进 `occlusion_exempted_pixels_total`。
+  - 层合同：有冻结计划时由计划的 `required_layers` 决定哪些帧必须有层
+    （未要求的层允许只覆盖部分帧）；没有冻结计划时提供层必须覆盖全部处理帧
+    （fail-closed，不静默跳过）；越出全片帧集合的层帧一律拒绝。
+  - 中性层（shadow 全 1 / reflection 全 0 / occlusion 全透明）与不带层的
+    输出逐字节一致（回归保证）。
 """
 from __future__ import annotations
 
@@ -183,6 +197,53 @@ def read_background_rgb(path: Path, color_space: str) -> np.ndarray:
 def read_mask(path: Path) -> np.ndarray:
     with Image.open(path) as image:
         return (np.asarray(image.convert("RGBA").split()[3], dtype=np.float32) / 255.0) > 0.5
+
+
+LAYER_NAMES = ("shadow", "reflection", "occlusion")
+
+
+def read_shadow_factor(path: Path) -> np.ndarray:
+    """阴影因子层：16 位灰度 PNG（线性因子 = 值/65535，无 gamma；1.0 = 无阴影）；
+    兼容 8 位灰度（值/255）与 RGBA（取第一分量/255）。"""
+    with Image.open(path) as image:
+        mode = image.mode
+        array = np.asarray(image, dtype=np.float32)
+    if array.ndim == 3:
+        array = array[:, :, 0]
+    scale = 65535.0 if mode.startswith("I") else 255.0
+    return np.clip(array / scale, 0.0, 1.0)
+
+
+def read_reflection_rgb(path: Path) -> np.ndarray:
+    """反射层：8 位 RGB PNG，sRGB 编码能量，解码到 display-linear 后加算到背景。"""
+    with Image.open(path) as image:
+        array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    return srgb_to_linear(array)
+
+
+def read_occlusion(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """遮挡层：RGBA PNG（RGB=遮挡物颜色 sRGB，A=覆盖度）。返回 (display-linear RGB, alpha)。
+
+    没有原生 Alpha 通道的文件直接拒绝：把 RGB 图静默当全图遮挡属于错误放行。
+    """
+    with Image.open(path) as image:
+        if "A" not in image.getbands():
+            raise ValueError("遮挡层缺少可信 Alpha")
+        array = np.asarray(image.convert("RGBA"), dtype=np.float32) / 255.0
+    return srgb_to_linear(array[:, :, :3]), array[:, :, 3]
+
+
+def parse_layers(items: list[str] | None) -> dict[str, Path]:
+    """解析 `--layers shadow=<dir> ...`；非法项直接拒绝（合成合同不接受静默忽略）。"""
+    layers: dict[str, Path] = {}
+    for item in items or []:
+        name, sep, value = item.partition("=")
+        if not sep or name not in LAYER_NAMES:
+            raise SystemExit(f"--layers 项格式应为 shadow=<dir> reflection=<dir> occlusion=<dir>，收到: {item!r}")
+        if name in layers:
+            raise SystemExit(f"--layers 重复指定 {name}")
+        layers[name] = Path(value)
+    return layers
 
 
 def _pick_alpha_plane(planes: dict[str, np.ndarray]) -> tuple[str, np.ndarray] | None:
@@ -404,35 +465,55 @@ def _read_frame(frame: int, product_files: dict[int, Path], mask_files: dict[int
     return product, product_alpha, mask, background
 
 
-def _read_optional_layers(frame: int, layer_files: dict[str, dict[int, Path]],
-                          color_contract: dict) -> dict[str, tuple[np.ndarray, np.ndarray | None]]:
-    layers: dict[str, tuple[np.ndarray, np.ndarray | None]] = {}
+def _read_layer_data(frame: int, layer_files: dict[str, dict[int, Path]],
+                     shape: tuple[int, int], failures: list[str]) -> dict[str, object]:
+    """读取并校验一帧的独立层；缺失帧静默跳过（帧级合同在 main 中统一校验）。
+
+    shadow → float32 (H, W) 因子；reflection → float32 (H, W, 3) 线性能量；
+    occlusion → (float32 (H, W, 3), float32 (H, W))。
+    """
+    data: dict[str, object] = {}
     for name, files in layer_files.items():
         path = files.get(frame)
         if path is None:
             continue
-        rgb = read_product_rgb(path, color_contract["layer_color_space"])
-        alpha = read_product_alpha(path)
-        layers[name] = (rgb, alpha)
-    return layers
-
-
-def _validate_optional_layers(frame: int, layers: dict[str, tuple[np.ndarray, np.ndarray | None]],
-                              shape: tuple[int, int], failures: list[str]) -> None:
-    for name, (rgb, alpha) in layers.items():
-        if rgb.shape[:2] != shape:
-            failures.append(f"帧 {frame} {name} 层尺寸不一致：{rgb.shape[:2]} / {shape}")
-        if not np.isfinite(rgb).all():
-            failures.append(f"帧 {frame} {name} 层包含非有限 RGB")
-        if alpha is None:
-            failures.append(f"帧 {frame} {name} 层缺少可信 Alpha")
-        else:
-            if alpha.shape != shape:
-                failures.append(f"帧 {frame} {name} Alpha 尺寸不一致：{alpha.shape} / {shape}")
-            if not np.isfinite(alpha).all():
-                failures.append(f"帧 {frame} {name} Alpha 包含非有限值")
-            if np.any(alpha < -1e-4) or np.any(alpha > 1.0001):
-                failures.append(f"帧 {frame} {name} Alpha 超出 [0,1]")
+        try:
+            if name == "shadow":
+                factor = read_shadow_factor(path)
+                if factor.shape != shape:
+                    failures.append(f"帧 {frame} shadow 层尺寸不一致：{factor.shape} / {shape}")
+                    continue
+                if not np.isfinite(factor).all():
+                    failures.append(f"帧 {frame} shadow 层包含非有限值")
+                    continue
+                if np.any(factor < -1e-4) or np.any(factor > 1.0001):
+                    failures.append(f"帧 {frame} shadow 因子超出 [0,1]")
+                    continue
+                data[name] = factor
+            elif name == "reflection":
+                energy = read_reflection_rgb(path)
+                if energy.shape != (shape[0], shape[1], 3):
+                    failures.append(f"帧 {frame} reflection 层尺寸不一致：{energy.shape} / {shape}")
+                    continue
+                if not np.isfinite(energy).all():
+                    failures.append(f"帧 {frame} reflection 层包含非有限值")
+                    continue
+                data[name] = energy
+            else:
+                occ_rgb, occ_alpha = read_occlusion(path)
+                if occ_alpha.shape != shape:
+                    failures.append(f"帧 {frame} occlusion 层尺寸不一致：{occ_alpha.shape} / {shape}")
+                    continue
+                if not np.isfinite(occ_rgb).all() or not np.isfinite(occ_alpha).all():
+                    failures.append(f"帧 {frame} occlusion 层包含非有限值")
+                    continue
+                if np.any(occ_alpha < -1e-4) or np.any(occ_alpha > 1.0001):
+                    failures.append(f"帧 {frame} occlusion Alpha 超出 [0,1]")
+                    continue
+                data[name] = (occ_rgb, occ_alpha)
+        except Exception as exc:
+            failures.append(f"帧 {frame} {name} 层读取失败：{exc}")
+    return data
 
 
 def _validate_frame(frame: int, product: np.ndarray, product_alpha: np.ndarray | None,
@@ -483,48 +564,52 @@ def _validate_frame(frame: int, product: np.ndarray, product_alpha: np.ndarray |
             failures.append(f"帧 {frame} 可信 Alpha 与遮罩轮廓 IoU 过低：{iou:.4f}")
             return None
 
-    dilated_mask = dilate(mask_bool.astype(np.float32), args.dilate)
-    effective_alpha = np.clip(np.maximum(product_alpha, dilated_mask), 0.0, 1.0)
-    composite = effective_alpha[:, :, None] * product + (1.0 - effective_alpha[:, :, None]) * background
-    if mask_has_visible:
-        locked = np.allclose(composite[mask_bool], product[mask_bool], atol=1e-6, rtol=0.0, equal_nan=False)
-        if not locked:
-            report["pixel_lock_ok"] = False
-            failures.append(f"帧 {frame} 像素锁定失败")
-            return None
-    return alpha_visible, mask_bool, dilated_mask
+    return alpha_visible, mask_bool, dilate(mask_bool.astype(np.float32), args.dilate)
 
 
 def _write_composite(frame: int, product: np.ndarray, product_alpha: np.ndarray,
                      mask: np.ndarray, background: np.ndarray, args: argparse.Namespace,
                      color_contract: dict,
                      staging: Path,
-                     layers: dict[str, tuple[np.ndarray, np.ndarray | None]] | None = None) -> tuple[float, float, float, str, float | None]:
+                     layer_data: dict[str, object]) -> tuple[float, float, float, str, float | None, int]:
     alpha_visible = product_alpha > 0.5
     mask_bool = mask > 0.5
     dilated_mask = dilate(mask_bool.astype(np.float32), args.dilate)
     effective_alpha = np.clip(np.maximum(product_alpha, dilated_mask), 0.0, 1.0)
-    composite = effective_alpha[:, :, None] * product + (1.0 - effective_alpha[:, :, None]) * background
-    for name, (layer_rgb, layer_alpha) in (layers or {}).items():
-        if layer_alpha is None:
-            continue
-        alpha = np.clip(layer_alpha, 0.0, 1.0)[:, :, None]
-        composited = layer_rgb * alpha + composite * (1.0 - alpha)
-        if name in {"shadow", "reflection"}:
-            composited[mask_bool] = composite[mask_bool]
-        composite = composited
+
+    working_background = background
+    if "shadow" in layer_data:
+        working_background = working_background * layer_data["shadow"][:, :, None]
+    if "reflection" in layer_data:
+        working_background = working_background + layer_data["reflection"]
+    composite = effective_alpha[:, :, None] * product + (1.0 - effective_alpha[:, :, None]) * working_background
+
+    exempted = 0
+    locked_region = mask_bool
+    if "occlusion" in layer_data:
+        occ_rgb, occ_alpha = layer_data["occlusion"]
+        composite = occ_alpha[:, :, None] * occ_rgb + (1.0 - occ_alpha[:, :, None]) * composite
+        occluded = occ_alpha > 0
+        exempted = int(np.logical_and(mask_bool, occluded).sum())
+        locked_region = np.logical_and(mask_bool, ~occluded)
+
+    if locked_region.any():
+        locked = np.allclose(composite[locked_region], product[locked_region], atol=1e-6, rtol=0.0, equal_nan=False)
+        if not locked:
+            raise RuntimeError("pixel lock failed")
+
     encoded = np.clip(linear_to_srgb(composite), 0.0, 1.0)
     target = staging / f"composite_{frame:04d}.png"
     Image.fromarray((encoded * 255 + 0.5).astype(np.uint8)).save(target)
     approved_display_diff = None
-    if mask_bool.any() and color_contract["product_color_space"] == DISPLAY_SRGB:
+    if locked_region.any() and color_contract["product_color_space"] == DISPLAY_SRGB:
         with Image.open(target) as written_image:
             written = np.asarray(written_image.convert("RGB"), dtype=np.float32) / 255.0
         product_display = np.clip(linear_to_srgb(product), 0.0, 1.0)
         product_display_8bit = np.round(product_display * 255.0) / 255.0
-        approved_display_diff = float(np.max(np.abs(written[mask_bool] - product_display_8bit[mask_bool])))
+        approved_display_diff = float(np.max(np.abs(written[locked_region] - product_display_8bit[locked_region])))
     return (float(alpha_visible.mean()), float(mask_bool.mean()), float(dilated_mask.mean()),
-            sha256_bytes(target.read_bytes()), approved_display_diff)
+            sha256_bytes(target.read_bytes()), approved_display_diff, exempted)
 
 
 def main() -> int:
@@ -535,6 +620,8 @@ def main() -> int:
     parser.add_argument("--shadow", default="", help="独立阴影层目录；空字符串表示未启用")
     parser.add_argument("--reflection", default="", help="独立反射层目录；空字符串表示未启用")
     parser.add_argument("--occlusion", default="", help="独立遮挡层目录；空字符串表示未启用")
+    parser.add_argument("--layers", nargs="+", default=None, metavar="NAME=DIR",
+                        help="V3-05 独立层：shadow=<dir> reflection=<dir> occlusion=<dir>（线性叠加，遮挡区豁免像素锁定）")
     parser.add_argument("--out", required=True)
     parser.add_argument("--dilate", type=int, default=2)
     parser.add_argument("--expected-frames", type=int, default=0, help="冻结计划总帧数；0 表示推断，推断时不会完整 PASS")
@@ -556,6 +643,16 @@ def main() -> int:
     product_dir, mask_dir, bg_dir, out_dir = (Path(p) for p in (args.product, args.mask, args.background, args.out))
     failures: list[str] = []
 
+    layers = parse_layers(args.layers)
+    for name in LAYER_NAMES:
+        flag_value = getattr(args, name, "")
+        if not flag_value:
+            continue
+        if name in layers:
+            failures.append(f"独立层 {name} 同时通过 --layers 与 --{name} 指定，合同重复")
+            continue
+        layers[name] = Path(flag_value)
+
     product_files = discover_indexed_frames(
         [p for p in product_dir.glob("*") if p.suffix.lower() in {".exr", ".png"}],
         label="product",
@@ -563,16 +660,10 @@ def main() -> int:
     )
     mask_files = discover_indexed_frames(mask_dir.glob("*.png"), label="mask", failures=failures)
     background_files = discover_indexed_frames(bg_dir.glob("*.png"), label="background", failures=failures)
-    optional_layer_files: dict[str, dict[int, Path]] = {}
-    for layer_name in ("shadow", "reflection", "occlusion"):
-        layer_arg = getattr(args, layer_name, "")
-        if not layer_arg:
-            continue
-        layer_dir = Path(layer_arg)
-        layer_paths = [p for p in layer_dir.glob("*") if p.suffix.lower() in {".png", ".exr"}]
-        optional_layer_files[layer_name] = discover_indexed_frames(
-            layer_paths, label=layer_name, failures=failures
-        )
+    layer_files: dict[str, dict[int, Path]] = {
+        name: discover_indexed_frames(path.glob("*.png"), label=name, failures=failures)
+        for name, path in layers.items()
+    }
 
     product_frames = set(product_files)
     mask_frames = set(mask_files)
@@ -581,16 +672,19 @@ def main() -> int:
         args, product_frames, mask_frames, raw_background_frames, failures
     )
     color_contract = _resolve_color_contract(args, plan_data, failures)
+    if layers and color_contract["layer_color_space"] != DISPLAY_SRGB:
+        failures.append("独立层当前只支持 display-srgb PNG 合同（shadow 因子不参与颜色管理）")
     required_layer_frames: dict[str, set[int]] = {}
-    for layer_name in ("shadow", "reflection", "occlusion"):
-        layer_frames = plan_data.get("required_layers", {}).get(layer_name, [])
-        if layer_frames:
-            required_layer_frames[layer_name] = set(layer_frames)
+    for layer_name in LAYER_NAMES:
+        layer_required = plan_data.get("required_layers", {}).get(layer_name, [])
+        if layer_required:
+            required_layer_frames[layer_name] = set(layer_required)
     mapped_background_files = _mapped_background_frames(background_files, background_offset, failures)
     background_frames = set(mapped_background_files)
 
     report: dict = {
-        "equation": "C = effective_alpha * trusted_product + (1 - effective_alpha) * generated_background",
+        "equation": "C = effective_alpha * trusted_product + (1 - effective_alpha) * generated_background；"
+                    "独立层：bg *= shadow_factor；bg += reflection_energy；C = occ_alpha * occluder + (1 - occ_alpha) * C（遮挡区豁免像素锁定）",
         "color_space": "composited in display-linear working space from display-sRGB inputs, output encoded to sRGB",
         "color_contract": color_contract,
         "approved_display_product_mae_max": round(1 / 255, 6),
@@ -607,14 +701,20 @@ def main() -> int:
             "product": sorted(product_frames),
             "mask": sorted(mask_frames),
             "background": sorted(background_frames),
-            **{name: sorted(files) for name, files in optional_layer_files.items()},
+            **{name: sorted(files) for name, files in layer_files.items()},
         },
         "pixel_lock_ok": True,
+        "occlusion_exempted_pixels_total": 0,
         "frames_report": [],
         "failures": failures,
         "preview_only": False,
         "passed": False,
     }
+    if layers:
+        report["layers"] = {
+            name: {"dir": str(layers[name]), "frames": len(layer_files[name])}
+            for name in layers
+        }
 
     if not plan_trusted and not args.limit:
         failures.append("缺少冻结计划合同（--plan 或同时提供 --expected-frames/--start-frame）；不能从已有文件推断完整帧范围")
@@ -630,16 +730,17 @@ def main() -> int:
             failures.append(f"{name} 缺少帧：{missing}")
         if extra:
             failures.append(f"{name} 有多余帧：{extra}")
-    for name, files in optional_layer_files.items():
-        layer_expected = required_layer_frames.get(name)
+    for name, files in layer_files.items():
         present = set(files)
         out_of_range = sorted(present - expected)
         if out_of_range:
             failures.append(f"{name} 含越出冻结全片帧集合的帧：{out_of_range}")
-        if layer_expected:
-            missing = sorted(layer_expected - present)
+        if plan_source == "frozen":
+            required = required_layer_frames.get(name)
+            missing = sorted((required or set()) - present)
         else:
-            missing = []
+            # 没有冻结计划：提供层必须覆盖全部处理帧（fail-closed，不静默跳过）
+            missing = sorted(expected - present)
         if missing:
             failures.append(f"{name} 缺少帧：{missing}")
     if len(expected) == 0:
@@ -665,8 +766,7 @@ def main() -> int:
         except Exception as exc:
             failures.append(f"帧 {frame} 读取失败：{exc}")
             continue
-        layers = _read_optional_layers(frame, optional_layer_files, color_contract)
-        _validate_optional_layers(frame, layers, mask.shape, failures)
+        layer_data = _read_layer_data(frame, layer_files, mask.shape, failures)
         _validate_frame(frame, product, product_alpha, mask, background, args, failures, report)
 
     if failures or (not plan_trusted and not preview_only):
@@ -677,20 +777,33 @@ def main() -> int:
     # 第二遍：预检通过后重新逐帧读取并写暂存 PNG；全片通过再提升为最终输出。
     staging = out_dir.resolve().parent / f".{out_dir.name}.strict_composite_staging_{os.getpid()}_{uuid.uuid4().hex}"
     staging.mkdir(parents=True, exist_ok=False)
+    layer_stats: dict[str, list[float]] = {name: [] for name in layers}
     for frame in frame_ids:
         try:
             product, product_alpha, mask, background = _read_frame(frame, product_files, mask_files, mapped_background_files, color_contract)
         except Exception as exc:
             failures.append(f"帧 {frame} 读取失败：{exc}")
             continue
-        layers = _read_optional_layers(frame, optional_layer_files, color_contract)
-        _validate_optional_layers(frame, layers, mask.shape, failures)
+        layer_data = _read_layer_data(frame, layer_files, mask.shape, failures)
         if product_alpha is None:
             failures.append(f"帧 {frame} 产品层缺少可信 Alpha，无法判断可见性")
             continue
-        alpha_coverage, mask_coverage, dilated_coverage, output_sha256, approved_display_diff = _write_composite(
-            frame, product, product_alpha, mask, background, args, color_contract, staging, layers
-        )
+        try:
+            alpha_coverage, mask_coverage, dilated_coverage, output_sha256, approved_display_diff, exempted = _write_composite(
+                frame, product, product_alpha, mask, background, args, color_contract, staging, layer_data
+            )
+        except RuntimeError:
+            report["pixel_lock_ok"] = False
+            failures.append(f"帧 {frame} 像素锁定失败")
+            continue
+        report["occlusion_exempted_pixels_total"] += exempted
+        if "shadow" in layer_data:
+            layer_stats["shadow"].append(float((layer_data["shadow"] < 0.98).mean()))
+        if "reflection" in layer_data:
+            layer_stats["reflection"].append(float((layer_data["reflection"] > 1e-3).mean()))
+        if "occlusion" in layer_data:
+            occ_alpha = layer_data["occlusion"][1]
+            layer_stats["occlusion"].append(float((occ_alpha > 0.5).mean()))
         if mask_coverage > 0:
             report["approved_display_product_visible_frames"] += 1
         if approved_display_diff is not None:
@@ -701,7 +814,7 @@ def main() -> int:
                 f"帧 {frame} 批准 display 产品与合成输出最大差 {approved_display_diff:.6f} 超过 1/255"
             )
         if frame in {frame_ids[0], frame_ids[-1]}:
-            report["frames_report"].append({
+            entry = {
                 "frame": frame,
                 "mask_coverage": round(mask_coverage, 4),
                 "alpha_coverage": round(alpha_coverage, 4),
@@ -710,7 +823,12 @@ def main() -> int:
                 "approved_display_product_max_abs_diff": (
                     round(approved_display_diff, 6) if approved_display_diff is not None else None
                 ),
-            })
+            }
+            if "occlusion" in layer_data:
+                entry["occlusion_exempted_pixels"] = exempted
+            report["frames_report"].append(entry)
+    for name, values in layer_stats.items():
+        report["layers"][name]["coverage_mean"] = round(float(np.mean(values)), 4) if values else 0.0
     if report["approved_display_product_visible_frames"] == 0:
         report["approved_display_product_match_status"] = "NOT_APPLICABLE"
         report["approved_display_product_match_ok"] = True

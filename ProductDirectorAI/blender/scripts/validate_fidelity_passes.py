@@ -7,11 +7,15 @@
 检查：精确帧数/起始帧号、同帧对应、通道基本完整、有限数值、深度在产品区为有限正值、
 法线分量齐全且模长接近 1、以及 EXR 与遮罩的产品区域在像素级轮廓上吻合。
 
+V3-05 独立层：`--layers <root>` 时校验 plate_full/plate/shadow/reflection/occlusion
+五层的帧数与可读性，并记录抽样覆盖率（全零层如实注明）。
+
 不依赖 Blender：用项目 venv 运行即可（Pillow 读遮罩 PNG，OpenEXR 读多层 EXR）。
 
 用法：
     .venv/bin/python blender/scripts/validate_fidelity_passes.py \
-        --passes <run_dir>/frames/passes --frames 72 --start-frame 1 --json <out.json>
+        --passes <run_dir>/frames/passes --frames 72 --start-frame 1 \
+        [--layers <layers_root>] --json <out.json>
 """
 from __future__ import annotations
 
@@ -32,6 +36,8 @@ def parse_args():
     parser.add_argument("--frames", type=int, default=72)
     parser.add_argument("--start-frame", type=int, default=None, help="起始帧号；未提供时按已发现文件的最小号推断")
     parser.add_argument("--json", default="")
+    parser.add_argument("--layers", default="",
+                        help="V3-05 可选：层根目录（含 plate_full/plate/shadow/reflection/occlusion 子目录），校验帧数与覆盖率")
     return parser.parse_args()
 
 
@@ -149,6 +155,51 @@ def _has_rgb_planes(planes: dict) -> bool:
         if "b" in tokens or "blue" in tokens:
             found.add("b")
     return found >= {"r", "g", "b"}
+
+
+def read_layer_frame(path: Path) -> np.ndarray:
+    """读一帧独立层：EXR（底板）取 RGB 均值，16 位灰度（阴影）归一到 0-1，
+    RGBA（遮挡）取 alpha，RGB（反射）取灰度。"""
+    if path.suffix.lower() == ".exr":
+        exr = read_exr(path)
+        plane = next(iter(exr["planes"].values()))
+        if plane.ndim == 3:
+            return plane[:, :, : min(3, plane.shape[2])].mean(axis=2)
+        return plane
+    with Image.open(path) as image:
+        if image.mode.startswith("I"):
+            return np.asarray(image, dtype=np.float32) / 65535.0
+        if image.mode == "RGBA":
+            return np.asarray(image.split()[3], dtype=np.float32) / 255.0
+        return np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+
+
+def validate_layers(root: Path, expected_frames: set[int], failures: list[str]) -> dict:
+    """V3-05 独立层校验：每层逐帧可读、帧数与全片对齐，并记录覆盖率（全零层如实注明）。"""
+    layer_report: dict = {}
+    for name in ("plate_full", "plate", "shadow", "reflection", "occlusion"):
+        layer_dir = root / name
+        paths = [p for p in layer_dir.glob("frame_*") if p.suffix.lower() in {".exr", ".png"}]
+        files = discover_indexed_frames(paths, label=f"独立层 {name}", failures=failures)
+        entry: dict = {"frames": len(files)}
+        _compare_sets(expected_frames, set(files), f"独立层 {name}", failures)
+        if files:
+            ordered = sorted(files)
+            sample_indices = sorted({0, len(ordered) // 2, len(ordered) - 1})
+            samples = []
+            for index in sample_indices:
+                try:
+                    samples.append(read_layer_frame(files[ordered[index]]))
+                except Exception as exc:
+                    failures.append(f"独立层 {name} 帧 {ordered[index]} 读取失败：{exc}")
+                    continue
+            if samples:
+                coverage = float(np.mean([float((sample > 0.02).mean()) for sample in samples]))
+                entry["coverage_mean_sampled"] = round(coverage, 4)
+                if coverage == 0.0:
+                    entry["note"] = "全零层（无遮挡物/无反射能量时属预期，见 layers_report.json）"
+        layer_report[name] = entry
+    return layer_report
 
 
 def main() -> int:
@@ -314,6 +365,9 @@ def main() -> int:
 
         if "normal_mean_magnitude" in entry and not 0.7 <= entry["normal_mean_magnitude"] <= 1.3:
             failures.append(f"帧 {index} 法线模长异常 {entry['normal_mean_magnitude']}")
+
+    if args.layers:
+        report["layers"] = validate_layers(Path(args.layers), expected_frames, failures)
 
     report["passed"] = not report["failures"]
     print("FIDELITY_PASSES " + json.dumps(report, ensure_ascii=False))
